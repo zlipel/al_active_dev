@@ -79,8 +79,9 @@ Common overrides (production defaults shown):
   --no-pessimism            Disable the on-by-default --pessimism flag
   --train_model_type {gpr_multitask,gpr_singletask,dnn}
 
-Power-user: any other al-master flag can be passed through after '--', e.g.
-  $0 --model MPIPI --iter 0 -- --ref_point_mode in_line --mc_ehvi
+Any other flag is forwarded to al-master unchanged. E.g.:
+  $0 --model MPIPI --iter 0 --ref_point_mode in_line --mc_ehvi
+  $0 --model MPIPI --iter 0 -- --some_future_flag value   # '--' also works
 EOF
     exit 1
 }
@@ -101,7 +102,9 @@ while [[ "$#" -gt 0 ]]; do
         --no-pessimism) PESSIMISM=false ;;
         --help|-h) usage ;;
         --) shift; EXTRA_FLAGS+=("$@"); break ;;
-        *) echo "Unknown parameter: $1"; usage ;;
+        # Catch-all: anything we don't recognize is forwarded to al-master.
+        # al-master's argparse is the source of truth on what's valid.
+        *) EXTRA_FLAGS+=("$1") ;;
     esac
     shift
 done

@@ -73,8 +73,9 @@ Common sweep knobs:
   --no-mc-ehvi                                 disable MC EHVI (default on)
   --front {upper,lower}                        (default: upper)
 
-Power-user: pass-through with '--', e.g.
-  $0 --model MPIPI -- --ref_point_frac 0.7
+Any other flag is forwarded to al-master unchanged. E.g.:
+  $0 --model MPIPI --ref_point_frac 0.7 --ref_point_tau 0.1
+  $0 --model MPIPI -- --some_future_flag value   # '--' also works
 EOF
     exit 1
 }
@@ -96,7 +97,9 @@ while [[ "$#" -gt 0 ]]; do
         --obj2) OBJ2="$2"; shift ;;
         --help|-h) usage ;;
         --) shift; EXTRA_FLAGS+=("$@"); break ;;
-        *) echo "Unknown parameter: $1"; usage ;;
+        # Catch-all: anything we don't recognize is forwarded to al-master.
+        # al-master's argparse is the source of truth on what's valid.
+        *) EXTRA_FLAGS+=("$1") ;;
     esac
     shift
 done
