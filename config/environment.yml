@@ -1,18 +1,20 @@
 # Conda environment for the al_active_dev pipeline.
 #
-# Setup (cluster, Princeton Stellar):
+# Cluster setup (Princeton Stellar):
 #   module purge
 #   module load anaconda3/2024.6
 #   conda env create -f config/environment.yml
 #   conda activate al_active_dev
 #
-# After the first activation on the cluster, build the md_calcs C++ extension
-# against this Python version (3.12) — see external/md_calcs/README.md.
+# Additional cluster-only install steps after the env exists:
+#   - md_calcs C++ extension: see external/md_calcs/README.md
+#   - mpi4py:                 see "Cluster bootstrap" in the root README.md
+#     (must be built against the cluster's openmpi/gcc/4.1.2)
 #
-# Setup (local dev, macOS / Linux):
+# Local dev (macOS / Linux without HPC modules):
 #   conda env create -f config/environment.yml
 #   conda activate al_active_dev
-#   # md_calcs_par.so is not required locally; the test suite stubs it.
+#   # md_calcs_par.so and mpi4py are not required locally; pytest stubs both.
 
 name: al_active_dev
 
@@ -41,20 +43,19 @@ dependencies:
   # Multi-objective utilities
   - pygmo
 
-  # Distributed / parallel
+  # Distributed / parallel (Ray for simulation_candidates filtering)
   - ray-default
 
-  # Beam search (cluster MPI runs)
+  # Beam search (numerics; MPI bindings installed separately — see README)
   - numba
-  - mpi4py
   - shapely
   - umap-learn
 
-  # C++ extension build chain (md_calcs_par)
+  # pybind11 headers for the md_calcs C++ extension.
+  # Compilers, OpenMP, cmake all come from cluster modules (intel/2022.2,
+  # cmake module) — do NOT vendor them via conda or they'll override the
+  # cluster's toolchain and link against the wrong libstdc++ / MPI.
   - pybind11
-  - cmake
-  - cxx-compiler
-  - openmp
 
   # Dev / test
   - pytest
