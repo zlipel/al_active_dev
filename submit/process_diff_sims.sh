@@ -10,7 +10,12 @@
 # Note: job-name/output/error are set by diff_calc.sh at submission time via sbatch CLI flags.
 # The #SBATCH values above are generic defaults and will be overridden.
 
-source "${HOME}/PROJECTS/al_active_dev/config/cluster.env"
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${REPO_ROOT}/config/cluster.env"
+
 module purge
 module load "${CONDA_MODULE}"
 module load "${INTEL_MODULE}" "${INTEL_MPI_MODULE}"
@@ -43,16 +48,17 @@ STRIDE=1
 
 export OMP_NUM_THREADS=$OMP_THREADS
 
-python process_diff_sims.py --parent_dir "$PAR_DIR" \
-                            --output_dir "$OUTPUT_DIR" \
-                            --sequence_file "$SEQS" \
-                            --nruns $NRUNS \
-                            --nsteps $NSTEPS \
-                            --dt $DT \
-                            --nchains $NCHAINS \
-                            --nfreq $NFREQ \
-                            --inner_jobs $INNER_JOBS \
-                            --omp_threads $OMP_THREADS \
-                            --nseq_jobs $NSEQ_JOBS \
-                            --cutoff $CUT \
-                            --stride $STRIDE
+python "${REPO_ROOT}/analysis/process_diff_sims.py" \
+    --parent_dir "$PAR_DIR" \
+    --output_dir "$OUTPUT_DIR" \
+    --sequence_file "$SEQS" \
+    --nruns $NRUNS \
+    --nsteps $NSTEPS \
+    --dt $DT \
+    --nchains $NCHAINS \
+    --nfreq $NFREQ \
+    --inner_jobs $INNER_JOBS \
+    --omp_threads $OMP_THREADS \
+    --nseq_jobs $NSEQ_JOBS \
+    --cutoff $CUT \
+    --stride $STRIDE

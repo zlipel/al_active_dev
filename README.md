@@ -15,9 +15,13 @@ al_active_dev/
 ├── simulation/         # Generate LAMMPS input files for EOS and diffusivity runs
 ├── analysis/           # Analyze completed MD simulations
 ├── beam_search/        # Surrogate-model beam search over sequence space (post-optimization)
+├── external/           # Vendored cluster code: core.py + md_calcs C++ extension
+├── submit/             # All SLURM job-submission scripts (consolidated, top-level)
 ├── utils/              # Shared visualization and Pareto-front utilities
-├── config/             # Cluster environment variables (sourced by all SLURM scripts)
-└── archive/            # Superseded scripts — preserved for reference, not for production
+├── tests/              # pytest suite (~100 tests covering AL math + helpers)
+├── config/             # cluster.env + environment.yml
+├── runs/               # (gitignored) HOME-side artifacts: .pt models, plots, logs
+└── archive/            # (gitignored) Superseded scripts — preserved locally for reference
 ```
 
 ---
@@ -108,15 +112,36 @@ CLUSTER_TESTS=1 pytest tests/       # also runs @pytest.mark.cluster tests
 
 **5. Cluster-specific env vars**
 
-`config/cluster.env` defines `HOME_AL`, `SCRATCH_AL`, `DB_PATH`, etc. Submit
-scripts source this file, so check the paths match your account. The
-`GENDATA` env var must also be set if not already in your `~/.bashrc`:
+`config/cluster.env` defines `HOME_AL`, `SCRATCH_AL`, `SCRATCH_AL_ACQ`,
+`DB_PATH`, etc. Submit scripts source this file, so check the paths match your
+account. The `GENDATA` env var must also be set if not already in your
+`~/.bashrc`:
 
 ```bash
 export GENDATA="${HOME}/scripts/GENDATA/gendata.py"   # adjust path
 ```
 
-After this, `git pull` is enough to roll forward when changes land on main.
+**6. (One-time) Migrate HOME-side artifacts to `runs/`**
+
+If you ran an earlier version of this pipeline that wrote GPR checkpoints and
+logs to `~/PROJECTS/MODEL_COMPARISON/<MODEL>/`, move them under the new
+`runs/` artifact root so the current `ALConfig.base_path` default finds them:
+
+```bash
+mkdir -p ~/PROJECTS/al_active_dev/runs
+for model in MPIPI CALVADOS HPS_URRY HPS_KR MARTINI; do
+  if [[ -d ~/PROJECTS/MODEL_COMPARISON/$model ]]; then
+    mv ~/PROJECTS/MODEL_COMPARISON/$model ~/PROJECTS/al_active_dev/runs/$model
+    echo "moved $model"
+  fi
+done
+```
+
+The loop is a no-op for models you haven't trained. After this, existing `.pt`
+checkpoints resume working at the new path — no retraining needed.
+
+After all of the above, `git pull` is enough to roll forward when changes land
+on main.
 
 ---
 
@@ -183,11 +208,10 @@ where equilibration from random configurations is slow.
 
 Both scripts require `core.py` from `$CORE_LIB` (see §External Dependencies).
 
-Submit via:
+Submit via the consolidated top-level `submit/`:
 ```bash
-# From beam_search/submit/ on cluster
-sbatch simulation/submit/make_eos.sh CALVADOS 10
-sbatch simulation/submit/make_diff.sh CALVADOS 10
+sbatch submit/make_eos.sh  --model CALVADOS --iter 10 --rho_i 0.05 --rho_f 1.4 --drho 0.1
+sbatch submit/make_diff.sh --model CALVADOS --iter 10
 ```
 
 ---
@@ -213,11 +237,15 @@ After LAMMPS simulations complete:
 
 ```bash
 # EOS analysis (phase coexistence densities, Beff/exp_density)
-sbatch analysis/submit/eos_calc.sh CALVADOS 10
+submit/eos_calc.sh CALVADOS 500 10        # MODEL NBOOT ITER
 
 # Diffusivity analysis
-sbatch analysis/submit/diff_calc.sh CALVADOS 10
+submit/diff_calc.sh CALVADOS 10           # MODEL ITER [INNER_JOBS] [OMP_THREADS] [NSEQ_JOBS]
 ```
+
+(The `*_calc.sh` scripts are thin wrappers — they `sbatch` the actual SLURM job
+script `process_{eos,diff}_sims.sh` and set per-(model, iter) `--job-name`,
+`--output`, `--error` on the CLI.)
 
 The submit wrappers call `process_eos_sims.sh` / `process_diff_sims.sh` via
 `sbatch --job-name=... --output=... --error=...` (no `sed -i` mutation). Results
@@ -236,6 +264,69 @@ Python analysis scripts:
 
 Return to Stage 1 with `--iter N+1`. The `al_pipeline` master script reads the
 accumulated observations from all previous iterations and fits a new surrogate model.
+
+```bash
+sbatch submit/al_master.sh --model CALVADOS --iter 11 --front upper
+```
+
+---
+
+## Submit scripts (`submit/`)
+
+All SLURM submission scripts live in a single top-level `submit/` directory.
+Every script:
+- Self-locates the repo via `${BASH_SOURCE}` (no hardcoded `${HOME}/...` paths).
+- Sources `config/cluster.env` for module versions, env name, and project paths.
+- Calls Python scripts via `${REPO_ROOT}/...` absolute paths — invariant to the
+  shell's working directory at submission time.
+
+| Script | Purpose |
+|---|---|
+| `submit/make_eos.sh` | Generate LAMMPS EOS input files for a (model, iter) batch |
+| `submit/make_diff.sh` | Generate LAMMPS diffusivity input files |
+| `submit/eos_calc.sh` | Thin wrapper that sbatches `process_eos_sims.sh` with parameterized job-name/output |
+| `submit/process_eos_sims.sh` | The actual EOS analysis SLURM job |
+| `submit/diff_calc.sh` | Wrapper for the diffusivity analysis |
+| `submit/process_diff_sims.sh` | The actual diffusivity analysis SLURM job |
+| `submit/al_master.sh` | **One sbatch per AL iteration** — production AL run |
+| `submit/al_master_acq_test.sh` | Acquisition-function diagnostic (separate scratch path) |
+| `submit/run_acq_sweep.sh` | Convenience wrapper to submit acq-test runs per `(model, ehvi, explore)` tuple |
+
+### AL master examples
+
+```bash
+# Production run, iteration 0
+sbatch submit/al_master.sh --model MPIPI --iter 0 --front upper
+
+# Override exploration strategy
+sbatch submit/al_master.sh --model MPIPI --iter 3 --front upper \
+       --exploration_strategy similarity_penalty
+
+# Disable the default --pessimism flag
+sbatch submit/al_master.sh --model MPIPI --iter 0 --no-pessimism
+
+# Pass-through power-user flags
+sbatch submit/al_master.sh --model MPIPI --iter 0 -- --ref_point_mode in_line
+```
+
+### Acquisition-function sweep
+
+```bash
+# One (model, ehvi, explore) per invocation
+./submit/run_acq_sweep.sh MPIPI epsilon kriging_believer
+
+# Bash loop for full sweep
+for m in MPIPI CALVADOS HPS_URRY; do
+  for e in epsilon standard; do
+    for x in kriging_believer similarity_penalty; do
+      ./submit/run_acq_sweep.sh "$m" "$e" "$x"
+    done
+  done
+done
+```
+
+Acq-test runs write to `${SCRATCH_AL_ACQ}` (a separate scratch root from
+`${SCRATCH_AL}`) so production state is never touched.
 
 ---
 
