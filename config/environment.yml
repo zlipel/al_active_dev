@@ -1,0 +1,66 @@
+# Conda environment for the al_active_dev pipeline.
+#
+# Setup (cluster, Princeton Stellar):
+#   module purge
+#   module load anaconda3/2024.6
+#   conda env create -f config/environment.yml
+#   conda activate al_active_dev
+#
+# After the first activation on the cluster, build the md_calcs C++ extension
+# against this Python version (3.12) — see external/md_calcs/README.md.
+#
+# Setup (local dev, macOS / Linux):
+#   conda env create -f config/environment.yml
+#   conda activate al_active_dev
+#   # md_calcs_par.so is not required locally; the test suite stubs it.
+
+name: al_active_dev
+
+channels:
+  - conda-forge
+  - pytorch
+
+dependencies:
+  - python=3.12
+
+  # Core scientific stack
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - joblib
+  - statsmodels
+  - tqdm
+
+  # ML / Bayesian optimization
+  - pytorch
+  - gpytorch
+
+  # Multi-objective utilities
+  - pygmo
+
+  # Distributed / parallel
+  - ray-default
+
+  # Beam search (cluster MPI runs)
+  - numba
+  - mpi4py
+  - shapely
+  - umap-learn
+
+  # C++ extension build chain (md_calcs_par)
+  - pybind11
+  - cmake
+  - cxx-compiler
+  - openmp
+
+  # Dev / test
+  - pytest
+  - ruff
+
+  # Pip-only additions
+  - pip
+  - pip:
+      - botorch

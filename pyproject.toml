@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "al-pipeline"
+version = "0.1.0"
+description = "Active learning pipeline for simulation-driven IDP sequence design"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Zachary Gabriel Lipel" }
+]
+
+# Runtime dependencies of the al_pipeline package proper. The full pipeline
+# (simulation/, analysis/, beam_search/) has additional deps captured in
+# config/environment.yml — use that for cluster setup.
+dependencies = [
+  "numpy",
+  "pandas",
+  "scipy",
+  "scikit-learn",
+  "matplotlib",
+  "joblib",
+  "statsmodels",
+  "tqdm",
+  "torch",
+  "gpytorch",
+  "botorch",
+  "pygmo",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "ruff",
+  "mypy",
+  "ipython",
+]
+
+[project.scripts]
+al-master = "al_pipeline.cli.master:main"
+al-child  = "al_pipeline.cli.child:run_child"
+
+[tool.setuptools.packages.find]
+include = ["al_pipeline*"]
