@@ -20,8 +20,16 @@
 
 set -eo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# Resolve repo root. SLURM rewrites BASH_SOURCE/$0 to a spool copy of the
+# script; prefer SLURM_SUBMIT_DIR, then AL_ACTIVE_DEV env var, then the
+# canonical install location.
+if [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/config/cluster.env" ]]; then
+    REPO_ROOT="${SLURM_SUBMIT_DIR}"
+elif [[ -n "${AL_ACTIVE_DEV:-}" && -f "${AL_ACTIVE_DEV}/config/cluster.env" ]]; then
+    REPO_ROOT="${AL_ACTIVE_DEV}"
+else
+    REPO_ROOT="${HOME}/PROJECTS/al_active_dev"
+fi
 source "${REPO_ROOT}/config/cluster.env"
 
 module purge
@@ -65,8 +73,9 @@ Common sweep knobs:
   --no-mc-ehvi                                 disable MC EHVI (default on)
   --front {upper,lower}                        (default: upper)
 
-Power-user: pass-through with '--', e.g.
-  $0 --model MPIPI -- --ref_point_frac 0.7
+Any other flag is forwarded to al-master unchanged. E.g.:
+  $0 --model MPIPI --ref_point_frac 0.7 --ref_point_tau 0.1
+  $0 --model MPIPI -- --some_future_flag value   # '--' also works
 EOF
     exit 1
 }
@@ -88,7 +97,9 @@ while [[ "$#" -gt 0 ]]; do
         --obj2) OBJ2="$2"; shift ;;
         --help|-h) usage ;;
         --) shift; EXTRA_FLAGS+=("$@"); break ;;
-        *) echo "Unknown parameter: $1"; usage ;;
+        # Catch-all: anything we don't recognize is forwarded to al-master.
+        # al-master's argparse is the source of truth on what's valid.
+        *) EXTRA_FLAGS+=("$1") ;;
     esac
     shift
 done
