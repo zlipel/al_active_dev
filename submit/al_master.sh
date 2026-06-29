@@ -21,8 +21,16 @@
 
 set -eo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# Resolve repo root. SLURM rewrites BASH_SOURCE/$0 to a spool copy of the
+# script; prefer SLURM_SUBMIT_DIR, then AL_ACTIVE_DEV env var, then the
+# canonical install location.
+if [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/config/cluster.env" ]]; then
+    REPO_ROOT="${SLURM_SUBMIT_DIR}"
+elif [[ -n "${AL_ACTIVE_DEV:-}" && -f "${AL_ACTIVE_DEV}/config/cluster.env" ]]; then
+    REPO_ROOT="${AL_ACTIVE_DEV}"
+else
+    REPO_ROOT="${HOME}/PROJECTS/al_active_dev"
+fi
 source "${REPO_ROOT}/config/cluster.env"
 
 module purge
@@ -126,9 +134,13 @@ echo "Running: ${CMD[*]}"
 "${CMD[@]}"
 
 # Move SLURM stdout/err into the iteration's log dir (matches old layout).
+# Files are written in SLURM_SUBMIT_DIR; use absolute paths so this works even
+# if anything in the run cd'd elsewhere.
 LOG_DEST="${HOME_AL}/${MODEL}/logs/iteration_${FRONT}_${ITER}"
 mkdir -p "$LOG_DEST"
-mv al_master.out "$LOG_DEST/al_master_iter${ITER}.out" 2>/dev/null || true
-mv al_master.err "$LOG_DEST/al_master_iter${ITER}.err" 2>/dev/null || true
+SLURM_OUT="${SLURM_SUBMIT_DIR:-.}/al_master.out"
+SLURM_ERR="${SLURM_SUBMIT_DIR:-.}/al_master.err"
+[[ -f "$SLURM_OUT" ]] && mv "$SLURM_OUT" "$LOG_DEST/al_master_iter${ITER}.out"
+[[ -f "$SLURM_ERR" ]] && mv "$SLURM_ERR" "$LOG_DEST/al_master_iter${ITER}.err"
 
 conda deactivate

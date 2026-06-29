@@ -10,10 +10,19 @@
 #SBATCH --output=make_diff.out
 #SBATCH --error=make_diff.err
 
-set -euo pipefail
+set -eo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# Resolve repo root. SLURM copies the script to /var/spool/slurmd/... so
+# BASH_SOURCE/$0 don't self-locate here. Prefer SLURM_SUBMIT_DIR (cwd from
+# which sbatch was invoked), fall back to an exported AL_ACTIVE_DEV, then to
+# the canonical install path.
+if [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/config/cluster.env" ]]; then
+    REPO_ROOT="${SLURM_SUBMIT_DIR}"
+elif [[ -n "${AL_ACTIVE_DEV:-}" && -f "${AL_ACTIVE_DEV}/config/cluster.env" ]]; then
+    REPO_ROOT="${AL_ACTIVE_DEV}"
+else
+    REPO_ROOT="${HOME}/PROJECTS/al_active_dev"
+fi
 source "${REPO_ROOT}/config/cluster.env"
 
 module purge
@@ -96,7 +105,10 @@ CMD="python \"${REPO_ROOT}/simulation/make_diff.py\" --model \"$MODEL\" \
 [[ -n "$MAX_CORES" ]] && CMD+=" --max_cores $MAX_CORES"
 eval "$CMD"
 
-mv make_diff.out "$LOGS/make_diff_${LOG_TAG}.out"
-mv make_diff.err "$LOGS/make_diff_${LOG_TAG}.err"
+# SLURM keeps --output / --error open in SLURM_SUBMIT_DIR, even after we cd.
+SLURM_OUT="${SLURM_SUBMIT_DIR:-.}/make_diff.out"
+SLURM_ERR="${SLURM_SUBMIT_DIR:-.}/make_diff.err"
+[[ -f "$SLURM_OUT" ]] && mv "$SLURM_OUT" "$LOGS/make_diff_${LOG_TAG}.out"
+[[ -f "$SLURM_ERR" ]] && mv "$SLURM_ERR" "$LOGS/make_diff_${LOG_TAG}.err"
 
 conda deactivate
