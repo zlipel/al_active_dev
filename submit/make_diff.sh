@@ -5,10 +5,12 @@
 #SBATCH --cpus-per-task=96
 #SBATCH --mem-per-cpu=100MB
 #SBATCH --time=00:29:59
-#SBATCH --mail-type=${SBATCH_MAIL_TYPE}
-#SBATCH --mail-user=${SBATCH_MAIL_USER}
 #SBATCH --output=make_diff.out
 #SBATCH --error=make_diff.err
+# To get failure emails, export SBATCH_MAIL_USER and SBATCH_MAIL_TYPE in your
+# shell rc; sbatch picks them up from the environment automatically. Or pass
+# --mail-user/--mail-type on the sbatch CLI at submit time. (#SBATCH headers
+# are parsed by SLURM before the script runs and do NOT expand bash variables.)
 
 set -eo pipefail
 
