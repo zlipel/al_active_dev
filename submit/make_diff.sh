@@ -10,7 +10,12 @@
 #SBATCH --output=make_diff.out
 #SBATCH --error=make_diff.err
 
-source "${HOME}/PROJECTS/al_active_dev/config/cluster.env"
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${REPO_ROOT}/config/cluster.env"
+
 module purge
 module load "${INTEL_MODULE}" "${INTEL_MPI_MODULE}"
 module load "${CONDA_MODULE}"
@@ -21,6 +26,7 @@ ITER=""
 NSIM="5"
 INIT=false
 CHECK_FIN=false
+QUICK=""
 CPUS_PER_SIM=""
 MAX_CORES=""
 
@@ -60,36 +66,25 @@ fi
 if [[ "$INIT" == true ]]; then
     SEQS="${SCRATCH_AL}/$MODEL/SIMULATIONS/DIFF/seq_init.txt"
     PAR_DIR="${SCRATCH_AL}/$MODEL/SIMULATIONS/DIFF/"
-    LOGS="$PAR_DIR/logs/"
-    mkdir -p "$LOGS"
+    LOG_TAG="init"
+else
+    if [[ -z "$ITER" ]]; then
+        echo "Error: --iter is required when --init is not set"
+        usage
+    fi
+    cp "${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS/seq_gen$ITER.txt" \
+       "${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF/seq_gen$ITER.txt"
 
-    CMD="python make_diff.py --model \"$MODEL\" \
-        --num_polymers 100 \
-        --nsim \"$NSIM\" \
-        --sequence_file \"$SEQS\" \
-        --parent_dir \"$PAR_DIR\" \
-        --quick \"${QUICK:-0}\" "
-
-    [[ "$CHECK_FIN" == true ]] && CMD+=" --check_finished"
-    [[ -n "$CPUS_PER_SIM" ]] && CMD+=" --cpus_per_sim $CPUS_PER_SIM"
-    [[ -n "$MAX_CORES" ]] && CMD+=" --max_cores $MAX_CORES"
-    eval "$CMD"
-
-    mv make_diff.out "$LOGS/make_diff_init.out"
-    mv make_diff.err "$LOGS/make_diff_init.err"
-    conda deactivate
-    exit 0
+    SEQS="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF/seq_gen$ITER.txt"
+    PAR_DIR="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF/"
+    LOG_TAG="gen$ITER"
 fi
 
-cp "${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS/seq_gen$ITER.txt" \
-   "${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF/seq_gen$ITER.txt"
-
-SEQS="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF/seq_gen$ITER.txt"
-PAR_DIR="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF/"
 LOGS="$PAR_DIR/logs/"
 mkdir -p "$LOGS"
+cd "$PAR_DIR"   # polymerize / gendata drop temp files into cwd
 
-CMD="python make_diff.py --model \"$MODEL\" \
+CMD="python \"${REPO_ROOT}/simulation/make_diff.py\" --model \"$MODEL\" \
     --num_polymers 100 \
     --nsim \"$NSIM\" \
     --sequence_file \"$SEQS\" \
@@ -101,7 +96,7 @@ CMD="python make_diff.py --model \"$MODEL\" \
 [[ -n "$MAX_CORES" ]] && CMD+=" --max_cores $MAX_CORES"
 eval "$CMD"
 
-mv make_diff.out "$LOGS/make_diff_gen$ITER.out"
-mv make_diff.err "$LOGS/make_diff_gen$ITER.err"
+mv make_diff.out "$LOGS/make_diff_${LOG_TAG}.out"
+mv make_diff.err "$LOGS/make_diff_${LOG_TAG}.err"
 
 conda deactivate

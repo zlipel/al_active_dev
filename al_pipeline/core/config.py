@@ -45,9 +45,16 @@ class ALConfig:
     ncands: int = 96
 
     #### Paths ####
-    base_path: Path = Path("/home/zl4808/PROJECTS/MODEL_COMPARISON/")
+    # base_path  : HOME-side artifact root (.pt checkpoints, parity plots, logs).
+    #              Defaults to runs/ inside the repo so artifacts ship with the
+    #              project tree (runs/ is .gitignored). Override via --base_path
+    #              or by editing config/cluster.env's HOME_AL.
+    # scratch_path : per-iteration data (features/labels, sim outputs). Lives
+    #                on the cluster's scratch filesystem.
+    # db_path    : gendata databases used by simulation input generation.
+    base_path: Path = Path("/home/zl4808/PROJECTS/al_active_dev/runs/")
     scratch_path: Path = Path("/scratch/gpfs/zl4808/PROJECTS/MODEL_COMPARISON/")
-    db_path: Path = Path("/home/zl4808/PROJECTS/MODEL_COMPARISON/databases/")
+    db_path: Path = Path("/home/zl4808/scripts/GENDATA/databases/")
 
     #### Reproducibility / worker threading ####
     seed_base: int = 12345

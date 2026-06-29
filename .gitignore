@@ -49,6 +49,11 @@ runs/
 external/md_calcs/build/
 external/md_calcs/*.so
 
+# ── AL artifact root (HOME-side: .pt checkpoints, plots, logs) ────────────
+runs/
+acq_logs/
+simlogs/
+
 # ── Archive (historical / cleanup artifacts; not production) ──────────────
 archive/
 file_inventory.txt

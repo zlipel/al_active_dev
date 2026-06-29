@@ -10,9 +10,12 @@
 #SBATCH --output=make_eos.out
 #SBATCH --error=make_eos.err
 
-# NOTE: was make_EOS_updated.sh which loaded anaconda3/2024.2 (version drift).
-# Standardized to anaconda3/2024.6 via cluster.env (CONDA_MODULE).
-source "${HOME}/PROJECTS/al_active_dev/config/cluster.env"
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${REPO_ROOT}/config/cluster.env"
+
 module purge
 module load "${INTEL_MODULE}" "${INTEL_MPI_MODULE}"
 module load "${CONDA_MODULE}"
@@ -59,48 +62,42 @@ fi
 if [[ "$INIT" == true ]]; then
     SEQS="${SCRATCH_AL}/$MODEL/SIMULATIONS/EOS/seq_init.txt"
     PAR_DIR="${SCRATCH_AL}/$MODEL/SIMULATIONS/EOS/"
-    LOGS="$PAR_DIR/logs/"
-    mkdir -p "$LOGS"
+    LOG_TAG="init"
+else
+    if [[ -z "$ITER" ]]; then
+        echo "Error: --iter is required when --init is not set"
+        usage
+    fi
+    PAR_DIR="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS"
 
-    CMD="python make_eos.py --model \"$MODEL\" --num_polymers 100 \
-        --density_start \"$RHO_i\" --density_end \"$RHO_f\" --density_step \"$DRHO\" \
-        --sequence_file \"$SEQS\" --parent_dir \"$PAR_DIR\""
-    [[ "$CHECK_RHO" == true ]] && CMD+=" --check_densities"
-    [[ "$CHECK_FINISHED" == true ]] && CMD+=" --check_finished"
-    [[ -n "$CPUS_PER_SIM" ]] && CMD+=" --cpus_per_sim $CPUS_PER_SIM"
-    [[ -n "$MAX_CORES" ]] && CMD+=" --max_cores $MAX_CORES"
-    eval "$CMD"
-    mv "make_eos.out" "$LOGS/make_eos_init.out"
-    mv "make_eos.err" "$LOGS/make_eos_init.err"
-    exit 0
+    # al_pipeline mirrors candidates into EOS/ at these paths (primary location):
+    SEQ_UPPER="$PAR_DIR/simulation_candidates_gen${ITER}_upper.txt"
+    SEQ_LOWER="$PAR_DIR/simulation_candidates_gen${ITER}_lower.txt"
+    SEQS="$PAR_DIR/seq_gen${ITER}.txt"
+
+    # Combine whichever fronts exist; error if neither found.
+    if [[ -f "$SEQ_UPPER" && -f "$SEQ_LOWER" ]]; then
+        cat "$SEQ_UPPER" "$SEQ_LOWER" > "$SEQS"
+    elif [[ -f "$SEQ_UPPER" ]]; then
+        echo "Note: only upper-front candidates found for iteration $ITER; lower-front absent."
+        cp "$SEQ_UPPER" "$SEQS"
+    elif [[ -f "$SEQ_LOWER" ]]; then
+        echo "Note: only lower-front candidates found for iteration $ITER; upper-front absent."
+        cp "$SEQ_LOWER" "$SEQS"
+    else
+        echo "Error: no candidate sequence files found for iteration $ITER in $PAR_DIR" >&2
+        exit 1
+    fi
+
+    cp "$SEQS" "${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/seq_gen${ITER}.txt"
+    LOG_TAG="gen$ITER"
 fi
 
-PAR_DIR="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS"
 LOGS="$PAR_DIR/logs/"
 mkdir -p "$LOGS"
+cd "$PAR_DIR"   # polymerize / gendata drop temp files into cwd
 
-# al_pipeline mirrors candidates into EOS/ at these paths (primary location):
-SEQ_UPPER="$PAR_DIR/simulation_candidates_gen${ITER}_upper.txt"
-SEQ_LOWER="$PAR_DIR/simulation_candidates_gen${ITER}_lower.txt"
-SEQS="$PAR_DIR/seq_gen${ITER}.txt"
-
-# Combine whichever fronts exist; error if neither found.
-if [[ -f "$SEQ_UPPER" && -f "$SEQ_LOWER" ]]; then
-    cat "$SEQ_UPPER" "$SEQ_LOWER" > "$SEQS"
-elif [[ -f "$SEQ_UPPER" ]]; then
-    echo "Note: only upper-front candidates found for iteration $ITER; lower-front absent."
-    cp "$SEQ_UPPER" "$SEQS"
-elif [[ -f "$SEQ_LOWER" ]]; then
-    echo "Note: only lower-front candidates found for iteration $ITER; upper-front absent."
-    cp "$SEQ_LOWER" "$SEQS"
-else
-    echo "Error: no candidate sequence files found for iteration $ITER in $PAR_DIR" >&2
-    exit 1
-fi
-
-cp "$SEQS" "${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/seq_gen${ITER}.txt"
-
-CMD="python make_eos.py --model \"$MODEL\" --num_polymers 100 \
+CMD="python \"${REPO_ROOT}/simulation/make_eos.py\" --model \"$MODEL\" --num_polymers 100 \
     --density_start \"$RHO_i\" --density_end \"$RHO_f\" --density_step \"$DRHO\" \
     --sequence_file \"$SEQS\" --parent_dir \"$PAR_DIR\""
 [[ "$CHECK_RHO" == true ]] && CMD+=" --check_densities"
@@ -109,6 +106,7 @@ CMD="python make_eos.py --model \"$MODEL\" --num_polymers 100 \
 [[ -n "$MAX_CORES" ]] && CMD+=" --max_cores $MAX_CORES"
 eval "$CMD"
 
-mv "make_eos.out" "$LOGS/make_eos_gen$ITER.out"
-mv "make_eos.err" "$LOGS/make_eos_gen$ITER.err"
+mv "make_eos.out" "$LOGS/make_eos_${LOG_TAG}.out"
+mv "make_eos.err" "$LOGS/make_eos_${LOG_TAG}.err"
+
 conda deactivate
