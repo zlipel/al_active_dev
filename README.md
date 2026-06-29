@@ -24,15 +24,99 @@ al_active_dev/
 
 ## Installation
 
-`al_pipeline` is a proper Python package. Install it in editable mode so all scripts
-can import from it directly:
+The full pipeline (al_pipeline + simulation + analysis + beam search) has cluster
+dependencies (intel compilers, openmpi for beam search, a built C++ extension)
+that aren't required for local development. The cluster bootstrap is documented
+in its own section; for local dev just create the conda env.
+
+### Local dev (any platform)
 
 ```bash
-pip install -e al_pipeline/
+conda env create -f config/environment.yml
+conda activate al_active_dev
+pip install -e .              # installs al_pipeline in editable mode
+
+pytest tests/                 # 102 tests; should pass with no extra setup
 ```
 
-The package requires PyTorch, GPyTorch, and standard scientific Python (numpy, pandas,
-scikit-learn). See `pyproject.toml` for the full dependency list.
+The vendored C++ MSD extension and `mpi4py` are stubbed by the test suite, so
+neither is needed locally. See `external/md_calcs/README.md` if you want to
+build the extension on macOS.
+
+### Cluster bootstrap (Princeton Stellar)
+
+One-time setup on a login node. Each step assumes you're inside
+`~/PROJECTS/al_active_dev` after cloning.
+
+**1. Conda env**
+
+```bash
+module purge
+module load anaconda3/2024.6
+conda env create -f config/environment.yml
+conda activate al_active_dev
+pip install -e .
+```
+
+**2. Build the md_calcs C++ extension**
+
+The build uses **cluster modules**, not conda toolchain — `cxx-compiler`,
+`openmp`, and `cmake` are deliberately absent from `environment.yml` so conda
+doesn't shadow the cluster's intel/intel-mpi/libstdc++.
+
+```bash
+module purge
+module load anaconda3/2024.6
+module load intel/2022.2
+module load cmake
+conda activate al_active_dev
+
+cd external/md_calcs
+mkdir -p build && cd build
+cmake ..
+make -j4
+cd ../../..
+```
+
+Result: `external/md_calcs/md_calcs_par.cpython-312-x86_64-linux-gnu.so`. Re-run
+the build whenever the conda env's Python version changes. See
+`external/md_calcs/README.md` for details.
+
+**3. Build mpi4py against the cluster's MPI** (beam search only)
+
+Conda's `mpi4py` ships with its own MPI implementation that can't talk to the
+cluster's openmpi. So mpi4py must be built from source with `mpicc` pointing
+at the cluster's openmpi wrapper:
+
+```bash
+module purge
+module load anaconda3/2024.6
+module load openmpi/gcc/4.1.2
+conda activate al_active_dev
+
+MPICC=$(which mpicc) pip install --no-binary=mpi4py mpi4py
+python -c "from mpi4py import MPI; print('mpi4py:', MPI.Get_library_version())"
+```
+
+**4. Sanity check**
+
+```bash
+conda activate al_active_dev
+pytest tests/                       # should be 102 passed
+CLUSTER_TESTS=1 pytest tests/       # also runs @pytest.mark.cluster tests
+```
+
+**5. Cluster-specific env vars**
+
+`config/cluster.env` defines `HOME_AL`, `SCRATCH_AL`, `DB_PATH`, etc. Submit
+scripts source this file, so check the paths match your account. The
+`GENDATA` env var must also be set if not already in your `~/.bashrc`:
+
+```bash
+export GENDATA="${HOME}/scripts/GENDATA/gendata.py"   # adjust path
+```
+
+After this, `git pull` is enough to roll forward when changes land on main.
 
 ---
 

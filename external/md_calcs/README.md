@@ -16,33 +16,42 @@ project is self-contained.
 The compiled `.so` is **not** vendored — it depends on the Python ABI and is
 expected to be built per-environment. The build drops it here, beside the source.
 
-## Build (Python 3.12, the project's standard)
+## Build on the cluster
+
+The build needs four things from the cluster's module system: a Python (via
+anaconda3), a C++ compiler (intel), OpenMP (comes with the compiler), and CMake.
+Conda's own `cxx-compiler` / `openmp` / `cmake` are deliberately **not** in
+`config/environment.yml` — using them would link against conda's libstdc++ and
+clash with the cluster's runtime libraries.
 
 ```bash
-# Activate the project conda env first (gives you pybind11, cmake, openmp):
+# load everything in this order
 module purge
-module load anaconda3/2024.6   # or local equivalent
+module load anaconda3/2024.6
+module load intel/2022.2
+module load cmake
 conda activate al_active_dev
 
+# build
 cd external/md_calcs
 mkdir -p build && cd build
 cmake ..
 make -j4
+ls ../md_calcs_par*.so   # e.g. md_calcs_par.cpython-312-x86_64-linux-gnu.so
 ```
 
-The build will produce something like `md_calcs_par.cpython-312-x86_64-linux-gnu.so`
-(filename depends on the active interpreter's ABI tag) in this directory. Once it
-exists, `from external.md_calcs import md_calcs_par` will resolve to it.
-
-For other Python versions: just rebuild — the CMake configure step picks up the
-active interpreter automatically via `pybind11`.
+The CMake configure step auto-discovers the active Python via `pybind11`, so the
+.so naturally targets whichever Python you're in. Re-run from `build/` whenever
+the Python version changes.
 
 ## Local development (macOS / non-cluster)
 
 You do not need to build this on the dev box. `tests/conftest.py` registers a
 shape-faithful stub at `external.md_calcs.md_calcs_par`, so the analysis tests
 pass without the real extension. Tests that exercise the actual MSD math should
-be marked `@pytest.mark.cluster` and run on the cluster with `CLUSTER_TESTS=1`.
+be marked `@pytest.mark.cluster` and run on a host where the .so exists, with
+`CLUSTER_TESTS=1`.
 
-If you do want a local build, the same recipe works — pybind11 + OpenMP are
-included in `config/environment.yml`.
+If you do want a local build, install `cmake` and `pybind11` via pip/brew/conda
+and follow the same recipe. The compiler/OpenMP step depends on your platform
+(Apple Clang's OpenMP support is fiddly; gcc/g++ from homebrew is simpler).
