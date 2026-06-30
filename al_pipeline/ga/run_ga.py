@@ -60,18 +60,13 @@ def _fitness_batch_analytic(
     """
     GA minimizes. We return negative EHVI since the genetic algorithm minimizes but acquisition is maximized (+ optional similarity penalty).
     """
-    # ints -> strings
+    # ints -> strings -> raw featurized DataFrame
     seq_strs = [ga_utils.back_AA(np.asarray(s, dtype=int)) for s in sequences]
+    X_raw_df = featurizer.featurize_many(seq_strs).astype(np.float32)
 
-    # featurize
-    Xraw = np.vstack([np.asarray(featurizer.featurize(s), dtype=np.float32) for s in seq_strs])
-
-    # normalize using shared training stats
-    Xn = convert_and_normalize_features(Xraw, train=False, stats=normalization_stats)
-    Xn = np.asarray(Xn, dtype=np.float32)
-
-    # get mean + std deviation for this set of children
-    pool = surrogate.predict_pool(Xn)
+    # Surrogate consumes RAW features; it normalizes internally with whatever
+    # stats it needs (global stats for GlobalGPRSurrogate, per-expert for MoE).
+    pool = surrogate.predict_pool(X_raw_df)
     pred1, pred2 = pool.means[:, 0], pool.means[:, 1]
     std1, std2 = pool.stds[:, 0], pool.stds[:, 1]
 
@@ -85,13 +80,19 @@ def _fitness_batch_analytic(
 
     vals = np.asarray(vals, dtype=np.float32).reshape(-1)
 
-    # similarity penalty if enabled
+    # similarity penalty if enabled. The penalty compares candidate features
+    # against previously selected children — both in *globally normalized*
+    # space, since `propseq_arr` is stored that way. Done lazily so callers
+    # that don't use similarity never pay the normalize cost.
     if cfg.exploration_strategy == "similarity_penalty":
         if propseq_arr.size == 0:
             alpha_pen = 1.0
             fit = -vals * alpha_pen
         else:
-            alpha_pen = ga_utils.alpha(Xn, propseq_arr, seq_id)  # shape [B]
+            Xn = convert_and_normalize_features(
+                X_raw_df.to_numpy(dtype=np.float32), train=False, stats=normalization_stats,
+            )
+            alpha_pen = ga_utils.alpha(np.asarray(Xn, dtype=np.float32), propseq_arr, seq_id)
             fit = -vals * np.asarray(alpha_pen, dtype=np.float32)
     else:
         fit = -vals
@@ -144,17 +145,15 @@ def _fitness_batch_mc(
         raise ValueError(
             "MC-EHVI requires a surrogate that supports joint sampling across "
             "objectives. The current surrogate does not — use gpr_multitask "
-            "(or future MoE) for MC mode."
+            "(or MoE) for MC mode."
         )
 
     seq_strs = [ga_utils.back_AA(np.asarray(s, dtype=int)) for s in sequences]
-    Xraw = np.vstack([np.asarray(featurizer.featurize(s), dtype=np.float32) for s in seq_strs])
-    Xn = convert_and_normalize_features(Xraw, train=False, stats=normalization_stats)
-    Xn = np.asarray(Xn, dtype=np.float32)
+    X_raw_df = featurizer.featurize_many(seq_strs).astype(np.float32)
 
     # Build the joint posterior ONCE for this candidate batch; the MC inner
     # loop samples from it in chunks until the std-error tolerance is hit.
-    pool = surrogate.predict_pool(Xn)
+    pool = surrogate.predict_pool(X_raw_df)
 
     ehvi_vals = ehvi.monte_carlo_ehvi_batch(
         pool,
@@ -173,7 +172,10 @@ def _fitness_batch_mc(
         if propseq_arr.size == 0:
             fit = -ehvi_vals
         else:
-            alpha_pen = ga_utils.alpha(Xn, propseq_arr, seq_id)
+            Xn = convert_and_normalize_features(
+                X_raw_df.to_numpy(dtype=np.float32), train=False, stats=normalization_stats,
+            )
+            alpha_pen = ga_utils.alpha(np.asarray(Xn, dtype=np.float32), propseq_arr, seq_id)
             fit = -ehvi_vals * np.asarray(alpha_pen, dtype=np.float32)
     else:
         fit = -ehvi_vals
@@ -200,8 +202,14 @@ def run_one_candidate(
 
     featurizer = sf.SequenceFeaturizer(model_name=cfg.model.lower(), db_path=cfg.db_path)
     model_bundle = ga_utils.load_models(cfg=cfg, temp = temp, device='cpu')
-    surrogate = make_surrogate(cfg, model_bundle)
     normalization_stats = ga_utils.load_normalization_stats(cfg.paths.norm_stats)
+    # GA pipeline only wires the global-GPR path here; MoE goes through the
+    # CLI in feat/moe-cli-al, which constructs its own MoEBundle.
+    surrogate = make_surrogate(
+        cfg,
+        model_bundle=model_bundle,
+        normalization_stats=normalization_stats,
+    )
 
     pareto_front, pareto_feats, parent_seqs = ga_utils.load_front(cfg=cfg, seq_id=seq_id)
 

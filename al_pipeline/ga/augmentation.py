@@ -5,7 +5,6 @@ from al_pipeline.training.ml_models import MultitaskGPRegressionModel, GPRegress
 from al_pipeline.training.kfold_training import save_chkpt
 from al_pipeline.data_prep.data_loading import load_dataset, convert_and_normalize_features
 from .ga_utils import load_normalization_stats, load_models
-from al_pipeline.surrogates import make_surrogate
 import al_pipeline.featurization.sequence_featurizer as sf
 import numpy as np
 import torch
@@ -112,12 +111,27 @@ def predict_for_augmentation(model_bundle, Xn, cfg, return_std: bool = False):
         # mu: (N,2), cov: (N,2,2)
 
     elif cfg.train_model_type == "gpr_singletask":
-        # no covariance: treat as diagonal
+        # No cross-objective covariance for single-task GPs — diagonal cov.
+        # Goes direct to the per-objective models rather than through the
+        # surrogate ABC: the surrogate's `predict_pool` takes raw features
+        # (so MoE/global can share the contract), but here we already have
+        # normalized features handy and don't need MoE in the augmentation
+        # path. Direct calls are simpler than re-inverting the normalization.
         Xn = torch.tensor(Xn.copy(), dtype=torch.float32)
         if Xn.ndim == 1:
             Xn = Xn.view(1,-1)
-        pool = make_surrogate(cfg, model_bundle).predict_pool(Xn)
-        mu, std = pool.means, pool.stds
+        models = model_bundle["models"]
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            post1 = models[cfg.obj1](Xn)
+            post2 = models[cfg.obj2](Xn)
+            mu = np.column_stack([
+                post1.mean.detach().cpu().numpy().reshape(-1),
+                post2.mean.detach().cpu().numpy().reshape(-1),
+            ])
+            std = np.column_stack([
+                post1.stddev.detach().cpu().numpy().reshape(-1),
+                post2.stddev.detach().cpu().numpy().reshape(-1),
+            ])
         cov = np.zeros((mu.shape[0], 2, 2), dtype=np.float32)
         cov[:,0,0] = std[:,0]**2
         cov[:,1,1] = std[:,1]**2
