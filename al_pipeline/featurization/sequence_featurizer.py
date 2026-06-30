@@ -21,7 +21,17 @@ class SequenceFeaturizer:
 
     def _load_model_params(self):
         self.ff_db = SourceFileLoader('ff_db', f"{self.db_path}/ff_db.py").load_module()
-        self.ff_db.import_parameters(f"{self.db_path}/{MODEL_TO_FILE[self.model]}", verbose=False)
+        # Newer ff_db.py supports verbose=False to suppress the "# Using ..."
+        # print on every load. Older copies (still on some checkouts) don't take
+        # the kwarg — fall back to a verbose call there.
+        try:
+            self.ff_db.import_parameters(
+                f"{self.db_path}/{MODEL_TO_FILE[self.model]}", verbose=False,
+            )
+        except TypeError:
+            self.ff_db.import_parameters(
+                f"{self.db_path}/{MODEL_TO_FILE[self.model]}",
+            )
         self.atm_types = self.ff_db.atm_types
         self.charge_dict = {aa: self.atm_types[aa]['q'] for aa in AMINO_ACIDS}
         self.mass_dict = {aa: self.atm_types[aa]['m'] for aa in AMINO_ACIDS}
@@ -37,19 +47,32 @@ class SequenceFeaturizer:
                 self.charge_dict[f"{aa}n"] = self.atm_types[f"{aa}n"]['q']
                 self.charge_dict[f"{aa}c"] = self.atm_types[f"{aa}c"]['q']
 
+    def _effective_charge(self, seq: str, i: int) -> float:
+        """Charge at position i, accounting for CALVADOS N/C-terminal modifications.
+
+        CALVADOS defines residues at sequence termini with shifted charges
+        (e.g. neutral 'A' becomes 'An' with q=+1 at position 0 and 'Ac' with
+        q=-1 at the C-terminal position). Use this helper everywhere a per-
+        residue charge is consumed so the featurizer is internally consistent.
+        """
+        aa = seq[i]
+        if self.model == "calvados":
+            if i == 0:
+                return self.charge_dict[f"{aa}n"]
+            if i == len(seq) - 1:
+                return self.charge_dict[f"{aa}c"]
+        return self.charge_dict[aa]
+
     def featurize(self, sequence: str) -> list:
         seq_len = len(sequence)
         comp = [sequence.count(aa) for aa in AMINO_ACIDS]
         entropy = -sum(p / seq_len * np.log2(p / seq_len) for p in comp if p > 0)
 
-        net_charge = sum(self.charge_dict[aa] for aa in sequence)
-        if self.model == "calvados":
-            net_charge += self.charge_dict[f"{sequence[0]}n"] - self.charge_dict[sequence[0]]
-            net_charge += self.charge_dict[f"{sequence[-1]}c"] - self.charge_dict[sequence[-1]]
-        abs_net_charge = abs(net_charge) # net charge of the seqence
+        net_charge = sum(self._effective_charge(sequence, i) for i in range(seq_len))
+        abs_net_charge = abs(net_charge)
 
-        pos_frac = sum(1 for aa in sequence if self.charge_dict[aa] > 0) # number of positively charged beads
-        neg_frac = sum(1 for aa in sequence if self.charge_dict[aa] < 0) # number of negatively charged beads
+        pos_frac = sum(1 for i in range(seq_len) if self._effective_charge(sequence, i) > 0)
+        neg_frac = sum(1 for i in range(seq_len) if self._effective_charge(sequence, i) < 0)
 
         mass = sum(self.mass_dict[aa] for aa in sequence)
 
@@ -67,7 +90,7 @@ class SequenceFeaturizer:
         else:
             scd = self._compute_scd(sequence)
             shd = self._compute_shd(sequence)
-            lambda_sum = sum(self.lambda_dict[aa] for aa in sequence) 
+            lambda_sum = sum(self.lambda_dict[aa] for aa in sequence)
             return comp + [
                 seq_len, scd, shd, abs_net_charge,
                 lambda_sum, pos_frac, neg_frac,
@@ -78,39 +101,33 @@ class SequenceFeaturizer:
         N = len(seq)
         result = 0.0
         for i in range(N):
-            if self.model == "calvados" and i == 0:
-                charge_i = self.charge_dict[f"{seq[i]}n"]
-            elif self.model == "calvados" and i == N - 1:
-                charge_i = self.charge_dict[f"{seq[i]}c"]
-            else:
-                charge_i = self.charge_dict[seq[i]]
+            charge_i = self._effective_charge(seq, i)
             for j in range(i + 1, N):
-                if self.model == "calvados" and j == 0:
-                    charge_j = self.charge_dict[f"{seq[j]}n"]
-                elif self.model == "calvados" and j == N - 1:
-                    charge_j = self.charge_dict[f"{seq[j]}c"]
-                else:
-                    charge_j = self.charge_dict[seq[j]]
+                charge_j = self._effective_charge(seq, j)
                 result += charge_i * charge_j * np.sqrt(j - i)
         return result / N
 
     def _compute_shd(self, seq):
         N = len(seq)
-        return sum(((self.lambda_dict[seq[i]] + self.lambda_dict[seq[j]])) / (j - i)
-                   for i in range(N) for j in range(i + 1, N)) / N
+        return sum(
+            (self.lambda_dict[seq[i]] + self.lambda_dict[seq[j]]) / (j - i)
+            for i in range(N) for j in range(i + 1, N)
+        ) / N
 
     def _extract_mpipi_features(self, seq):
         n = len(seq)
-        shd = 0.
-        scd = 0.
-        avg_lambda = sum(self.nonbon_types[tuple(sorted((aa, aa)))]['eps']/0.2 for aa in seq) 
+        shd = 0.0
+        scd = 0.0
+        avg_lambda = sum(self.nonbon_types[tuple(sorted((aa, aa)))]['eps'] / 0.2 for aa in seq)
         for i in range(n):
+            qi = self._effective_charge(seq, i)
             for j in range(i + 1, n):
+                qj = self._effective_charge(seq, j)
                 pair = tuple(sorted((seq[i], seq[j])))
                 if pair in self.nonbon_types:
                     eps_ij = self.nonbon_types[pair]["eps"] / 0.2
                     shd += eps_ij / (j - i)
-                    scd += self.charge_dict[seq[i]] * self.charge_dict[seq[j]] * np.sqrt(j - i)
+                    scd += qi * qj * np.sqrt(j - i)
         return [scd / n, shd / n, avg_lambda]
     
     def featurize_many(self, sequences):
