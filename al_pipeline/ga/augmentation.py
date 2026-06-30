@@ -5,7 +5,7 @@ from al_pipeline.training.ml_models import MultitaskGPRegressionModel, GPRegress
 from al_pipeline.training.kfold_training import save_chkpt
 from al_pipeline.data_prep.data_loading import load_dataset, convert_and_normalize_features
 from .ga_utils import load_normalization_stats, load_models
-from .run_ga import _predict_mu_std
+from al_pipeline.surrogates import make_surrogate
 import al_pipeline.featurization.sequence_featurizer as sf
 import numpy as np
 import torch
@@ -116,7 +116,8 @@ def predict_for_augmentation(model_bundle, Xn, cfg, return_std: bool = False):
         Xn = torch.tensor(Xn.copy(), dtype=torch.float32)
         if Xn.ndim == 1:
             Xn = Xn.view(1,-1)
-        mu, std = _predict_mu_std(cfg=cfg, model_bundle=model_bundle, Xn=Xn)
+        pool = make_surrogate(cfg, model_bundle).predict_pool(Xn)
+        mu, std = pool.means, pool.stds
         cov = np.zeros((mu.shape[0], 2, 2), dtype=np.float32)
         cov[:,0,0] = std[:,0]**2
         cov[:,1,1] = std[:,1]**2

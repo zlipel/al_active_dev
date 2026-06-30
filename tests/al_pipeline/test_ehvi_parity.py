@@ -18,29 +18,30 @@ from al_pipeline.acquisition.ehvi import (
     monte_carlo_ehvi_batch,
     front_augmentation,
 )
+from al_pipeline.surrogates.base import PoolPosterior
 
 
-# Fixed-mean fixed-std posterior; same as the one used in test_ehvi_mc but kept
-# local here to avoid a cross-test fixture import.
-class _GaussianPosterior:
-    def __init__(self, mus: torch.Tensor, sigmas: torch.Tensor):
-        self.mus = mus
-        self.sigmas = sigmas
-
-    def rsample(self, sample_shape):
-        S = int(sample_shape[0])
-        B, D = self.mus.shape
-        eps = torch.randn(S, B, D)
-        return self.mus[None, :, :] + eps * self.sigmas[None, :, :]
-
-
-class _FakeModel:
+# Fixed-mean fixed-std PoolPosterior; same shape as the GlobalGPRSurrogate returns,
+# kept local here to avoid a cross-test fixture import.
+class _FakePoolPosterior(PoolPosterior):
     def __init__(self, mus, sigmas):
-        self._mus = torch.as_tensor(mus, dtype=torch.float32)
-        self._sigmas = torch.as_tensor(sigmas, dtype=torch.float32)
+        self._means = np.asarray(mus, dtype=np.float64)
+        self._stds = np.asarray(sigmas, dtype=np.float64)
+        self._mus_t = torch.as_tensor(mus, dtype=torch.float32)
+        self._sigmas_t = torch.as_tensor(sigmas, dtype=torch.float32)
 
-    def __call__(self, _x):
-        return _GaussianPosterior(self._mus, self._sigmas)
+    @property
+    def means(self):
+        return self._means
+
+    @property
+    def stds(self):
+        return self._stds
+
+    def sample(self, n_samples: int) -> torch.Tensor:
+        B, D = self._mus_t.shape
+        eps = torch.randn(n_samples, B, D)
+        return self._mus_t[None, :, :] + eps * self._sigmas_t[None, :, :]
 
 
 @pytest.mark.parametrize(
@@ -67,10 +68,9 @@ def test_analytic_mc_parity_single_candidate(mu, sigma):
     )[0])
 
     base_hv = hypervolume(pf_min).compute(ref)
-    model = _FakeModel(mu_arr, sig_arr)
-    candidates = torch.zeros(1, 3)
+    pool = _FakePoolPosterior(mu_arr, sig_arr)
     e_mc = float(monte_carlo_ehvi_batch(
-        candidates, model, pf_min, ref, base_hv,
+        pool, pf_min, ref, base_hv,
         front="lower",
         min_samples=512, max_samples=4096, stderr_tol=5e-3, chunk_size=256,
     )[0])
@@ -102,10 +102,9 @@ def test_analytic_mc_parity_batch_ordering():
 
     e_analytic = ehvi_analytic(mus[:, 0], sigmas[:, 0], mus[:, 1], sigmas[:, 1], aug)
 
-    model = _FakeModel(mus, sigmas)
-    candidates = torch.zeros(mus.shape[0], 3)
+    pool = _FakePoolPosterior(mus, sigmas)
     e_mc = monte_carlo_ehvi_batch(
-        candidates, model, pf_min, ref, base_hv,
+        pool, pf_min, ref, base_hv,
         front="lower",
         min_samples=512, max_samples=4096, stderr_tol=5e-3, chunk_size=256,
     )
