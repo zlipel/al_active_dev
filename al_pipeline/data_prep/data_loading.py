@@ -3,7 +3,171 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 
-# NOTE: This is *hardcoded*, and should be modified if we change features! 
+
+# ----------------------------------------------------------------------
+# DataFrame-based feature pipeline (used by MoE per-expert training)
+# ----------------------------------------------------------------------
+#
+# The existing `convert_and_normalize_features` operates on a 29-column numpy
+# array with hardcoded indices and does convert + fit + apply in a single call.
+# That's fine for the global-GPR path that trains on every row at once, but the
+# MoE workflow needs to fit a feature normalizer SEPARATELY per expert (PS
+# rows, nonPS rows, all rows). For that the three steps must be callable
+# independently:
+#
+#   df_conv     = convert_features(features_df)
+#   stats_ps    = fit_feature_normalizer(df_conv.loc[is_ps])
+#   df_norm_ps  = apply_feature_normalizer(df_conv.loc[is_ps], stats_ps)
+#
+# These DataFrame functions are numerically equivalent to the numpy path: a
+# round-trip through `df.values` produces the same normalized array. Verified
+# by tests/al_pipeline/test_feature_pipeline.py.
+
+_FEATURES_TO_STANDARDIZE = (
+    "beads(+)", "beads(-)", "sum lambda", "mol wt", "SHD", "SCD", "|net charge|",
+)
+_FEATURES_DIVIDED_BY_LENGTH = (
+    "beads(+)", "beads(-)", "|net charge|", "sum lambda", "mol wt",
+)
+
+
+def convert_features(features_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Length-normalize raw features WITHOUT fitting any standardizer.
+
+    The first 20 columns (AA counts) become fractions, and a handful of
+    aggregate features get divided by length too. No normalization stats are
+    fit here — that's `fit_feature_normalizer`'s job.
+
+    All columns are cast to float32 to keep the entire pipeline in single
+    precision (consistent with the numpy path and with downstream GPyTorch
+    training tensors).
+
+    Parameters
+    ----------
+    features_df : pd.DataFrame
+        Raw featurizer output. Must contain column 'length' and the standard
+        29-column feature layout produced by SequenceFeaturizer.featurize_many.
+
+    Returns
+    -------
+    pd.DataFrame
+        Same shape and columns as the input, with the length-normalized
+        operations applied, dtype float32. Input is not mutated.
+    """
+    df = features_df.astype(np.float32, copy=True)
+    # First 20 columns are AA counts (in AMINO_ACIDS order).
+    for col in df.columns[:20]:
+        df[col] = df[col] / df["length"]
+    for col in _FEATURES_DIVIDED_BY_LENGTH:
+        df[col] = df[col] / df["length"]
+    return df
+
+
+def fit_feature_normalizer(features_converted_df: pd.DataFrame) -> dict:
+    """
+    Fit per-feature normalization statistics on already-converted features.
+
+    Standardization uses population std (ddof=0) — matches the existing numpy
+    `convert_and_normalize_features` and treats the AL generations as the
+    population, not a sample of a larger one. Stats are stored as float32 so
+    a subsequent `apply_feature_normalizer` stays in single precision.
+
+    Parameters
+    ----------
+    features_converted_df : pd.DataFrame
+        Output of `convert_features`. Standardization stats are fit on whatever
+        subset of rows is passed (e.g. PS rows only for the PS expert).
+
+    Returns
+    -------
+    dict
+        Per-feature stats. Each entry has a 'type' key, plus the stats needed
+        to apply that type:
+          - {'type': 'standard', 'mean': float32, 'std': float32}
+          - {'type': 'minmax',   'min':  float32, 'max': float32, 'range': float32}
+          - {'type': 'shanent',  'max':  float32}
+    """
+    stats: dict = {}
+
+    for feat in _FEATURES_TO_STANDARDIZE:
+        col = features_converted_df[feat]
+        mean = float(col.mean())
+        # population std (ddof=0) — matches convert_and_normalize_features
+        std = float(col.std(ddof=0))
+        if pd.isna(mean):
+            mean = 0.0
+        if pd.isna(std) or std == 0:
+            std = 1.0
+        stats[feat] = {
+            "type": "standard",
+            "mean": np.float32(mean),
+            "std":  np.float32(std),
+        }
+
+    min_L = float(features_converted_df["length"].min())
+    max_L = float(features_converted_df["length"].max())
+    range_L = max_L - min_L
+    if range_L == 0 or pd.isna(range_L):
+        range_L = 1.0
+    stats["length"] = {
+        "type": "minmax",
+        "min":   np.float32(min_L),
+        "max":   np.float32(max_L),
+        "range": np.float32(range_L),
+    }
+
+    max_S = float(features_converted_df["shan ent"].max())
+    if pd.isna(max_S) or max_S == 0:
+        max_S = 1.0
+    stats["shan ent"] = {"type": "shanent", "max": np.float32(max_S)}
+
+    return stats
+
+
+def apply_feature_normalizer(
+    features_converted_df: pd.DataFrame,
+    stats: dict,
+) -> pd.DataFrame:
+    """
+    Apply previously-fit normalization stats to converted features.
+
+    All arithmetic stays in float32 (stats are float32, the input is float32
+    from `convert_features`). The output is cast to float32 explicitly to
+    guard against accidental upcasting if a caller passes float64 input.
+
+    Parameters
+    ----------
+    features_converted_df : pd.DataFrame
+        Output of `convert_features` (length-normalized, not standardized).
+    stats : dict
+        Output of `fit_feature_normalizer`.
+
+    Returns
+    -------
+    pd.DataFrame
+        Same shape as input, fully normalized, dtype float32. Input is not
+        mutated.
+    """
+    df = features_converted_df.astype(np.float32, copy=True)
+    for feat, s in stats.items():
+        kind = s["type"]
+        if kind == "standard":
+            df[feat] = (df[feat] - s["mean"]) / s["std"]
+        elif kind == "minmax":
+            df[feat] = (df[feat] - s["min"]) / s["range"]
+        elif kind == "shanent":
+            df[feat] = df[feat] / s["max"] - np.float32(1.0)
+        else:
+            raise ValueError(f"Unknown normalizer type: {kind!r} for feature {feat!r}")
+    return df
+
+
+# ----------------------------------------------------------------------
+# Numpy-array pipeline (existing global-GPR path; unchanged behavior)
+# ----------------------------------------------------------------------
+
+# NOTE: This is *hardcoded*, and should be modified if we change features!
 def convert_and_normalize_features(
     X: np.ndarray,
     train: bool = True,
