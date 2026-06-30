@@ -68,7 +68,7 @@ def _to_min_space(pareto_Y: np.ndarray, front: str) -> np.ndarray:
     - upper: max-max -> negate so we minimize
     - lower: min-min -> unchanged
     """
-    Y = np.asarray(pareto_Y, dtype=np.float32)
+    Y = np.asarray(pareto_Y, dtype=np.float64)
     if front == "upper":
         return -Y
     if front == "lower":
@@ -101,7 +101,7 @@ def _ref_point_on_IN_line(
     d = N - I
     L = float(np.linalg.norm(d))
     if L < 1e-8:
-        u = np.array([1.0, 0.0], dtype=np.float32)
+        u = np.array([1.0, 0.0], dtype=np.float64)
         L = 1.0
     else:
         u = d / L
@@ -123,7 +123,7 @@ def _ref_point_halfway(pmin: np.ndarray, frac: float = 0.5) -> np.ndarray:
 
     d = N - I
     L = float(np.linalg.norm(d))
-    u = np.array([1.0, 0.0], dtype=np.float32) if L < 1e-8 else d / L
+    u = np.array([1.0, 0.0], dtype=np.float64) if L < 1e-8 else d / L
     
     R0_on_IN = N + np.dot(R0 - N, u)*u
 
@@ -157,18 +157,18 @@ def _augment_front(
 
     Returns: (N+2,2) array sorted by y2 ascending.
     """
-    pf = np.asarray(pareto_front_min, dtype=np.float32)
+    pf = np.asarray(pareto_front_min, dtype=np.float64)
     r1, r2 = map(float, ref_point_min)
 
     # sort by objective 2 ascending (minimization)
-    pf_sorted = np.array(sorted(map(tuple, pf), key=lambda p: p[1]), dtype=np.float32)
+    pf_sorted = np.array(sorted(map(tuple, pf), key=lambda p: p[1]), dtype=np.float64)
 
     # sentinel points to close the stripes toward the reference rectangle
     # (r1, -inf) and (-inf, r2)
     return np.vstack([
-        np.array([r1,  -1*big], dtype=np.float32),
+        np.array([r1,  -1*big], dtype=np.float64),
         pf_sorted,
-        np.array([-1*big, r2], dtype=np.float32),
+        np.array([-1*big, r2], dtype=np.float64),
     ])
 
 
@@ -231,7 +231,7 @@ def filter_nondominated(points: np.ndarray) -> np.ndarray:
     Returns boolean mask of nondominated points for 2D minimization.
     A point is dominated if there exists another point <= in both dims and < in at least one.
     """
-    P = np.asarray(points, dtype=np.float32)
+    P = np.asarray(points, dtype=np.float64)
     n = P.shape[0]
     if n == 0:
         return np.zeros(0, dtype=bool)
@@ -305,7 +305,7 @@ def monte_carlo_ehvi_batch(
     """
  
     B = candidate_tensor.size(0)
-    ehvi_vals = np.zeros(B, dtype=np.float32)
+    ehvi_vals = np.zeros(B, dtype=np.float64)
     with torch.no_grad(), gpytorch.settings.fast_pred_var():
         posterior = model(candidate_tensor)
 
@@ -320,7 +320,10 @@ def monte_carlo_ehvi_batch(
             with torch.no_grad():
                 samples = posterior.rsample(torch.Size([S]))  # (S, B, 2)
 
-            s_np = samples[:, i, :].detach().cpu().numpy()   # (S, 2)
+            # Posterior samples come from torch in float32 by default; promote
+            # to float64 here so the EHVI stripe math has full precision (small
+            # stripe widths can lose digits at fp32 epsilon).
+            s_np = samples[:, i, :].detach().cpu().numpy().astype(np.float64)   # (S, 2)
             if front == "upper":
                 s_np *= -1.0
 
@@ -330,7 +333,7 @@ def monte_carlo_ehvi_batch(
             drawn += S
 
             if drawn >= min_samples:
-                arr = np.asarray(improvements, dtype=np.float32)
+                arr = np.asarray(improvements, dtype=np.float64)
                 stderr = arr.std(ddof=1) / np.sqrt(arr.size) if arr.size > 1 else np.inf
                 if stderr < stderr_tol:
                     converged = True
