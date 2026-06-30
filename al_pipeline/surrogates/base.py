@@ -26,6 +26,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 import numpy as np
+import pandas as pd
 import torch
 
 
@@ -70,24 +71,29 @@ class Surrogate(ABC):
 
     Implementations:
       - GlobalGPRSurrogate — wraps the existing multitask / singletask GPR.
-      - (future) MoESurrogate — global + PS + nonPS experts, blended by RF gate.
+      - MoESurrogate — global + PS + nonPS experts blended by an RF gate.
 
-    The interface is deliberately tiny: one call to `predict_pool` per
-    candidate batch, which returns an object that supports both analytic and
-    MC consumers. Anything more would be premature.
+    The interface takes RAW features (as produced by `SequenceFeaturizer
+    .featurize_many`). Each surrogate handles its own preprocessing internally:
+    GlobalGPRSurrogate stores the global normalization stats and applies them;
+    MoESurrogate routes through per-expert normalizers. The GA stays out of
+    surrogate-specific preprocessing, which keeps the abstraction honest when
+    a new surrogate (DNN, MoE variant, etc.) needs a different pipeline.
     """
 
     @abstractmethod
-    def predict_pool(self, Xn: np.ndarray) -> PoolPosterior:
+    def predict_pool(self, X_raw: pd.DataFrame) -> PoolPosterior:
         """
-        Build a posterior over a batch of *already-normalized* feature vectors.
+        Build a posterior over a batch of raw feature rows.
 
         Parameters
         ----------
-        Xn : np.ndarray
-            Shape (B, n_features). Features must already be normalized with
-            whatever stats the surrogate expects (global stats for
-            GlobalGPRSurrogate; per-expert stats for MoE in the future).
+        X_raw : pd.DataFrame
+            Shape (B, n_features). Columns must be the standard featurizer
+            output (the 20 AA columns + the engineered columns produced by
+            `SequenceFeaturizer.featurize_many`). Each surrogate normalizes
+            internally — the GA never has to know whether the surrogate uses
+            global stats, per-expert stats, or no normalization at all.
 
         Returns
         -------

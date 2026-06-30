@@ -23,8 +23,10 @@ from typing import Any
 
 import gpytorch
 import numpy as np
+import pandas as pd
 import torch
 
+from al_pipeline.data_prep.data_loading import convert_and_normalize_features
 from al_pipeline.surrogates.base import PoolPosterior, Surrogate
 
 
@@ -93,16 +95,27 @@ class GlobalGPRSurrogate(Surrogate):
     """
     Surrogate backed by the existing global GPR (multitask or singletask).
 
-    Construction is split from prediction so the heavy `load_models` work can
-    happen once per GA candidate (it already does — see
-    `run_ga.run_one_candidate`).
+    Stores the *global* feature-normalization stats — produced when the global
+    GPR was trained — and applies them to raw features inside `predict_pool`.
+    That keeps the GA side stupid: it hands the surrogate a DataFrame of raw
+    features from the featurizer and gets back a posterior, with no knowledge
+    of what preprocessing the surrogate happens to need.
     """
 
-    def __init__(self, *, mode: str, model_bundle: dict[str, Any], obj1: str, obj2: str):
+    def __init__(
+        self,
+        *,
+        mode: str,
+        model_bundle: dict[str, Any],
+        normalization_stats: dict,
+        obj1: str,
+        obj2: str,
+    ):
         if mode not in ("gpr_multitask", "gpr_singletask"):
             raise ValueError(f"Unsupported GPR mode: {mode!r}")
         self._mode = mode
         self._bundle = model_bundle
+        self._stats = normalization_stats
         self._obj1 = obj1
         self._obj2 = obj2
 
@@ -110,10 +123,14 @@ class GlobalGPRSurrogate(Surrogate):
     def supports_joint_sampling(self) -> bool:
         return self._mode == "gpr_multitask"
 
-    def predict_pool(self, Xn: np.ndarray) -> PoolPosterior:
-        X_tensor = (
-            Xn if torch.is_tensor(Xn) else torch.tensor(np.asarray(Xn).copy(), dtype=torch.float32)
-        )
+    def _normalize(self, X_raw: pd.DataFrame) -> torch.Tensor:
+        """Convert + standardize via the stored global stats, return a torch tensor."""
+        Xraw = X_raw.to_numpy(dtype=np.float32)
+        Xn = convert_and_normalize_features(Xraw, train=False, stats=self._stats)
+        return torch.tensor(np.asarray(Xn, dtype=np.float32), dtype=torch.float32)
+
+    def predict_pool(self, X_raw: pd.DataFrame) -> PoolPosterior:
+        X_tensor = self._normalize(X_raw)
 
         if self._mode == "gpr_multitask":
             model = self._bundle["model"]
@@ -130,17 +147,54 @@ class GlobalGPRSurrogate(Surrogate):
         return _SingletaskPoolPosterior(post1, post2)
 
 
-def make_surrogate(cfg, model_bundle: dict[str, Any]) -> Surrogate:
+def make_surrogate(
+    cfg,
+    *,
+    model_bundle: dict[str, Any] | None = None,
+    normalization_stats: dict | None = None,
+    moe_bundle=None,
+    moe_policy: str = "soft",
+    moe_threshold: float = 0.5,
+) -> Surrogate:
     """
     Dispatch to the right `Surrogate` based on `cfg.train_model_type`.
 
-    The MoE surrogate will land here as a new `elif` branch on a future
-    feat/moe-core branch.
+    Parameters
+    ----------
+    cfg : ALConfig
+        Used for train_model_type, obj1, obj2 dispatch.
+    model_bundle : dict | None
+        Loaded GPR bundle. Required for `train_model_type` in {gpr_multitask,
+        gpr_singletask}; ignored for moe.
+    normalization_stats : dict | None
+        Global feature normalization stats. Required for the GPR modes;
+        ignored for moe (each MoE expert has its own normalizer).
+    moe_bundle : MoEBundle | None
+        Required when `train_model_type == 'moe'`.
+    moe_policy, moe_threshold
+        MoE gate-blend configuration. Only used when `train_model_type == 'moe'`.
     """
     t = cfg.train_model_type
     if t in ("gpr_multitask", "gpr_singletask"):
+        if model_bundle is None or normalization_stats is None:
+            raise ValueError(f"make_surrogate({t!r}) requires model_bundle + normalization_stats")
         return GlobalGPRSurrogate(
-            mode=t, model_bundle=model_bundle, obj1=cfg.obj1, obj2=cfg.obj2
+            mode=t,
+            model_bundle=model_bundle,
+            normalization_stats=normalization_stats,
+            obj1=cfg.obj1,
+            obj2=cfg.obj2,
+        )
+    if t == "moe":
+        if moe_bundle is None:
+            raise ValueError("make_surrogate('moe') requires moe_bundle")
+        # Imported here to avoid a base-module -> moe import cycle; moe imports
+        # Surrogate / PoolPosterior from base.
+        from al_pipeline.surrogates.moe import MoESurrogate
+        return MoESurrogate(
+            bundle=moe_bundle,
+            policy=moe_policy,
+            threshold=moe_threshold,
         )
     if t == "dnn":
         raise NotImplementedError("DNN surrogate not implemented yet.")
