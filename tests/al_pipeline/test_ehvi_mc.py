@@ -7,7 +7,7 @@ Unit tests for the Monte Carlo EHVI helpers (`ehvi_samples` and `monte_carlo_ehv
   - improving sample -> HV of (front ∪ {sample}) minus base HV
 
 `monte_carlo_ehvi_batch` glues a posterior sampler to that kernel. We test it via a
-fake fixed-mean fixed-std posterior so the test does not need a fitted GP.
+fake `PoolPosterior` with fixed mean/std so the test does not need a fitted GP.
 """
 from __future__ import annotations
 
@@ -20,31 +20,35 @@ from al_pipeline.acquisition.ehvi import (
     monte_carlo_ehvi_batch,
     front_augmentation,
 )
+from al_pipeline.surrogates.base import PoolPosterior
 
 
-# ---------- a posterior stub for monte_carlo_ehvi_batch ----------
+# ---------- a PoolPosterior stub for monte_carlo_ehvi_batch ----------
 
-class _GaussianPosterior:
-    """Posterior with fixed per-candidate means and stds; rsample emits (S, B, 2)."""
-    def __init__(self, mus: torch.Tensor, sigmas: torch.Tensor):
-        self.mus = mus       # (B, 2)
-        self.sigmas = sigmas # (B, 2)
+class _FakePoolPosterior(PoolPosterior):
+    """PoolPosterior with fixed per-candidate means / stds; sample() draws Gaussians.
 
-    def rsample(self, sample_shape):
-        S = int(sample_shape[0])
-        B, D = self.mus.shape
-        eps = torch.randn(S, B, D)
-        return self.mus[None, :, :] + eps * self.sigmas[None, :, :]
-
-
-class _FakeModel:
-    """Mimics enough of a GPyTorch model for monte_carlo_ehvi_batch."""
+    Mirrors what GlobalGPRSurrogate would return for a tiny analytical case so
+    `monte_carlo_ehvi_batch` can be unit-tested without a fitted GP.
+    """
     def __init__(self, mus: np.ndarray, sigmas: np.ndarray):
-        self._mus = torch.as_tensor(mus, dtype=torch.float32)
-        self._sigmas = torch.as_tensor(sigmas, dtype=torch.float32)
+        self._means = np.asarray(mus, dtype=np.float64)
+        self._stds = np.asarray(sigmas, dtype=np.float64)
+        self._mus_t = torch.as_tensor(mus, dtype=torch.float32)
+        self._sigmas_t = torch.as_tensor(sigmas, dtype=torch.float32)
 
-    def __call__(self, _x: torch.Tensor) -> _GaussianPosterior:
-        return _GaussianPosterior(self._mus, self._sigmas)
+    @property
+    def means(self) -> np.ndarray:
+        return self._means
+
+    @property
+    def stds(self) -> np.ndarray:
+        return self._stds
+
+    def sample(self, n_samples: int) -> torch.Tensor:
+        B, D = self._mus_t.shape
+        eps = torch.randn(n_samples, B, D)
+        return self._mus_t[None, :, :] + eps * self._sigmas_t[None, :, :]
 
 
 # ---------- ehvi_samples ----------
@@ -111,11 +115,10 @@ def test_mc_batch_returns_shape_B():
 
     mus = np.array([[0.5, 0.5], [4.5, 4.5]], dtype=np.float32)
     sigmas = np.full_like(mus, 0.1)
-    model = _FakeModel(mus, sigmas)
+    pool = _FakePoolPosterior(mus, sigmas)
 
-    candidates = torch.zeros(2, 3)  # arbitrary -- fake model ignores it
     out = monte_carlo_ehvi_batch(
-        candidates, model, pf, ref, base_hv,
+        pool, pf, ref, base_hv,
         front="lower", min_samples=64, max_samples=256, chunk_size=64,
     )
     assert out.shape == (2,)
@@ -133,11 +136,10 @@ def test_mc_batch_zero_for_certain_dominated_candidate():
 
     mus = np.array([[float(ref[0]) - 1e-3, float(ref[1]) - 1e-3]], dtype=np.float32)
     sigmas = np.array([[1e-3, 1e-3]], dtype=np.float32)
-    model = _FakeModel(mus, sigmas)
+    pool = _FakePoolPosterior(mus, sigmas)
 
-    candidates = torch.zeros(1, 3)
     out = monte_carlo_ehvi_batch(
-        candidates, model, pf, ref, base_hv,
+        pool, pf, ref, base_hv,
         front="lower", min_samples=64, max_samples=256, chunk_size=64,
     )
     assert out[0] < 1e-2, f"expected ~0 for dominated candidate, got {out[0]}"
@@ -154,11 +156,10 @@ def test_mc_batch_positive_for_certain_improving_candidate():
 
     mus = np.array([[0.5, 0.5]], dtype=np.float32)
     sigmas = np.array([[1e-3, 1e-3]], dtype=np.float32)
-    model = _FakeModel(mus, sigmas)
+    pool = _FakePoolPosterior(mus, sigmas)
 
-    candidates = torch.zeros(1, 3)
     out = monte_carlo_ehvi_batch(
-        candidates, model, pf, ref, base_hv,
+        pool, pf, ref, base_hv,
         front="lower", min_samples=64, max_samples=256, chunk_size=64,
     )
     assert out[0] > 0.0
@@ -181,18 +182,17 @@ def test_mc_batch_upper_lower_negation_symmetry():
 
     mus_min = np.array([[0.5, 0.5]], dtype=np.float32)
     sigmas  = np.array([[1e-3, 1e-3]], dtype=np.float32)
-    candidates = torch.zeros(1, 3)
 
-    # min-space model -> "lower"
+    # min-space pool -> "lower"
     torch.manual_seed(123)
     e_lower = monte_carlo_ehvi_batch(
-        candidates, _FakeModel(mus_min, sigmas), pf_min, ref, base_hv,
+        _FakePoolPosterior(mus_min, sigmas), pf_min, ref, base_hv,
         front="lower", min_samples=128, max_samples=256, chunk_size=64,
     )[0]
-    # max-space model (sign-flipped means) -> "upper", internal negation undoes it
+    # max-space pool (sign-flipped means) -> "upper", internal negation undoes it
     torch.manual_seed(123)
     e_upper = monte_carlo_ehvi_batch(
-        candidates, _FakeModel(-mus_min, sigmas), pf_min, ref, base_hv,
+        _FakePoolPosterior(-mus_min, sigmas), pf_min, ref, base_hv,
         front="upper", min_samples=128, max_samples=256, chunk_size=64,
     )[0]
 

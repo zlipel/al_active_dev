@@ -5,8 +5,6 @@ from pathlib import Path
 from typing import Literal, Callable, Optional
 
 import numpy as np
-import torch
-import gpytorch
 from pygmo import hypervolume
 
 import al_pipeline.featurization.sequence_featurizer as sf
@@ -16,6 +14,7 @@ import al_pipeline.ga.ga_utils as ga_utils
 import al_pipeline.acquisition.ehvi as ehvi
 from al_pipeline.data_prep.data_loading import convert_and_normalize_features
 from al_pipeline.ga.geneticalgorithm_m2 import geneticalgorithm_batch as GA
+from al_pipeline.surrogates import Surrogate, make_surrogate
 
 
 
@@ -46,49 +45,7 @@ def _init_pop(parent_seqs: list[str]) -> list[list[int]]:
     return [list(ga_utils.AA2num(s)) for s in parent_seqs]
 
 
-def _predict_mu_std(
-    *,
-    cfg: ALConfig,
-    model_bundle: dict,
-    Xn: np.ndarray,  # [Nsamples,nfeat] normalized
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Returns (mu, std) in normalized objective space, each shape [Nsamples,2],
-    ordered as (cfg.obj1, cfg.obj2).
-    """
-    X_tensor  = torch.tensor(Xn.copy(), dtype=torch.float32) if not torch.is_tensor(Xn) else Xn
-
-    if cfg.train_model_type == "gpr_multitask":
-        model = model_bundle["model"]
-        model.eval()
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            post = model(X_tensor)
-            mu = post.mean.detach().cpu().numpy()
-            std = post.stddev.detach().cpu().numpy()
-        return mu, std
-
-    if cfg.train_model_type == "gpr_singletask":
-        models = model_bundle["models"]
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            post1 = models[cfg.obj1](X_tensor)
-            post2 = models[cfg.obj2](X_tensor)
-            mu = np.column_stack([
-                post1.mean.detach().cpu().numpy().reshape(-1),
-                post2.mean.detach().cpu().numpy().reshape(-1),
-            ])
-            std = np.column_stack([
-                post1.stddev.detach().cpu().numpy().reshape(-1),
-                post2.stddev.detach().cpu().numpy().reshape(-1),
-            ])
-        return mu, std
-    
-    #TODO: implement DNN
-    #if cfg.train_model_type == "dnn":
-
-    raise ValueError(f"Unsupported train_model_type={cfg.train_model_type}")
-
-
-# analytic ehvi 
+# analytic ehvi
 def _fitness_batch_analytic(
     sequences: list[list[int]],
     *,
@@ -98,7 +55,7 @@ def _fitness_batch_analytic(
     normalization_stats: dict,
     augmented_front: np.ndarray,  # [N,2] in normalized space (after epsilon shift + front augmentation)
     propseq_arr: np.ndarray,      # [K,nfeat] normalized previous selected children (or empty if not similarity penalty)
-    model_bundle: dict,
+    surrogate: Surrogate,
 ) -> list[float]:
     """
     GA minimizes. We return negative EHVI since the genetic algorithm minimizes but acquisition is maximized (+ optional similarity penalty).
@@ -114,10 +71,9 @@ def _fitness_batch_analytic(
     Xn = np.asarray(Xn, dtype=np.float32)
 
     # get mean + std deviation for this set of children
-    mu, std = _predict_mu_std(cfg=cfg, model_bundle=model_bundle, Xn=Xn)
-
-    pred1, pred2 = mu[:, 0], mu[:, 1]
-    std1, std2 = std[:, 0], std[:, 1]
+    pool = surrogate.predict_pool(Xn)
+    pred1, pred2 = pool.means[:, 0], pool.means[:, 1]
+    std1, std2 = pool.stds[:, 0], pool.stds[:, 1]
 
     # invert sign for upper to change to minimization space
     if cfg.front == "upper":
@@ -155,7 +111,7 @@ def _fitness_batch_mc(
     ref_point: np.ndarray,  # [2] in normalized objective space + minimization
     base_hv: float,
     propseq_arr: np.ndarray,
-    model_bundle: dict,
+    surrogate: Surrogate,
 ) -> list[float]:
     """
     Does same stuff as analytic but uses Monte Carlo sampling to esitmate the hypervolume.
@@ -184,25 +140,24 @@ def _fitness_batch_mc(
     list[float]
         A list of fitness values for each candidate sequence, where lower values indicate better fitness (minimization).
     """
-    if cfg.train_model_type != "gpr_multitask":
-        raise ValueError("Not much of a point using MC with the single task models since we don't have covariance between objectives.")
+    if not surrogate.supports_joint_sampling:
+        raise ValueError(
+            "MC-EHVI requires a surrogate that supports joint sampling across "
+            "objectives. The current surrogate does not — use gpr_multitask "
+            "(or future MoE) for MC mode."
+        )
 
     seq_strs = [ga_utils.back_AA(np.asarray(s, dtype=int)) for s in sequences]
     Xraw = np.vstack([np.asarray(featurizer.featurize(s), dtype=np.float32) for s in seq_strs])
     Xn = convert_and_normalize_features(Xraw, train=False, stats=normalization_stats)
     Xn = np.asarray(Xn, dtype=np.float32)
 
-    model = model_bundle["model"]
-    model.eval()
-
-    cand_t = torch.tensor(Xn, dtype=torch.float32)
-    
-    # ref = ehvi.make_ref_point_min_space(pareto, margin=cfg.mc_ref_margin)
-    # base_hv = ehvi.hypervolume(pareto).compute(ref)
+    # Build the joint posterior ONCE for this candidate batch; the MC inner
+    # loop samples from it in chunks until the std-error tolerance is hit.
+    pool = surrogate.predict_pool(Xn)
 
     ehvi_vals = ehvi.monte_carlo_ehvi_batch(
-        cand_t,
-        model,
+        pool,
         pareto_front.copy(),
         ref_point,
         base_hv,
@@ -245,6 +200,7 @@ def run_one_candidate(
 
     featurizer = sf.SequenceFeaturizer(model_name=cfg.model.lower(), db_path=cfg.db_path)
     model_bundle = ga_utils.load_models(cfg=cfg, temp = temp, device='cpu')
+    surrogate = make_surrogate(cfg, model_bundle)
     normalization_stats = ga_utils.load_normalization_stats(cfg.paths.norm_stats)
 
     pareto_front, pareto_feats, parent_seqs = ga_utils.load_front(cfg=cfg, seq_id=seq_id)
@@ -296,7 +252,7 @@ def run_one_candidate(
             ref_point=ref_point,
             base_hv=base_hv,
             propseq_arr=propseq_arr,
-            model_bundle=model_bundle,
+            surrogate=surrogate,
         )
     else:
         augmented_front = ehvi.front_augmentation(
@@ -318,7 +274,7 @@ def run_one_candidate(
             normalization_stats=normalization_stats,
             augmented_front=augmented_front,
             propseq_arr=propseq_arr,
-            model_bundle=model_bundle,
+            surrogate=surrogate,
         )
 
     # GA parameters (keep in cfg as scalars; no dict in cfg)

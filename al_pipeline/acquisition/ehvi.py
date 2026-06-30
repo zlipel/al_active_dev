@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.stats import norm
-import torch
-import gpytorch
 from pygmo import hypervolume
 
 
@@ -270,18 +268,19 @@ def ehvi_samples(sample, base_hv, pareto_front, ref_point):
     return hv - base_hv
 
 def monte_carlo_ehvi_batch(
-    candidate_tensor, model, pareto_front, ref_point, base_hv,
+    pool_posterior, pareto_front, ref_point, base_hv,
     front="upper", min_samples=64, max_samples=548, stderr_tol=1e-3,
     chunk_size=128,
 ):
     """
     Monte Carlo EHVI estimation for batch of candidates.
+
     Parameters:
-    ----------- 
-    candidate_tensor: torch.Tensor
-        (B, D) tensor of candidates
-    model: gpytorch model
-        trained GP model
+    -----------
+    pool_posterior: PoolPosterior
+        Cached posterior over the candidate batch — built once by the
+        surrogate. Repeated `.sample(S)` calls draw fresh joint samples
+        without recomputing the underlying GP / mixture posterior.
     pareto_front: np.ndarray
         (N,2) array in MIN space
     ref_point: np.ndarray
@@ -298,16 +297,15 @@ def monte_carlo_ehvi_batch(
         standard error tolerance for convergence
     chunk_size: int
         number of samples to draw per iteration
+
     Returns:
     -----------
     ehvi_vals: np.ndarray
         (B,) array of EHVI values
     """
- 
-    B = candidate_tensor.size(0)
+
+    B = pool_posterior.means.shape[0]
     ehvi_vals = np.zeros(B, dtype=np.float64)
-    with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        posterior = model(candidate_tensor)
 
     for i in range(B):
         improvements = []
@@ -316,9 +314,8 @@ def monte_carlo_ehvi_batch(
 
         while (not converged) and (drawn < max_samples):
             S = min(chunk_size, max_samples - drawn)
-            
-            with torch.no_grad():
-                samples = posterior.rsample(torch.Size([S]))  # (S, B, 2)
+
+            samples = pool_posterior.sample(S)  # (S, B, 2)
 
             # Posterior samples come from torch in float32 by default; promote
             # to float64 here so the EHVI stripe math has full precision (small
