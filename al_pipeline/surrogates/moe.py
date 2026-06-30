@@ -32,6 +32,8 @@ The AL loop's existing analytic and MC EHVI consumers work unchanged —
 """
 from __future__ import annotations
 
+import os
+import pickle
 from typing import Any, Literal
 
 import numpy as np
@@ -96,6 +98,62 @@ def classifier_p_ps(rf, X: np.ndarray) -> np.ndarray:
     if 1 in classes:
         return proba[:, classes.index(1)]
     return np.zeros(X.shape[0], dtype=np.float64)
+
+
+# ---------------------------------------------------------------------------
+# RF bundle (de)serialization
+# ---------------------------------------------------------------------------
+
+def save_rf_bundle(
+    path: str,
+    rf,
+    *,
+    rf_raw_feature_columns: list[str],
+    rf_converted_feature_columns: list[str],
+    ps_definition: str,
+    random_state: int,
+    threshold: float,
+    model_name: str,
+    iteration: int,
+    transform: str,
+    label_scaler_scope: str,
+    best_params: dict | None = None,
+    extra: dict | None = None,
+) -> None:
+    """
+    Pickle the RF classifier with all metadata the loader and validator need.
+
+    The bundle is the source of truth for the gate's feature contract — every
+    consumer (`MoESurrogate`, beam-search diagnostic) reads the raw and
+    converted column lists from here, not from a separate config.
+    """
+    save_dir = os.path.dirname(path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    bundle = {
+        "classifier":                   rf,
+        "rf_raw_feature_columns":       list(rf_raw_feature_columns),
+        "rf_converted_feature_columns": list(rf_converted_feature_columns),
+        "rf_feature_space":             "converted_unstandardized",
+        "ps_definition":                ps_definition,
+        "random_state":                 random_state,
+        "threshold":                    threshold,
+        "model_name":                   model_name,
+        "iter":                         iteration,
+        "transform":                    transform,
+        "label_scaler_scope":           label_scaler_scope,
+    }
+    if best_params is not None:
+        bundle["best_params"] = best_params
+    if extra:
+        bundle.update(extra)
+    with open(path, "wb") as f:
+        pickle.dump(bundle, f)
+
+
+def load_rf_bundle(path: str) -> dict:
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +240,65 @@ class MoEBundle:
         scope = rf_bundle.get("label_scaler_scope", "regime")
         transform = rf_bundle.get("transform", ps_expert.transform)
         return cls(rf_bundle, ps_expert, nonps_expert, scope, transform)
+
+    @classmethod
+    def from_checkpoints(
+        cls,
+        rf_pkl: str,
+        ps_gpr_ckpt: str,
+        nonps_gpr_ckpt: str,
+        features_train_file: str,
+        labels_train_file: str,
+        *,
+        expected_transform: str | None = None,
+        expected_label_scaler_scope: str | None = None,
+        expected_model_name: str | None = None,
+        expected_iter: int | None = None,
+    ) -> "MoEBundle":
+        """
+        Load an RF bundle + PS + nonPS expert checkpoints into a live MoE.
+
+        The expert ExactGPs need their training tensors to compute predictive
+        posteriors, so we reload the raw features + labels CSVs and let each
+        `GPRExpert.from_checkpoint` rebuild its own train tensors from the
+        stored `original_indices`.
+
+        Optional `expected_*` kwargs let callers (e.g. the AL CLI) assert that
+        the loaded bundle matches the expected iter / transform / scope,
+        catching stale checkpoints early.
+        """
+        for pth in (rf_pkl, ps_gpr_ckpt, nonps_gpr_ckpt, features_train_file, labels_train_file):
+            if not os.path.exists(pth):
+                raise FileNotFoundError(f"Required MoE artifact not found: {pth}")
+
+        rf_bundle = load_rf_bundle(rf_pkl)
+        # `weights_only=False` lets us pickle-load the sklearn label scalers
+        # that travel with each expert checkpoint. Same affordance MCSC needed.
+        ps_ckpt = torch.load(ps_gpr_ckpt, map_location="cpu", weights_only=False)
+        nps_ckpt = torch.load(nonps_gpr_ckpt, map_location="cpu", weights_only=False)
+        ps_expert = GPRExpert.from_checkpoint(ps_ckpt, features_train_file, labels_train_file)
+        nps_expert = GPRExpert.from_checkpoint(nps_ckpt, features_train_file, labels_train_file)
+
+        # Run the standard validator over scope / transform / iter / model_name.
+        bundle = cls.from_components(rf_bundle, ps_expert, nps_expert)
+
+        # Optional caller assertions on top of the structural check.
+        rf_transform = rf_bundle.get("transform")
+        rf_scope = rf_bundle.get("label_scaler_scope")
+        rf_model = rf_bundle.get("model_name")
+        rf_iter = rf_bundle.get("iter")
+        mismatches = []
+        if expected_transform is not None and rf_transform != expected_transform:
+            mismatches.append(f"transform={rf_transform!r} != expected {expected_transform!r}")
+        if expected_label_scaler_scope is not None and rf_scope != expected_label_scaler_scope:
+            mismatches.append(f"scope={rf_scope!r} != expected {expected_label_scaler_scope!r}")
+        if expected_model_name is not None and rf_model != expected_model_name:
+            mismatches.append(f"model_name={rf_model!r} != expected {expected_model_name!r}")
+        if expected_iter is not None and rf_iter != expected_iter:
+            mismatches.append(f"iter={rf_iter!r} != expected {expected_iter!r}")
+        if mismatches:
+            raise ValueError("MoE checkpoint mismatch:\n  " + "\n  ".join(mismatches))
+        return bundle
 
 
 # ---------------------------------------------------------------------------
