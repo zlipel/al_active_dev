@@ -7,6 +7,8 @@ from al_pipeline.surrogates.moe import (
     MoESurrogate,
     build_rf_features,
     classifier_p_ps,
+    load_rf_bundle,
+    save_rf_bundle,
 )
 from al_pipeline.surrogates.moe_combine import (
     combine_hard,
@@ -27,7 +29,9 @@ __all__ = [
     "classifier_p_ps",
     "combine_hard",
     "combine_soft",
+    "load_rf_bundle",
     "make_surrogate",
     "ps_guarded",
+    "save_rf_bundle",
     "soft_mixture_variance",
 ]

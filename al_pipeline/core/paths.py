@@ -193,7 +193,21 @@ class ALPaths:
     def gpr_singletask_chkpt(self, label_name: List, temp: bool) -> List[Path]:
         fnames =[f"GPR_iter{self.iteration}_{label}_{self.tag}_TEMP.pt" if temp else f"GPR_iter{self.iteration}_{label}_{self.tag}.pt" for label in label_name]
         return [self.models_dir / fname for fname in fnames]
-    
+
+    #### MoE checkpoint paths (mirror gpr_multitask shape per expert + the RF bundle).
+    # No "all" expert — global GPR comparisons use `gpr_multitask_chkpt`.
+    def moe_ps_chkpt(self, temp: bool) -> Path:
+        suffix = "_TEMP" if temp else ""
+        return self.models_dir / f"MOE_PS_iter{self.iteration}_{self.tag}{suffix}.pt"
+
+    def moe_nonps_chkpt(self, temp: bool) -> Path:
+        suffix = "_TEMP" if temp else ""
+        return self.models_dir / f"MOE_NONPS_iter{self.iteration}_{self.tag}{suffix}.pt"
+
+    def moe_rf_bundle(self, temp: bool) -> Path:
+        suffix = "_TEMP" if temp else ""
+        return self.models_dir / f"MOE_RF_iter{self.iteration}_{self.tag}{suffix}.pkl"
+
     #### TODO: implement DNN ensemble paths later ####
 
     #### next simulation directory ####
