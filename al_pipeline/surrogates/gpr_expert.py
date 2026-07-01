@@ -219,8 +219,20 @@ class GPRExpert:
         model_name: str,
         iteration: int,
         extra: dict | None = None,
+        *,
+        train_x_direct: "torch.Tensor | None" = None,
+        train_y_direct: "torch.Tensor | None" = None,
     ) -> dict:
-        """Build a serializable checkpoint dict for this expert."""
+        """
+        Build a serializable checkpoint dict for this expert.
+
+        Base (per-iter) checkpoints supply `original_indices` and let the loader
+        rebuild ExactGP train tensors from features_csv + labels_csv. Temp
+        checkpoints (written during kriging-believer augmentation) supply
+        `train_x_direct` + `train_y_direct` instead, because synthesized
+        children don't have "raw" labels to reindex from a CSV. The loader
+        prefers the direct tensors when present.
+        """
         ckpt = {
             "model_state_dict":         self.model.state_dict(),
             "likelihood_state_dict":    self.likelihood.state_dict(),
@@ -236,6 +248,10 @@ class GPRExpert:
             "model_name":               model_name,
             "iter":                     iteration,
         }
+        if train_x_direct is not None:
+            ckpt["train_x_direct"] = train_x_direct.detach().cpu()
+        if train_y_direct is not None:
+            ckpt["train_y_direct"] = train_y_direct.detach().cpu()
         if extra:
             ckpt.update(extra)
         return ckpt
@@ -249,12 +265,18 @@ class GPRExpert:
         model_name: str,
         iteration: int,
         extra: dict | None = None,
+        *,
+        train_x_direct: "torch.Tensor | None" = None,
+        train_y_direct: "torch.Tensor | None" = None,
     ) -> None:
         save_dir = os.path.dirname(path)
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
         torch.save(
-            self.to_checkpoint(regime, label_scaler_scope, original_indices, model_name, iteration, extra),
+            self.to_checkpoint(
+                regime, label_scaler_scope, original_indices, model_name, iteration, extra,
+                train_x_direct=train_x_direct, train_y_direct=train_y_direct,
+            ),
             path,
         )
 
@@ -268,33 +290,44 @@ class GPRExpert:
         """
         Reconstruct a live expert from a checkpoint + training data files.
 
-        ExactGP needs its training tensors to compute predictive posteriors, so
-        we rebuild them from the stored `original_indices` using the checkpoint's
-        own normalizer / scalers / transform — guaranteeing the loaded expert
-        sees the same training data the saved expert was fit on.
+        Two loader paths:
+          1. If the checkpoint has `train_x_direct` + `train_y_direct` (temp
+             checkpoints written during augmentation), use those directly.
+             Synthesized kriging-believer children live in these tensors —
+             they don't correspond to rows in the raw CSVs.
+          2. Otherwise, use `original_indices` to slice features_csv +
+             labels_csv, re-apply this expert's own normalizer / scalers /
+             transform. Guarantees the loaded expert sees the same training
+             data the saved expert was fit on.
         """
         label_columns = list(ckpt["label_columns"])
         transform = ckpt["transform"]
-        original_indices = ckpt["original_indices"]
-
-        features_all = pd.read_csv(features_train_file)
-        labels_all = pd.read_csv(labels_train_file)
-        feature_columns = ckpt.get("feature_columns", features_all.columns.tolist())
-
-        features_raw = features_all.iloc[original_indices].reset_index(drop=True)
-        labels_raw = labels_all.iloc[original_indices].reset_index(drop=True)
-
-        feat_conv = convert_features(features_raw[feature_columns])
-        feat_norm = apply_feature_normalizer(feat_conv, ckpt["feature_normalizer_stats"])
-        train_x = torch.tensor(feat_norm.to_numpy(), dtype=torch.float32)
-
         scaler1 = ckpt["label_scaler1"]
         scaler2 = ckpt["label_scaler2"]
-        lab_prepared = _prepare_label_array(labels_raw, label_columns, transform)
-        lab_scaled = lab_prepared.copy()
-        lab_scaled[:, 0] = scaler1.transform(lab_prepared[:, [0]]).ravel()
-        lab_scaled[:, 1] = scaler2.transform(lab_prepared[:, [1]]).ravel()
-        train_y = torch.tensor(lab_scaled, dtype=torch.float32)
+
+        features_all = pd.read_csv(features_train_file)
+        feature_columns = ckpt.get("feature_columns", features_all.columns.tolist())
+
+        if "train_x_direct" in ckpt and "train_y_direct" in ckpt:
+            # Temp checkpoint (augmented): direct tensors are the source of truth.
+            train_x = ckpt["train_x_direct"].float()
+            train_y = ckpt["train_y_direct"].float()
+        else:
+            # Base checkpoint: reconstruct from CSV + original_indices.
+            labels_all = pd.read_csv(labels_train_file)
+            original_indices = ckpt["original_indices"]
+            features_raw = features_all.iloc[original_indices].reset_index(drop=True)
+            labels_raw = labels_all.iloc[original_indices].reset_index(drop=True)
+
+            feat_conv = convert_features(features_raw[feature_columns])
+            feat_norm = apply_feature_normalizer(feat_conv, ckpt["feature_normalizer_stats"])
+            train_x = torch.tensor(feat_norm.to_numpy(), dtype=torch.float32)
+
+            lab_prepared = _prepare_label_array(labels_raw, label_columns, transform)
+            lab_scaled = lab_prepared.copy()
+            lab_scaled[:, 0] = scaler1.transform(lab_prepared[:, [0]]).ravel()
+            lab_scaled[:, 1] = scaler2.transform(lab_prepared[:, [1]]).ravel()
+            train_y = torch.tensor(lab_scaled, dtype=torch.float32)
 
         likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=2)
         model = MultitaskGPRegressionModel(train_x, train_y, likelihood, num_tasks=2)

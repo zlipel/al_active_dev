@@ -45,6 +45,15 @@ class _FakePoolPosterior(PoolPosterior):
     def stds(self) -> np.ndarray:
         return self._stds
 
+    @property
+    def covariance(self) -> np.ndarray:
+        # Independent per-objective marginals for these tests.
+        B, D = self._stds.shape
+        cov = np.zeros((B, D, D), dtype=self._stds.dtype)
+        for t in range(D):
+            cov[:, t, t] = self._stds[:, t] ** 2
+        return cov
+
     def sample(self, n_samples: int) -> torch.Tensor:
         B, D = self._mus_t.shape
         eps = torch.randn(n_samples, B, D)

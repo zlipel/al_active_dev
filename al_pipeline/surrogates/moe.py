@@ -368,6 +368,8 @@ class MoEPoolPosterior(PoolPosterior):
             self._vars = np.clip(self._vars, 0.0, None)
 
         self._stds = np.sqrt(self._vars)
+        # Lazy — augment() reads it, everything else doesn't.
+        self._cov_cache: np.ndarray | None = None
 
     @property
     def means(self) -> np.ndarray:
@@ -376,6 +378,46 @@ class MoEPoolPosterior(PoolPosterior):
     @property
     def stds(self) -> np.ndarray:
         return self._stds
+
+    def _per_expert_covariance(self, post) -> np.ndarray:
+        """Extract per-candidate (T, T) covariance blocks from one expert's posterior."""
+        with torch.no_grad():
+            mean = post.mean
+            B, T = mean.shape
+            cov = post.covariance_matrix.reshape(B, T, B, T)
+            per_cand = cov[torch.arange(B), :, torch.arange(B), :]
+            return per_cand.detach().cpu().numpy()
+
+    @property
+    def covariance(self) -> np.ndarray:
+        """
+        Per-candidate (2, 2) covariance under the mixture.
+
+        Soft policy: full law-of-total-covariance moment match
+            Cov_mix = p*Cov_PS + (1-p)*Cov_nonPS
+                    + p*(1-p) * (mu_PS - mu_nonPS)(mu_PS - mu_nonPS)^T
+
+        The last term is the between-component contribution to the joint
+        cross-objective covariance — the analog of `soft_mixture_variance`
+        for the diagonal case, generalized to the full 2x2. Without it the
+        pessimism penalty under a bimodal mixture would systematically
+        underestimate uncertainty at borderline p_ps values.
+
+        Hard policy: switch per candidate — the assigned expert's cov
+        wholesale. No between-component term (deterministic gate).
+        """
+        if self._cov_cache is None:
+            cov_ps = self._per_expert_covariance(self._post_ps)       # (B, 2, 2)
+            cov_nonps = self._per_expert_covariance(self._post_nonps) # (B, 2, 2)
+            if self._policy == "soft":
+                p = self._p_ps[:, None, None]                          # (B, 1, 1)
+                delta = (self._mu_ps - self._mu_nonps)                # (B, 2)
+                between = p * (1.0 - p) * (delta[:, :, None] * delta[:, None, :])
+                self._cov_cache = p * cov_ps + (1.0 - p) * cov_nonps + between
+            else:   # hard
+                use_ps = (self._p_ps >= self._threshold)[:, None, None]   # (B, 1, 1)
+                self._cov_cache = np.where(use_ps, cov_ps, cov_nonps)
+        return self._cov_cache
 
     def sample(self, n_samples: int) -> torch.Tensor:
         with torch.no_grad():

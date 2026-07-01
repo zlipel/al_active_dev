@@ -86,9 +86,17 @@ def load_models(cfg: ALConfig, *, temp: bool, device: str | torch.device = "cpu"
     raise ValueError(f"Unknown train_model_type={t}")
 
 
-def load_moe_bundle(cfg: ALConfig):
+def load_moe_bundle(cfg: ALConfig, *, temp: bool = False):
     """
     Load the per-iter MoE artifacts written by `train_moe_from_config`.
+
+    Parameters
+    ----------
+    temp : bool
+        False -> base checkpoints from the iter's training run.
+        True  -> the augmented checkpoints written by kriging-believer during
+                 batch generation (accumulate synthesized children across
+                 seq_ids in the current batch).
 
     Returns
     -------
@@ -98,14 +106,12 @@ def load_moe_bundle(cfg: ALConfig):
         — stale checkpoints surface as ValueError here rather than as silent
         wrong predictions downstream.
     """
-    # Lazy import: surrogates depend on data_prep + training but not on
-    # ga_utils, so this stays in the right direction.
     from al_pipeline.surrogates import MoEBundle
     p = cfg.paths
     return MoEBundle.from_checkpoints(
-        str(p.moe_rf_bundle(temp=False)),
-        str(p.moe_ps_chkpt(temp=False)),
-        str(p.moe_nonps_chkpt(temp=False)),
+        str(p.moe_rf_bundle(temp=temp)),
+        str(p.moe_ps_chkpt(temp=temp)),
+        str(p.moe_nonps_chkpt(temp=temp)),
         str(p.features_csv),
         str(p.labels_csv),
         expected_transform=cfg.transform,
