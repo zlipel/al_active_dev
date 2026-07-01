@@ -208,6 +208,12 @@ class ALPaths:
         suffix = "_TEMP" if temp else ""
         return self.models_dir / f"MOE_RF_iter{self.iteration}_{self.tag}{suffix}.pkl"
 
+    #### Diagnostic outputs (retrospective analyses, plots, etc.) ####
+    # Lives under model_home_dir so it ships with the AL artifacts, not on scratch.
+    @property
+    def diagnostic_dir(self) -> Path:
+        return self.model_home_dir / "DIAGNOSTIC"
+
     #### TODO: implement DNN ensemble paths later ####
 
     #### next simulation directory ####
