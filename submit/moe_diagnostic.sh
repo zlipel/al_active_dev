@@ -66,6 +66,13 @@ OBJ1="exp_density"
 OBJ2="diff"
 NGEN=24
 MOE_POLICY="soft"
+# Production-shape training params (matches al_master.sh). The retrospective
+# refits surrogates per iter; toy values here give toy rankings.
+EPOCHS=1000
+PATIENCE=5
+K_FOLDS=5
+LEARNING_RATE=0.1
+PESSIMISM_START_ITER=6
 
 EXTRA_FLAGS=()
 
@@ -127,6 +134,11 @@ CMD=(python -m al_pipeline.cli.moe_diagnostic
     --obj2 "$OBJ2"
     --ngen "$NGEN"
     --moe_policy "$MOE_POLICY"
+    --epochs "$EPOCHS"
+    --patience "$PATIENCE"
+    --k_folds "$K_FOLDS"
+    --learning_rate "$LEARNING_RATE"
+    --pessimism_start_iter "$PESSIMISM_START_ITER"
     --base_path "$HOME_AL"
     --scratch_path "$SCRATCH_AL"
     --db_path "$DB_PATH"

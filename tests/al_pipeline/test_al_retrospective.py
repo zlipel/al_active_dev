@@ -241,17 +241,26 @@ def _write_completed_run(source_root: Path, model: str, n_iters: int,
 @pytest.mark.slow
 def test_run_retrospective_end_to_end_synthetic(tmp_path):
     """
-    Tiny 3-iter synthetic run. Verifies:
+    Tiny 2-iter synthetic run with kriging-believer + epsilon shift + pessimism
+    on every iter (pessimism_start_iter=1 so the pessimism branch fires).
+
+    Verifies:
       - both output files exist with the expected schema
       - HV trajectories are monotonic non-decreasing
       - target HV >= any policy's HV (target is union of all iters)
+      - trajectory JSON reports pessimism_start_iter + ehvi_variant
 
     The completed-run artifacts are written under cfg.scratch_path (mirrors
     the production layout: features/labels/seqs live on SCRATCH, outputs
     live on HOME under cfg.base_path).
+
+    Kept tiny (n_iters=2, batch=8, k_pick=3) because the KB inner loop
+    re-conditions the surrogates on each pick — cost scales with n_iters *
+    n_policies * k_pick.
     """
-    n_iters = 3
-    batch = 12
+    n_iters = 2
+    batch = 8
+    k_pick = 3
     model = "TEST_MODEL"
 
     # cfg_base: diagnostic_dir lands at base_path/<MODEL>/DIAGNOSTIC (HOME-side);
@@ -278,7 +287,8 @@ def test_run_retrospective_end_to_end_synthetic(tmp_path):
     out = run_retrospective(
         runs_root=cfg_base.scratch_path, model=model,
         cfg_base=cfg_base, n_iters=n_iters,
-        k_pick=batch // 2,
+        k_pick=k_pick,
+        pessimism_start_iter=1,   # exercise the pessimism branch on every iter
     )
 
     diag_dir = cfg_base.paths.diagnostic_dir
@@ -296,6 +306,10 @@ def test_run_retrospective_end_to_end_synthetic(tmp_path):
     for key in ("iters", "hv_actual", "hv_moe_soft", "hv_moe_hard", "hv_global"):
         assert key in traj
         assert len(traj[key]) == n_iters
+    # New provenance fields the KB refactor added.
+    assert traj["pessimism_start_iter"] == 1
+    assert traj["ehvi_variant"] == "epsilon"
+    assert traj["k_pick"] == k_pick
 
     # Monotone non-decreasing under each policy.
     for name in ("hv_actual", "hv_moe_soft", "hv_moe_hard", "hv_global"):
