@@ -33,8 +33,8 @@ mkdir -p "$LOG_DEST"
 
 SLURM_OUT="${SLURM_SUBMIT_DIR:-.}/test_suite.out"
 SLURM_ERR="${SLURM_SUBMIT_DIR:-.}/test_suite.err"
-[[ -f "$SLURM_OUT" ]] && mv "$SLURM_OUT" "$LOG_DEST/moe_diagnostic.out"
-[[ -f "$SLURM_ERR" ]] && mv "$SLURM_ERR" "$LOG_DEST/moe_diagnostic.err"
+[[ -f "$SLURM_OUT" ]] && mv "$SLURM_OUT" "$LOG_DEST/test_suite.out"
+[[ -f "$SLURM_ERR" ]] && mv "$SLURM_ERR" "$LOG_DEST/test_suite.err"
 
 conda deactivate
 
