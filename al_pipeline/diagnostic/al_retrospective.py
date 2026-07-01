@@ -5,21 +5,35 @@ Goal (per project_moe_diagnostics_plan.md): given a completed 10-round global-AL
 run, ask *at each iter N, would MoE have picked better children than global did*?
 Reported as (a) cumulative HV trajectory and (b) rounds-to-target HV.
 
-Framing: **counterfactual re-selection** — the proposal pool at each iter is
+Framing: **kriging-believer re-selection**. The proposal pool at each iter is
 the real batch of children that ran through LAMMPS in the completed run, with
 their real measured labels. At each iter we refit MoE + global on the exact
-data slice the AL loop had, rank the children by each surrogate's EHVI, take
-top-K, and roll the "picks" forward. Same real labels for both surrogates —
-directly answers "which surrogate identified the eventual winners earlier?"
-without needing to impute labels for hypothetical MoE proposals.
+data slice the AL loop had, then run a KB inner loop that mirrors production
+`cli/child.py::run_child`:
 
-Reuses:
-  - `train_moe_from_config` / `_kfold_gpr_multitask_from_config` for training
-    (each iter gets its own tempdir + cfg pointing at it).
-  - `MoESurrogate` / `GlobalGPRSurrogate.predict_pool(raw_df)` for inference.
-  - `ehvi.front_augmentation` + `ehvi.ehvi_analytic` for scoring.
-  - `data_prep.parents.find_pareto_front` for extracting Pareto members.
-  - `pygmo.hypervolume` for the HV metric.
+  * pick highest-EHVI child from the remaining pool;
+  * predict its z-labels via the surrogate's mean (apply pessimism penalty
+    from iter >= pessimism_start_iter, seq_id > 1 — same rule production uses);
+  * re-condition the surrogate on those predicted labels (global: retrain the
+    multitask GP with warm start + 1 Adam step; MoE: hard-gate + reindex the
+    assigned expert). The RF gate stays frozen inside a batch, same as
+    production augmentation;
+  * update the running Pareto front with the picked child's predicted labels;
+  * repeat for `k_pick` seq_ids.
+
+At the end of the iter, HV is computed in raw physical space using the REAL
+labels of the picked children — never the KB-imputed values.
+
+Reuses (from ga/augmentation.py):
+  - `predict_for_augmentation(surrogate, feats_raw_df, return_std)`
+  - `overlap_batch(mu, S, mu_cands, S_cands)` — pessimism penalty
+  - `_reindex_expert(assigned, feats_raw_df, z_labels, lr)` — MoE expert
+    re-conditioning (identical to production `augment()`)
+  - `_retrain_model_gpr_multitask(cfg, model, likelihood, X, y)` — global GP
+    re-conditioning
+And from ga/ga_utils.py:
+  - `make_epsilon_shifted_front(cfg, front, feats_raw_df, surrogate)` —
+    ε·σ̄·epsilon_scale shift applied whenever cfg.ehvi_variant == 'epsilon'.
 """
 from __future__ import annotations
 
@@ -31,13 +45,27 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import torch
 from pygmo import hypervolume
 
 from al_pipeline.acquisition import ehvi
 from al_pipeline.core.config import ALConfig
+from al_pipeline.data_prep.data_loading import convert_and_normalize_features
 from al_pipeline.data_prep.parents import find_pareto_front
-from al_pipeline.ga.ga_utils import load_models, load_moe_bundle, load_normalization_stats
-from al_pipeline.surrogates import GlobalGPRSurrogate, MoESurrogate, Surrogate
+from al_pipeline.ga.augmentation import (
+    _reindex_expert,
+    _retrain_model_gpr_multitask,
+    overlap_batch,
+    predict_for_augmentation,
+)
+from al_pipeline.ga.ga_utils import (
+    load_models, load_moe_bundle, load_normalization_stats,
+    make_epsilon_shifted_front,
+)
+from al_pipeline.surrogates import (
+    GlobalGPRSurrogate, MoESurrogate, Surrogate,
+    build_rf_features, classifier_p_ps,
+)
 from al_pipeline.training.kfold_training import train_from_config
 
 
@@ -223,27 +251,22 @@ def _build_global_surrogate(cfg_global: ALConfig) -> Surrogate:
 
 # ---------- EHVI scoring ----------
 
-def _pareto_front_from_labels_norm(labels_norm_csv: Path, obj1: str, obj2: str,
-                                     front: str) -> np.ndarray:
-    """Extract the surrogate's Pareto front from its own normalized labels CSV."""
-    df = pd.read_csv(labels_norm_csv)
-    kind = ["max", "max"] if front == "upper" else ["min", "min"]
-    front_df, _idx = find_pareto_front(df[[obj1, obj2]], kind=kind, objectives=[obj1, obj2])
-    return front_df[[obj1, obj2]].to_numpy()
-
-
 def score_children_ehvi(
     surrogate: Surrogate,
     children_features_raw_df: pd.DataFrame,
     pareto_front_norm: np.ndarray,
     front: str,
-    epsilon_scale: float = 1.0,
     ref_mode: str = "frac",
     ref_frac: float = 0.5,
 ) -> np.ndarray:
     """
-    Score each child's EHVI under `surrogate` using `pareto_front_norm`
-    (which lives in the surrogate's own normalized objective space).
+    Score each child's EHVI under `surrogate` against `pareto_front_norm`
+    (in the surrogate's own normalized objective space).
+
+    NOTE: `pareto_front_norm` is expected to be the FINAL front used for EHVI
+    — if `cfg.ehvi_variant == 'epsilon'`, the caller must have already applied
+    `make_epsilon_shifted_front` to shift the front outward. This function
+    itself does not know about `ehvi_variant`; it's just the acquisition math.
 
     Returns a (B,) array of EHVI values. Higher is better.
     """
@@ -261,6 +284,176 @@ def score_children_ehvi(
     return ehvi.ehvi_analytic(pred1, std1, pred2, std2, augmented_front)
 
 
+# ---------- kriging-believer re-conditioning ----------
+
+def _recondition_surrogate(
+    surrogate: Surrogate,
+    cfg: ALConfig,
+    new_feats_raw_df: pd.DataFrame,
+    new_z_labels: np.ndarray,
+) -> None:
+    """
+    Kriging-believer step: append the picked child's raw features + predicted
+    z-space labels to the surrogate's training state, mirroring what
+    production's `augmentation.augment()` does at each seq_id.
+
+    - `MoESurrogate`: RF-hard-gate the child, then `_reindex_expert` on the
+      assigned expert (RF frozen inside the batch, matching production).
+    - `GlobalGPRSurrogate` (multitask only): warm-start `_retrain_model_gpr_multitask`
+      on the expanded (X, y) tensors and swap the retrained model + likelihood
+      into the surrogate's bundle. Single-task path isn't wired here (it was
+      never used with the retrospective) — raise a clear error.
+
+    Mutates the surrogate in place. Next call to `surrogate.predict_pool(...)`
+    sees the augmented state.
+    """
+    if isinstance(surrogate, MoESurrogate):
+        bundle = surrogate.bundle
+        X_rf, _ = build_rf_features(
+            new_feats_raw_df,
+            bundle.rf_raw_feature_columns,
+            bundle.rf_converted_feature_columns,
+        )
+        p_ps_child = float(classifier_p_ps(bundle.rf, X_rf)[0])
+        is_ps = p_ps_child >= cfg.moe_threshold
+        assigned = bundle.ps_expert if is_ps else bundle.nonps_expert
+        _reindex_expert(assigned, new_feats_raw_df, new_z_labels, lr=cfg.learning_rate)
+        return
+
+    if isinstance(surrogate, GlobalGPRSurrogate):
+        if surrogate.mode != "gpr_multitask":
+            raise ValueError(
+                f"KB re-conditioning only supports gpr_multitask, got mode={surrogate.mode!r}"
+            )
+        model_bundle = surrogate.model_bundle
+        model = model_bundle["model"]
+        likelihood = model_bundle["likelihood"]
+
+        current_train_x = model.train_inputs[0]
+        current_train_y = model.train_targets
+
+        # Normalize new features via the stored global stats — same code path
+        # GlobalGPRSurrogate.predict_pool uses internally.
+        Xn = convert_and_normalize_features(
+            new_feats_raw_df.to_numpy(dtype=np.float32),
+            train=False, stats=surrogate.normalization_stats,
+        )
+        new_x = torch.tensor(np.asarray(Xn, dtype=np.float32), dtype=torch.float32)
+        new_y = torch.tensor(np.asarray(new_z_labels).reshape(1, 2), dtype=torch.float32)
+
+        train_x = torch.cat([current_train_x, new_x], dim=0)
+        train_y = torch.cat([current_train_y, new_y], dim=0)
+
+        model_new, likelihood_new = _retrain_model_gpr_multitask(
+            cfg, model, likelihood, train_x, train_y,
+        )
+        # Swap in the retrained model so the surrogate sees the new state.
+        model_bundle["model"] = model_new
+        model_bundle["likelihood"] = likelihood_new
+        return
+
+    raise TypeError(f"Unsupported surrogate type: {type(surrogate).__name__}")
+
+
+# ---------- KB inner loop (per iter × policy) ----------
+
+def _kb_inner_loop(
+    surrogate: Surrogate,
+    cfg_base: ALConfig,
+    train_feats_raw_df: pd.DataFrame,
+    train_labels_norm_df: pd.DataFrame,
+    pool_feats_raw_df: pd.DataFrame,
+    pool_labels: pd.DataFrame,
+    k_pick: int,
+    apply_pessimism: bool,
+    target_front: np.ndarray,
+) -> tuple[pd.DataFrame, int]:
+    """
+    Kriging-believer inner loop for ONE policy at ONE iteration.
+
+    Mirrors production `cli/child.py::run_child`: seq_id 1..k_pick, each pick
+    updates the surrogate + running Pareto front before the next pick.
+
+    Returns
+    -------
+    picked_real_labels : pd.DataFrame
+        The real (measured) labels of the k_pick picked children. Used for
+        HV computation in raw physical space.
+    n_pareto_hits : int
+        How many picked children lie on the target Pareto front (union of
+        all completed iters).
+    """
+    obj1, obj2 = cfg_base.obj1, cfg_base.obj2
+    front = cfg_base.front
+    kind = ["max", "max"] if front == "upper" else ["min", "min"]
+
+    # Running z-space training labels + raw features (grow as KB augments).
+    running_z = train_labels_norm_df[[obj1, obj2]].to_numpy(dtype=np.float64).copy()
+    running_feats = train_feats_raw_df.reset_index(drop=True).copy()
+
+    picked_local_idxs: list[int] = []           # positional indices into the pool
+    prev_feats_dfs: list[pd.DataFrame] = []     # picks earlier in this batch (for pessimism)
+
+    n_pool = len(pool_feats_raw_df)
+
+    for seq_id in range(1, k_pick + 1):
+        # Pareto members of the running training slice, in z-space.
+        _, front_indices = find_pareto_front(
+            pd.DataFrame(running_z, columns=[obj1, obj2]),
+            kind=kind, objectives=[obj1, obj2],
+        )
+        pareto_z = running_z[front_indices]
+        pareto_feats_raw = running_feats.iloc[front_indices].reset_index(drop=True)
+
+        # Epsilon-shift the front — no-op when cfg.ehvi_variant != 'epsilon'.
+        pareto_input, _eps = make_epsilon_shifted_front(
+            cfg=cfg_base,
+            pareto_front=pareto_z,
+            pareto_feats_raw_df=pareto_feats_raw,
+            surrogate=surrogate,
+        )
+
+        # Remaining pool: exclude already-picked positions.
+        picked_set = set(picked_local_idxs)
+        remaining_pool_idxs = np.array([i for i in range(n_pool) if i not in picked_set])
+        if len(remaining_pool_idxs) == 0:
+            break
+        remaining_feats = pool_feats_raw_df.iloc[remaining_pool_idxs].reset_index(drop=True)
+
+        scores = score_children_ehvi(
+            surrogate, remaining_feats, pareto_input, front=front,
+            ref_mode=cfg_base.ref_point_mode, ref_frac=cfg_base.ref_point_frac,
+        )
+        best_in_remaining = int(np.argmax(scores))
+        picked_local = int(remaining_pool_idxs[best_in_remaining])
+        picked_local_idxs.append(picked_local)
+
+        # KB "belief": use the surrogate's mean prediction as the child's z-labels.
+        picked_feats = pool_feats_raw_df.iloc[[picked_local]].reset_index(drop=True)
+        mu, cov, sig = predict_for_augmentation(surrogate, picked_feats, return_std=True)
+        # mu: (1, 2), cov: (1, 2, 2), sig: (1, 2)
+
+        # Pessimism penalty against earlier picks in this batch (iter >= start_iter, seq_id > 1).
+        if apply_pessimism and len(prev_feats_dfs) > 0:
+            prev_feats = pd.concat(prev_feats_dfs, ignore_index=True)
+            mu_prev, cov_prev = predict_for_augmentation(surrogate, prev_feats, return_std=False)
+            sign = -1.0 if front == "upper" else 1.0
+            penalty = sign * overlap_batch(mu.copy(), cov[0], mu_prev, cov_prev)
+            mu = mu + penalty * sig
+
+        # Re-condition the surrogate on the picked child.
+        _recondition_surrogate(surrogate, cfg_base, picked_feats, mu[0])
+
+        # Update running training-slice state so the next seq_id's Pareto front + shift see the KB pick.
+        running_z = np.vstack([running_z, mu])
+        running_feats = pd.concat([running_feats, picked_feats], ignore_index=True)
+        prev_feats_dfs.append(picked_feats)
+
+    picked_real_labels = pool_labels.iloc[picked_local_idxs].reset_index(drop=True)
+    n_pareto_hits = _count_pareto_hits(picked_real_labels, target_front, obj1, obj2)
+    return picked_real_labels, n_pareto_hits
+
+
 # ---------- orchestrator ----------
 
 def run_retrospective(
@@ -270,6 +463,7 @@ def run_retrospective(
     n_iters: int,
     *,
     k_pick: int | None = None,
+    pessimism_start_iter: int = 6,
     log=None,
 ) -> dict[str, Any]:
     """
@@ -288,16 +482,20 @@ def run_retrospective(
     model
         Model name (e.g. "MPIPI"). Used to resolve the completed-run path.
     cfg_base
-        Base ALConfig. Only `obj1`, `obj2`, `front`, `transform`, `ngen`,
-        `ehvi_variant`, `ref_point_mode`, `ref_point_frac`, and training
-        hyperparams (epochs, patience, k_folds, learning_rate) are read.
-        Paths + iteration + train_model_type are overwritten per-iter.
+        Base ALConfig. `obj1`, `obj2`, `front`, `transform`, `ngen`,
+        `ehvi_variant`, `epsilon_scale`, `ref_point_mode`, `ref_point_frac`,
+        `moe_policy`, `moe_threshold`, and training hyperparams (epochs,
+        patience, k_folds, learning_rate) are read. Paths + iteration +
+        train_model_type are overwritten per-iter.
     n_iters
         Number of completed iters to walk (walks iter=1..n_iters).
     k_pick
         Number of children to pick per iter. Defaults to `cfg_base.ngen // 2`
         (a "half budget" retrospective — the difference between surrogates
         collapses to zero if k_pick == full batch size).
+    pessimism_start_iter
+        Iter at which pessimism kicks in (matches the user's production
+        practice: rounds 1..5 without pessimism, 6+ with). Default 6.
     """
     log_fn = log.info if log is not None else (lambda msg: None)
     runs_root = Path(runs_root)
@@ -343,6 +541,9 @@ def run_retrospective(
             log_fn(f"[retrospective] iter {M}: no proposal children found, skipping.")
             continue
 
+        # Train fresh surrogates for this iter on the pre-iter-M data slice.
+        # Read the shared labels_norm_csv BEFORE the tempdir goes away — the KB
+        # loop needs the full training-slice z-labels to grow.
         with tempfile.TemporaryDirectory() as tempdir_str:
             tempdir = Path(tempdir_str)
 
@@ -351,44 +552,47 @@ def run_retrospective(
             _write_training_slice(cfg_moe, train_feats, train_labels)
             try:
                 moe_surs = _build_moe_surrogates(cfg_moe)
+                moe_labels_norm_df = pd.read_csv(cfg_moe.paths.labels_norm_csv)
             except Exception as e:
                 log_fn(f"[retrospective] iter {M}: MoE training failed ({e!r}), skipping MoE this iter.")
                 moe_surs = {}
-            moe_pareto = (
-                _pareto_front_from_labels_norm(cfg_moe.paths.labels_norm_csv, obj1, obj2, front)
-                if moe_surs else None
-            )
+                moe_labels_norm_df = None
 
             # Global
             cfg_global = _make_iter_cfg(tempdir / "global", cfg_base, iteration=M - 1, train_model_type="gpr_multitask")
             _write_training_slice(cfg_global, train_feats, train_labels)
             global_sur = _build_global_surrogate(cfg_global)
-            global_pareto = _pareto_front_from_labels_norm(cfg_global.paths.labels_norm_csv, obj1, obj2, front)
+            global_labels_norm_df = pd.read_csv(cfg_global.paths.labels_norm_csv)
 
-        # Score + counterfactual-pick + roll HV
+        # KB inner loop per policy — mirrors production run_child's seq_id loop.
         row: dict[str, Any] = {"iter": M, "n_children": int(len(pool_labels)), "n_picked": int(min(k_pick, len(pool_labels)))}
+        apply_pessimism = (M >= pessimism_start_iter)
 
-        for name, sur, pareto in [
-            ("moe_soft",  moe_surs.get("moe_soft"),  moe_pareto),
-            ("moe_hard",  moe_surs.get("moe_hard"),  moe_pareto),
-            ("global",    global_sur,                global_pareto),
+        for name, sur, labels_norm_df in [
+            ("moe_soft",  moe_surs.get("moe_soft"),  moe_labels_norm_df),
+            ("moe_hard",  moe_surs.get("moe_hard"),  moe_labels_norm_df),
+            ("global",    global_sur,                global_labels_norm_df),
         ]:
-            if sur is None or pareto is None:
+            if sur is None or labels_norm_df is None:
                 row[f"n_pareto_members_hit_{name}"] = 0
                 hv_traj[name].append(hv_traj[name][-1] if hv_traj[name] else 0.0)
                 continue
-            scores = score_children_ehvi(
-                sur, pool_feats, pareto, front=front,
-                epsilon_scale=cfg_base.epsilon_scale,
-                ref_mode=cfg_base.ref_point_mode, ref_frac=cfg_base.ref_point_frac,
+            picked, n_hits = _kb_inner_loop(
+                surrogate=sur,
+                cfg_base=cfg_base,
+                train_feats_raw_df=train_feats,
+                train_labels_norm_df=labels_norm_df,
+                pool_feats_raw_df=pool_feats,
+                pool_labels=pool_labels,
+                k_pick=row["n_picked"],
+                apply_pessimism=apply_pessimism,
+                target_front=target_front,
             )
-            top_k = np.argsort(-scores)[: row["n_picked"]]
-            picked = pool_labels.iloc[top_k].reset_index(drop=True)
             picks[name] = pd.concat([picks[name], picked], ignore_index=True)
             hv_traj[name].append(compute_hv_raw(
                 picks[name], front=front, obj1=obj1, obj2=obj2, ref_point_min=ref_pt_min,
             ))
-            row[f"n_pareto_members_hit_{name}"] = int(_count_pareto_hits(picked, target_front, obj1, obj2))
+            row[f"n_pareto_members_hit_{name}"] = int(n_hits)
 
         # Baseline: HV if you kept EVERY iter-M child (what the real AL loop did).
         actual_running = pd.concat([actual_running, pool_labels], ignore_index=True)
@@ -410,18 +614,23 @@ def run_retrospective(
     summary_df.to_csv(diagnostic_dir / "retrospective_summary.csv", index=False)
 
     trajectory = {
-        "iters":         hv_traj_iters,
-        "target_hv":     target_hv,
-        "target_front":  target_front.tolist(),
-        "hv_actual":     hv_traj["actual"],
-        "hv_moe_soft":   hv_traj["moe_soft"],
-        "hv_moe_hard":   hv_traj["moe_hard"],
-        "hv_global":     hv_traj["global"],
-        "k_pick":        k_pick,
-        "ref_point_min": ref_pt_min.tolist(),
-        "front":         front,
-        "obj1":          obj1,
-        "obj2":          obj2,
+        "iters":                hv_traj_iters,
+        "target_hv":            target_hv,
+        "target_front":         target_front.tolist(),
+        "hv_actual":            hv_traj["actual"],
+        "hv_moe_soft":          hv_traj["moe_soft"],
+        "hv_moe_hard":          hv_traj["moe_hard"],
+        "hv_global":            hv_traj["global"],
+        "k_pick":               k_pick,
+        "pessimism_start_iter": pessimism_start_iter,
+        "ehvi_variant":         cfg_base.ehvi_variant,
+        "epsilon_scale":        cfg_base.epsilon_scale,
+        "ref_point_mode":       cfg_base.ref_point_mode,
+        "ref_point_frac":       cfg_base.ref_point_frac,
+        "ref_point_min":        ref_pt_min.tolist(),
+        "front":                front,
+        "obj1":                 obj1,
+        "obj2":                 obj2,
         "rounds_to_95pct": {
             name: _rounds_to_hv(hv_traj[name], hv_traj_iters, 0.95 * target_hv)
             for name in ("actual", "moe_soft", "moe_hard", "global")

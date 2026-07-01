@@ -64,6 +64,10 @@ def _parse_diagnostic_args(argv: list[str]) -> tuple[argparse.Namespace, list[st
     parser.add_argument("--k_pick", type=int, default=None,
                           help="Top-K children to pick per iter under each surrogate. "
                                "Defaults to cfg.ngen // 2 (a 'half budget' retrospective).")
+    parser.add_argument("--pessimism_start_iter", type=int, default=6,
+                          help="First iter at which pessimism kicks in inside the KB inner "
+                               "loop (default: 6, matches production practice of "
+                               "no-pessimism rounds 1-5, pessimism rounds 6+).")
     args, remaining = parser.parse_known_args(argv)
     return args, remaining
 
@@ -117,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg_base=cfg_base,
         n_iters=diag_args.n_iters,
         k_pick=diag_args.k_pick,
+        pessimism_start_iter=diag_args.pessimism_start_iter,
         log=log,
     )
 

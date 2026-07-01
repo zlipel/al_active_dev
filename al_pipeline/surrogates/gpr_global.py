@@ -151,6 +151,23 @@ class GlobalGPRSurrogate(Surrogate):
     def supports_joint_sampling(self) -> bool:
         return self._mode == "gpr_multitask"
 
+    @property
+    def model_bundle(self) -> dict[str, Any]:
+        """Live reference to the underlying model dict.
+
+        Mutable — the retrospective's kriging-believer path re-conditions
+        the GP by swapping in retrained `model`/`likelihood` objects here."""
+        return self._bundle
+
+    @property
+    def normalization_stats(self) -> dict:
+        """Global feature normalization stats used by `_normalize`."""
+        return self._stats
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
     def _normalize(self, X_raw: pd.DataFrame) -> torch.Tensor:
         """Convert + standardize via the stored global stats, return a torch tensor."""
         Xraw = X_raw.to_numpy(dtype=np.float32)
