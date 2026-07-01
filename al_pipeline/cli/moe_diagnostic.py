@@ -1,6 +1,14 @@
 """
 CLI entry point for the AL MoE retrospective diagnostic.
 
+**Path split (matches the rest of the pipeline):**
+- **Reads** training data (features_gen*.csv, labels_gen*.csv, seq_gen*.txt)
+  from `cfg.scratch_path/<MODEL>/GENERATIONS/` — the same place every other
+  training / GA consumer reads from. Override via `--runs_root` if you want
+  to point at a copy elsewhere.
+- **Writes** diagnostic outputs to `cfg.base_path/<MODEL>/DIAGNOSTIC/`
+  (home-side, small + persistent).
+
 Example (single model, upper front):
 
     python -m al_pipeline.cli.moe_diagnostic \\
@@ -8,11 +16,12 @@ Example (single model, upper front):
         --train_model_type moe --ehvi_variant epsilon \\
         --exploration_strategy kriging_believer \\
         --transform yeoj --obj1 exp_density --obj2 diff \\
-        --runs_root $HOME/PROJECTS/al_active_dev/runs \\
+        --base_path   $HOME/PROJECTS/al_active_dev/runs \\
+        --scratch_path /scratch/gpfs/zl4808/PROJECTS/MODEL_COMPARISON \\
         --n_iters 10
 
 Cheap enough to run on a login node — no LAMMPS, small kfold, ~10 min.
-Produces three artifacts under `<runs_root>/<MODEL>/DIAGNOSTIC/`:
+Produces three artifacts under `<base_path>/<MODEL>/DIAGNOSTIC/`:
 
   - retrospective_summary.csv   — one row per iter (HV under each policy, hits)
   - retrospective_trajectory.json — full HV curves + target front + rounds-to-95%
@@ -42,8 +51,14 @@ def _parse_diagnostic_args(argv: list[str]) -> tuple[argparse.Namespace, list[st
     Peel off the retrospective-specific args and hand the rest to ALConfig.from_cli.
     """
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--runs_root", type=Path, required=True,
-                          help="Root containing <MODEL>/GENERATIONS/iteration_* (completed run).")
+    # Optional override for the completed-run source root. Defaults to
+    # cfg.scratch_path (i.e. where the AL loop actually writes features and
+    # labels). Only set this if you've copied a completed run somewhere else
+    # (e.g. an archived snapshot).
+    parser.add_argument("--runs_root", type=Path, default=None,
+                          help="Override for the completed-run source root "
+                               "(should contain <MODEL>/GENERATIONS/iteration_*). "
+                               "Defaults to cfg.scratch_path.")
     parser.add_argument("--n_iters", type=int, default=10,
                           help="Number of completed iters to walk (default: 10).")
     parser.add_argument("--k_pick", type=int, default=None,
@@ -90,8 +105,14 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         sys.argv = _orig_argv
 
+    # Default runs_root to cfg.scratch_path — that's where every other
+    # pipeline consumer reads features/labels from, so the diagnostic
+    # matches by default. Explicit --runs_root overrides.
+    runs_root = diag_args.runs_root if diag_args.runs_root is not None else cfg_base.scratch_path
+    log.info(f"reading completed-run artifacts from {runs_root}")
+
     out = run_retrospective(
-        runs_root=diag_args.runs_root,
+        runs_root=runs_root,
         model=cfg_base.model,
         cfg_base=cfg_base,
         n_iters=diag_args.n_iters,

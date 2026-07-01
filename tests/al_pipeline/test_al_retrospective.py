@@ -207,16 +207,17 @@ def test_compute_hv_raw_monotone_under_added_pareto_point():
 
 # ---------- (5) end-to-end run_retrospective on synthetic data ----------
 
-def _write_completed_run(tmp_path: Path, n_iters: int, batch_size: int, seed: int) -> Path:
+def _write_completed_run(source_root: Path, model: str, n_iters: int,
+                          batch_size: int, seed: int) -> None:
     """
     Materialize a synthetic completed AL run at the layout the loader expects:
-       runs_root / <MODEL> / GENERATIONS / iteration_N /
+       source_root / <MODEL> / GENERATIONS / iteration_N /
            features_gen{N}.csv, labels_gen{N}.csv, seq_gen{N}.txt
     Only the FINAL iter's cumulative files are needed by load_completed_run.
+    `source_root` should be the SCRATCH-side root (== cfg.scratch_path in
+    production).
     """
-    runs_root = tmp_path / "runs"
-    model = "TEST_MODEL"
-    gen_dir = runs_root / model / "GENERATIONS" / f"iteration_{n_iters}"
+    gen_dir = source_root / model / "GENERATIONS" / f"iteration_{n_iters}"
     gen_dir.mkdir(parents=True, exist_ok=True)
 
     n_seed = 40
@@ -235,7 +236,6 @@ def _write_completed_run(tmp_path: Path, n_iters: int, batch_size: int, seed: in
     with open(gen_dir / f"seq_gen{n_iters}.txt", "w") as f:
         for s in seqs:
             f.write(s + "\n")
-    return runs_root
 
 
 @pytest.mark.slow
@@ -245,19 +245,24 @@ def test_run_retrospective_end_to_end_synthetic(tmp_path):
       - both output files exist with the expected schema
       - HV trajectories are monotonic non-decreasing
       - target HV >= any policy's HV (target is union of all iters)
+
+    The completed-run artifacts are written under cfg.scratch_path (mirrors
+    the production layout: features/labels/seqs live on SCRATCH, outputs
+    live on HOME under cfg.base_path).
     """
     n_iters = 3
     batch = 12
-    runs_root = _write_completed_run(tmp_path, n_iters=n_iters, batch_size=batch, seed=7)
+    model = "TEST_MODEL"
 
-    # cfg_base: diagnostic_dir will land at base_path/<MODEL>/DIAGNOSTIC.
+    # cfg_base: diagnostic_dir lands at base_path/<MODEL>/DIAGNOSTIC (HOME-side);
+    # completed-run source at scratch_path/<MODEL>/GENERATIONS/... (SCRATCH-side).
     base = tmp_path / "home"
     scratch = tmp_path / "scratch"
     db = tmp_path / "db"
     for d in (base, scratch, db):
         d.mkdir(parents=True, exist_ok=True)
     cfg_base = ALConfig(
-        model="TEST_MODEL", iteration=0, front="upper",
+        model=model, iteration=0, front="upper",
         base_path=base, scratch_path=scratch, db_path=db,
         train_model_type="moe", transform="yeoj",
         ehvi_variant="epsilon", exploration_strategy="standard",
@@ -267,9 +272,11 @@ def test_run_retrospective_end_to_end_synthetic(tmp_path):
         moe_policy="soft", moe_threshold=0.5,
     )
 
+    _write_completed_run(scratch, model=model, n_iters=n_iters, batch_size=batch, seed=7)
+
     torch.manual_seed(0); np.random.seed(0)
     out = run_retrospective(
-        runs_root=runs_root, model="TEST_MODEL",
+        runs_root=cfg_base.scratch_path, model=model,
         cfg_base=cfg_base, n_iters=n_iters,
         k_pick=batch // 2,
     )

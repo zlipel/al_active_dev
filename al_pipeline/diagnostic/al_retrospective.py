@@ -280,7 +280,11 @@ def run_retrospective(
     Parameters
     ----------
     runs_root
-        Path to the completed AL results (`runs_root/<MODEL>/GENERATIONS/...`).
+        SCRATCH-side root containing the completed run at
+        `runs_root/<MODEL>/GENERATIONS/iteration_*/`. This is where the AL
+        loop's features/labels/seqs actually live — typically
+        `cfg.scratch_path`. NOT the home-side `runs/` folder, which only
+        holds outputs (checkpoints, plots, logs).
     model
         Model name (e.g. "MPIPI"). Used to resolve the completed-run path.
     cfg_base
