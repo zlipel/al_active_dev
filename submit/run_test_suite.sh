@@ -10,9 +10,6 @@
 #SBATCH --output=test_suite.out
 #SBATCH --error=test_suit.err
 
-module purge 
-module load anaconda3/2024.6
-module load al_active_dev
 
 if [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/config/cluster.env" ]]; then
     REPO_ROOT="${SLURM_SUBMIT_DIR}"
@@ -22,6 +19,10 @@ else
     REPO_ROOT="${HOME}/PROJECTS/al_active_dev"
 fi
 source "${REPO_ROOT}/config/cluster.env"
+
+module purge
+module load "${CONDA_MODULE}"
+conda activate "${CONDA_ENV}"
 
 
 pytest tests/
