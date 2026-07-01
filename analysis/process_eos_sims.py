@@ -10,9 +10,7 @@ from external.core import calculate_mass
 import scipy
 from scipy.interpolate import CubicSpline
 from scipy.optimize import root_scalar
-from scipy.signal import correlate
 import pickle as pkl
-from statsmodels.tsa.stattools import acf
 
 
 def main():
@@ -152,23 +150,17 @@ def get_EOS(pth, frac=0.5, bootstrap=False):
 
                 N = int((1-frac)*len(data)) # get frac*100 % of the data (eg frac 0.8 => 80%)
 
-                # get number of samples to generate
-                tau = correlation_time(data['P'][N:].values)
+                # Fixed 5-block split-error. Previously we tried a
+                # correlation-time-based n_samples via statsmodels.acf, but
+                # the zero-crossing estimator was empirically unreliable
+                # (frequently returned -1) and we always fell back to n=5.
+                # Skip the machinery entirely.
+                n_samples = 5
 
-                corr_time = get_corr_frames(data['P'][N:].values)
-                if corr_time != -1:
-                    tau = corr_time
-                    n_samples = data['P'][N:].values.shape[0] // corr_time
-                else:
-                    n_samples = 5
-        
-                #n_samples = generate_n_samples(data['P'][N:].values, tau, timestep=10, output_freq=100, max_samples=5)
-                #n_samples = 10
-                                            
                 if bootstrap:
                     P.append(split_error(data['P'][N:].values, n_samples)[1])
                 else:
-                    P.append(data['P'][N:].mean())  
+                    P.append(data['P'][N:].mean())
 
                 err.append(split_error(data['P'][N:].values, n_samples)[0])
                 rho.append(float(data['rho'].values[-1]))
@@ -489,22 +481,10 @@ def bootstrap_exp_dens_from_path(pth, frac, num_bootstrap=200, work=15, confiden
 
                 N = int((1-frac)*len(data)) # get frac*100 % of the data (eg frac 0.8 => 80%)
 
-                # get number of samples to generate
-                tau = correlation_time(data['P'][N:].values)
-        
-                #n_samples = generate_n_samples(data['P'][N:].values, tau, timestep=10, output_freq=100, max_samples=5)
+                # Fixed 5-block split-error (see get_EOS for rationale).
+                n_samples = 5
 
-                corr_time = get_corr_frames(data['P'][N:].values)
-                if corr_time != -1:
-                    tau = corr_time
-                    n_samples = data['P'][N:].values.shape[0] // corr_time
-                else:
-                    n_samples = 5
-                                            
-            
                 P.append(split_error(data['P'][N:].values, n_samples)[1])
-                
-
                 err.append(split_error(data['P'][N:].values, n_samples)[0])
                 rho.append(float(data['rho'].values[-1]))
             else:
@@ -566,74 +546,6 @@ def bootstrap_exp_dens_from_path(pth, frac, num_bootstrap=200, work=15, confiden
 
     return exp_density_mean #, exp_density_std #, rho_star_samples, exp_density_samples, P_bootstrapped
 
-
-def generate_n_samples(pressure_time_series, tau_c, timestep=10, output_freq=100, max_samples=20):
-    """
-    Generates independent pressure samples based on the correlation time.
-
-    Parameters:
-    ----------
-    pressure_time_series : array-like
-        The time series of pressure values.
-    tau_c : float
-        Correlation time in the same units as timestep × output_freq.
-    timestep : float
-        Simulation timestep (e.g., 10 fs).
-    output_freq : int
-        Number of timesteps between successive outputs in the time series.
-
-    Returns:
-    --------
-    n_samples: int
-        Number of independent samples
-    """
-
-    # Compute the time interval between successive entries in the time series
-    delta_t = timestep * output_freq  # Time per index in the time series
-
-    # Compute the number of indices per correlation time
-    if delta_t == 0:
-        return max_samples
-    else:
-        n_corr = int(np.ceil(tau_c / delta_t))
-
-        if n_corr != 0 and n_corr != 1:
-
-        # Based on n_corr, determine max number of independent samples, but round down to nearest integer
-            n_samples = len(pressure_time_series) // n_corr
-
-        else:
-
-            n_samples = 5
-
-        return min(n_samples, max_samples)
-
-def correlation_time(P_arr):
-    """
-    Calculates the correlation time of a pressure time series.
-    """
-    avg = np.mean(P_arr)
-    var = np.var(P_arr)
-
-    if var == 0 or np.isnan(var):
-        return 1  # or some small default value
-
-    autocorr = correlate(P_arr - avg, P_arr - avg, mode='full')[len(P_arr)-1:] / (var * len(P_arr))
-
-    tau = np.argmax(autocorr < 1/np.e)
-
-    return tau
-
-def get_corr_frames(data):
-
-    acf_values = acf(data)
-
-    zero_crossing_length = None
-    for i in range(1, len(acf_values)):
-        if acf_values[i-1] > 0 and acf_values[i] <= 0:
-            zero_crossing_length = i
-    
-    return zero_crossing_length if zero_crossing_length is not None else -1
 
 #def calc_exp_density(Pinp, rhoinp, work=15, verbose=False):
 def calc_exp_density(spline, rhomin, rhomax, work=15, verbose=False):
