@@ -242,6 +242,21 @@ def augment(cfg: ALConfig, *, seq_id: int, pessimism: bool, log=None) -> None:
     -------
     None
     """
+    # MoE augmentation isn't wired here. The kriging-believer path inside
+    # `predict_for_augmentation` calls `get_cand_stats` which returns the
+    # full per-task covariance matrix from a multitask GP — the MoE
+    # PoolPosterior exposes marginal stds but not cross-objective covariance
+    # over the mixture (would need a separate branch to derive it from the
+    # gate-weighted joint moment match). Lands in a follow-up branch when the
+    # MoE diagnostic loop actually needs augmentation.
+    if cfg.train_model_type == "moe":
+        raise NotImplementedError(
+            "kriging_believer + MoE augmentation is not yet wired. Use "
+            "exploration_strategy in {'standard', 'similarity_penalty'} with "
+            "train_model_type='moe', or fall back to gpr_multitask for the "
+            "kriging-believer path."
+        )
+
     p = cfg.paths
     featurizer = sf.SequenceFeaturizer(cfg.model.lower(), cfg.db_path)
     normalization_stats = load_normalization_stats(p.norm_stats)

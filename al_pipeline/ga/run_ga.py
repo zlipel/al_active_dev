@@ -201,17 +201,29 @@ def run_one_candidate(
     ga_utils.seed_everything(seed_base=cfg.seed_base, iteration=cfg.iteration, seq_id=seq_id, cand_id=cand_id)
 
     featurizer = sf.SequenceFeaturizer(model_name=cfg.model.lower(), db_path=cfg.db_path)
-    model_bundle = ga_utils.load_models(cfg=cfg, temp = temp, device='cpu')
-    normalization_stats = ga_utils.load_normalization_stats(cfg.paths.norm_stats)
-    # GA pipeline only wires the global-GPR path here; MoE goes through the
-    # CLI in feat/moe-cli-al, which constructs its own MoEBundle.
-    surrogate = make_surrogate(
-        cfg,
-        model_bundle=model_bundle,
-        normalization_stats=normalization_stats,
-    )
+    # normalization_stats is only needed for the global-GPR surrogate (MoE
+    # experts carry their own normalizers). Load it for global paths and skip
+    # for MoE — calling it under MoE would fail since the global-fit
+    # normalization stats file isn't written by the MoE training pipeline.
+    if cfg.train_model_type == "moe":
+        moe_bundle = ga_utils.load_moe_bundle(cfg=cfg)
+        surrogate = make_surrogate(
+            cfg,
+            moe_bundle=moe_bundle,
+            moe_policy=cfg.moe_policy,
+            moe_threshold=cfg.moe_threshold,
+        )
+        normalization_stats = ga_utils.load_normalization_stats(cfg.paths.norm_stats)
+    else:
+        model_bundle = ga_utils.load_models(cfg=cfg, temp=temp, device='cpu')
+        normalization_stats = ga_utils.load_normalization_stats(cfg.paths.norm_stats)
+        surrogate = make_surrogate(
+            cfg,
+            model_bundle=model_bundle,
+            normalization_stats=normalization_stats,
+        )
 
-    pareto_front, pareto_feats, parent_seqs = ga_utils.load_front(cfg=cfg, seq_id=seq_id)
+    pareto_front, pareto_feats_raw_df, parent_seqs = ga_utils.load_front(cfg=cfg, seq_id=seq_id)
 
     # init population from parent sequences
     init_pop = _init_pop(parent_seqs)
@@ -226,12 +238,13 @@ def run_one_candidate(
     else:
         propseq_arr = np.empty((0, 0), dtype=np.float32)
 
-    # epsilon-shift (if enabled) and front augmentation
+    # epsilon-shift (if enabled) and front augmentation. Routes through the
+    # surrogate — uniform path for global GPR and MoE.
     pareto_input, eps = ga_utils.make_epsilon_shifted_front(
         cfg=cfg,
         pareto_front=pareto_front,
-        pareto_feats=pareto_feats,
-        model_bundle=model_bundle,
+        pareto_feats_raw_df=pareto_feats_raw_df,
+        surrogate=surrogate,
     )
     
 

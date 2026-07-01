@@ -69,15 +69,50 @@ def back_AA(X, atm_types=atm_types):
 
 
 def load_models(cfg: ALConfig, *, temp: bool, device: str | torch.device = "cpu") -> dict[str, Any]:
-    """Top-level loader used by GA / augmentation."""
+    """Top-level loader used by GA / augmentation for the global GPR path."""
     t = cfg.train_model_type
     if t == "gpr_multitask":
         return load_gpr_multitask(cfg, temp=temp, device=device)
     if t == "gpr_singletask":
         return load_gpr_singletask(cfg, temp=temp, device=device)
+    if t == "moe":
+        raise ValueError(
+            "load_models is for global GPR only; use load_moe_bundle for "
+            "train_model_type='moe' (no model_bundle dict shape — MoEBundle "
+            "is passed to make_surrogate via moe_bundle=...)"
+        )
     if t == "dnn":
         raise NotImplementedError("DNN loader not implemented yet.")
     raise ValueError(f"Unknown train_model_type={t}")
+
+
+def load_moe_bundle(cfg: ALConfig):
+    """
+    Load the per-iter MoE artifacts written by `train_moe_from_config`.
+
+    Returns
+    -------
+    MoEBundle
+        Validated bundle with the RF + PS + nonPS experts. The bundle's
+        metadata is checked against the iter / transform / model_name in cfg
+        — stale checkpoints surface as ValueError here rather than as silent
+        wrong predictions downstream.
+    """
+    # Lazy import: surrogates depend on data_prep + training but not on
+    # ga_utils, so this stays in the right direction.
+    from al_pipeline.surrogates import MoEBundle
+    p = cfg.paths
+    return MoEBundle.from_checkpoints(
+        str(p.moe_rf_bundle(temp=False)),
+        str(p.moe_ps_chkpt(temp=False)),
+        str(p.moe_nonps_chkpt(temp=False)),
+        str(p.features_csv),
+        str(p.labels_csv),
+        expected_transform=cfg.transform,
+        expected_label_scaler_scope="all",
+        expected_model_name=cfg.model,
+        expected_iter=cfg.iteration,
+    )
 
 
 def load_gpr_multitask(cfg: ALConfig, *, temp: bool, device: str | torch.device = "cpu") -> dict[str, Any]:
@@ -145,24 +180,39 @@ def load_gpr_singletask(cfg: ALConfig, *, temp: bool, device: str | torch.device
 
 
 def load_front(cfg: ALConfig, seq_id: int, log=None):
-    "Loads the current Pareto front sequences, features, and labels."
+    """
+    Loads the current Pareto front: sequences, raw features, and labels.
+
+    Returns
+    -------
+    pareto_front : np.ndarray
+        Shape (N, 2). Labels in normalized objective space (same z-space the
+        EHVI computation operates in).
+    pareto_feats_raw_df : pd.DataFrame
+        Shape (N, 29). RAW parent features — the surrogate normalizes them
+        internally. Lets the epsilon-shift route through the surrogate ABC so
+        global GPR and MoE share one code path.
+    parent_seqs : list[str]
+        The actual amino-acid sequences for each Pareto point.
+    """
     p = cfg.paths
-    
+
     seq_path = p.parent_seqs_temp_txt if seq_id > 1 else p.parent_seqs_txt
 
     labels_df = pd.read_csv(p.parent_labels_norm_csv)
-    feats_df  = pd.read_csv(p.parent_features_norm_csv)
+    feats_raw_df = pd.read_csv(p.parent_features_csv)
 
     pareto_front = labels_df[[cfg.obj1, cfg.obj2]].to_numpy()
-    pareto_feats = feats_df.to_numpy()
 
     with open(seq_path, "r") as f:
         parent_seqs = [ln.strip() for ln in f if ln.strip()]
 
     if len(parent_seqs) != pareto_front.shape[0]:
         raise ValueError("Parents mismatch: sequences and labels have different lengths.")
+    if len(feats_raw_df) != pareto_front.shape[0]:
+        raise ValueError("Parents mismatch: feats and labels have different lengths.")
 
-    return pareto_front, pareto_feats, parent_seqs
+    return pareto_front, feats_raw_df, parent_seqs
 
 def alpha(sequences: np.ndarray, propseqs: np.ndarray, seq_id: int) -> np.ndarray:
     """
@@ -226,28 +276,30 @@ def load_previous_children_as_feats(
 
 def make_epsilon_shifted_front(
     cfg,
-    pareto_front: np.ndarray,   # shape [N,2] in normalized objective space
-    pareto_feats: np.ndarray,   # shape [N,29] normalized feature space (or whatever model expects)
-    model_bundle: dict,
+    pareto_front: np.ndarray,           # shape [N,2] in normalized objective space
+    pareto_feats_raw_df: "pd.DataFrame",  # shape [N,29] RAW features
+    surrogate,
 ) -> tuple[np.ndarray, tuple[float, float] | None]:
     """
-    Returns (pareto_input, eps_tuple_or_None). pareto_input is what we feed into front augmentation.
-    This method applies the heuristic epsilon shift based on model uncertainty. Helps with exploration.
+    Returns (pareto_input, eps_tuple_or_None). pareto_input is what we feed
+    into front augmentation.
+
+    Routes through the `Surrogate` ABC so global GPR and MoE share one
+    implementation: each surrogate normalizes raw features its own way and
+    returns marginal stds via `predict_pool(...).stds`. The shift direction
+    flips with `cfg.front` (upper / lower) to push the front "outward" in the
+    less explored direction.
     """
     if cfg.ehvi_variant != "epsilon":
         return pareto_front.copy(), None
-    
-    epsilon_scale = cfg.epsilon_scale
 
-    model = model_bundle["model"]
-    with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        post = model(torch.tensor(pareto_feats, dtype=torch.float32))
-        std = post.stddev.detach().cpu().numpy()  # [N,2]
+    epsilon_scale = cfg.epsilon_scale
+    pool = surrogate.predict_pool(pareto_feats_raw_df)
+    std = pool.stds  # (N, 2) in normalized objective space
 
     sigma_bar = np.mean(std, axis=0)  # (2,)
-    sign = cfg.epsilon_scale if cfg.front == "upper" else -1*cfg.epsilon_scale
-    
-    eps = sign  * sigma_bar * epsilon_scale  # (2,)
+    sign = cfg.epsilon_scale if cfg.front == "upper" else -1 * cfg.epsilon_scale
+    eps = sign * sigma_bar * epsilon_scale  # (2,)
 
     pareto_input = pareto_front.copy()
     pareto_input[:, 0] += eps[0]

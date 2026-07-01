@@ -89,6 +89,16 @@ class ALConfig:
 
     acq_test: bool = False
 
+    #### MoE surrogate (used only when train_model_type == 'moe') ####
+    # 'soft' — gate-weighted blend of PS + nonPS posteriors (combine_soft +
+    #          soft_mixture_variance for means/vars; per-draw Bernoulli routing
+    #          for MC samples). Natural default — averages over gate uncertainty.
+    # 'hard' — deterministic per-candidate switch: PS expert where p_ps >=
+    #          moe_threshold, else nonPS. Discrete; useful for "discover PS
+    #          sequences only" acquisition.
+    moe_policy:    str   = "soft"
+    moe_threshold: float = 0.5
+
     def validate(self) -> None:
         """Validate the configuration parameters."""
         if self.iteration < 0:
@@ -108,6 +118,8 @@ class ALConfig:
             
         if self.train_model_type == "gpr_singletask" and (not self.obj1 or not self.obj2):
             raise ValueError("gpr_singletask requires obj1 and obj2")
+        if self.train_model_type == "moe" and self.moe_policy not in ("soft", "hard"):
+            raise ValueError(f"moe_policy must be 'soft' or 'hard', got {self.moe_policy!r}")
         _ = self.paths.tag
         
     @property
@@ -141,9 +153,10 @@ class ALConfig:
         parser.add_argument("--model", required=True, type=str)
         parser.add_argument("--iter", dest="iteration", required=True, type=int)
         parser.add_argument("--front", required=True, choices=["upper", "lower"], type=str)
-        parser.add_argument("--train_model_type", required=True, type=str, 
-                            choices=['gpr_singletask', 
+        parser.add_argument("--train_model_type", required=True, type=str,
+                            choices=['gpr_singletask',
                                      'gpr_multitask',
+                                     'moe',
                                      'dnn'])
         parser.add_argument("--ehvi_variant", required=True, type=str, 
                             choices=['standard', 

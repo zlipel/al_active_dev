@@ -29,6 +29,7 @@ Artifacts written:
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import gpytorch
@@ -42,6 +43,7 @@ from sklearn.preprocessing import PowerTransformer, StandardScaler
 from al_pipeline.core.config import ALConfig
 from al_pipeline.data_prep.data_loading import (
     apply_feature_normalizer,
+    convert_and_normalize_features,
     convert_features,
     fit_feature_normalizer,
 )
@@ -320,6 +322,25 @@ def train_moe_from_config(cfg: ALConfig, log=None) -> dict[str, Any]:
 
     # Shared label scalers (scope='all')
     scaler1, scaler2 = _fit_label_scalers(labels_df, label_columns, cfg.transform)
+
+    # Fit + persist a global feature normalizer too. MoE experts have their
+    # own per-regime normalizers (held in each GPRExpert), but the GA's
+    # similarity-penalty path and the parents/Pareto-front pipeline both
+    # reach into `cfg.paths.norm_stats` and `cfg.paths.features_norm_csv`
+    # for globally-normalized data. Writing them here keeps every
+    # downstream consumer happy regardless of surrogate type.
+    feats_norm_np, global_norm_stats = convert_and_normalize_features(
+        features_df[FEATURE_COLUMNS].to_numpy(np.float32), train=True,
+    )
+    with open(p.norm_stats, "w") as f:
+        json.dump(global_norm_stats, f)
+    pd.DataFrame(feats_norm_np, columns=FEATURE_COLUMNS).to_csv(p.features_norm_csv, index=False)
+
+    # Labels in shared z-space — same scalers PS / nonPS experts use, so the
+    # Pareto-front computation in `get_parents` operates in the same space the
+    # MoE surrogate predicts into. scope='all' makes this well-defined.
+    labels_scaled = _apply_label_scalers(labels_df, label_columns, cfg.transform, scaler1, scaler2)
+    pd.DataFrame(labels_scaled, columns=label_columns).to_csv(p.labels_norm_csv, index=False)
 
     # PS expert
     if log:
