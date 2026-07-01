@@ -283,33 +283,39 @@ def test_run_retrospective_end_to_end_synthetic(tmp_path):
 
     _write_completed_run(scratch, model=model, n_iters=n_iters, batch_size=batch, seed=7)
 
+    start_iter = 1
+
     torch.manual_seed(0); np.random.seed(0)
     out = run_retrospective(
         runs_root=cfg_base.scratch_path, model=model,
         cfg_base=cfg_base, n_iters=n_iters,
         k_pick=k_pick,
         pessimism_start_iter=1,   # exercise the pessimism branch on every iter
+        start_iter=start_iter,
     )
 
     diag_dir = cfg_base.paths.diagnostic_dir
-    assert (diag_dir / "retrospective_summary.csv").exists()
-    assert (diag_dir / "retrospective_trajectory.json").exists()
+    summary_path    = diag_dir / f"retrospective_summary_start{start_iter}.csv"
+    trajectory_path = diag_dir / f"retrospective_trajectory_start{start_iter}.json"
+    assert summary_path.exists()
+    assert trajectory_path.exists()
 
-    summary = pd.read_csv(diag_dir / "retrospective_summary.csv")
-    assert len(summary) == n_iters
+    summary = pd.read_csv(summary_path)
+    assert len(summary) == n_iters - start_iter + 1
     for col in ("iter", "n_children", "n_picked",
                  "hv_actual", "hv_moe_soft", "hv_moe_hard", "hv_global"):
         assert col in summary.columns, f"missing column {col}"
 
-    with open(diag_dir / "retrospective_trajectory.json") as f:
+    with open(trajectory_path) as f:
         traj = json.load(f)
     for key in ("iters", "hv_actual", "hv_moe_soft", "hv_moe_hard", "hv_global"):
         assert key in traj
-        assert len(traj[key]) == n_iters
-    # New provenance fields the KB refactor added.
+        assert len(traj[key]) == n_iters - start_iter + 1
+    # New provenance fields the KB + start_iter refactors added.
     assert traj["pessimism_start_iter"] == 1
     assert traj["ehvi_variant"] == "epsilon"
     assert traj["k_pick"] == k_pick
+    assert traj["start_iter"] == start_iter
 
     # Monotone non-decreasing under each policy.
     for name in ("hv_actual", "hv_moe_soft", "hv_moe_hard", "hv_global"):
@@ -320,6 +326,61 @@ def test_run_retrospective_end_to_end_synthetic(tmp_path):
     for name in ("hv_actual", "hv_moe_soft", "hv_moe_hard", "hv_global"):
         assert traj[name][-1] <= traj["target_hv"] + 1e-8, \
             f"{name} final HV exceeds target HV: {traj[name][-1]} > {traj['target_hv']}"
+
+
+# ---------- start_iter shifts the loop range + seeds ----------
+
+@pytest.mark.slow
+def test_run_retrospective_start_iter_shifts_range(tmp_path):
+    """
+    Running with start_iter=2 must:
+      - evaluate n_iters - 1 iters (the summary CSV has that many rows)
+      - land under `_start2` suffixed output filenames (no clobber if start_iter=1 also ran)
+      - seed every policy's initial picks with cumulative real data through gen 1
+    """
+    n_iters = 3
+    batch = 6
+    k_pick = 2
+    start_iter = 2
+    model = "TEST_MODEL"
+
+    base = tmp_path / "home"; scratch = tmp_path / "scratch"; db = tmp_path / "db"
+    for d in (base, scratch, db):
+        d.mkdir(parents=True, exist_ok=True)
+    cfg_base = ALConfig(
+        model=model, iteration=0, front="upper",
+        base_path=base, scratch_path=scratch, db_path=db,
+        train_model_type="moe", transform="yeoj",
+        ehvi_variant="standard", exploration_strategy="standard",
+        obj1="exp_density", obj2="diff",
+        epochs=20, patience=3, k_folds=3, learning_rate=0.1,
+        ngen=batch,
+        moe_policy="soft", moe_threshold=0.5,
+    )
+    _write_completed_run(scratch, model=model, n_iters=n_iters, batch_size=batch, seed=11)
+
+    torch.manual_seed(0); np.random.seed(0)
+    run_retrospective(
+        runs_root=cfg_base.scratch_path, model=model,
+        cfg_base=cfg_base, n_iters=n_iters,
+        k_pick=k_pick, pessimism_start_iter=99, start_iter=start_iter,
+    )
+
+    diag_dir = cfg_base.paths.diagnostic_dir
+    summary_path    = diag_dir / f"retrospective_summary_start{start_iter}.csv"
+    trajectory_path = diag_dir / f"retrospective_trajectory_start{start_iter}.json"
+    assert summary_path.exists()
+    assert trajectory_path.exists()
+
+    summary = pd.read_csv(summary_path)
+    assert len(summary) == n_iters - start_iter + 1
+    # First iter row is the start_iter, not 1.
+    assert int(summary.iloc[0]["iter"]) == start_iter
+
+    with open(trajectory_path) as f:
+        traj = json.load(f)
+    assert traj["start_iter"] == start_iter
+    assert traj["iters"] == list(range(start_iter, n_iters + 1))
 
 
 # ---------- load_completed_run error paths ----------
