@@ -1,0 +1,37 @@
+#!/bin/bash
+
+#SBATCH --job-name=moe_diag
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem-per-cpu=4G
+#SBATCH --time=00:30:00
+#SBATCH --output=test_suite.out
+#SBATCH --error=test_suit.err
+
+module purge 
+module load anaconda3/2024.6
+module load al_active_dev
+
+if [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/config/cluster.env" ]]; then
+    REPO_ROOT="${SLURM_SUBMIT_DIR}"
+elif [[ -n "${AL_ACTIVE_DEV:-}" && -f "${AL_ACTIVE_DEV}/config/cluster.env" ]]; then
+    REPO_ROOT="${AL_ACTIVE_DEV}"
+else
+    REPO_ROOT="${HOME}/PROJECTS/al_active_dev"
+fi
+source "${REPO_ROOT}/config/cluster.env"
+
+
+pytest tests/
+
+LOG_DEST="${SLURM_SUBMIT_DIR:-.}/logs"
+
+SLURM_OUT="${SLURM_SUBMIT_DIR:-.}/test_suite.out"
+SLURM_ERR="${SLURM_SUBMIT_DIR:-.}/test_suite.err"
+[[ -f "$SLURM_OUT" ]] && mv "$SLURM_OUT" "$LOG_DEST/moe_diagnostic.out"
+[[ -f "$SLURM_ERR" ]] && mv "$SLURM_ERR" "$LOG_DEST/moe_diagnostic.err"
+
+conda deactivate
+
