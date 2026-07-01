@@ -29,6 +29,8 @@ pytest tests/
 
 LOG_DEST="${SLURM_SUBMIT_DIR:-.}/logs"
 
+mkdir -p "$LOG_DEST"
+
 SLURM_OUT="${SLURM_SUBMIT_DIR:-.}/test_suite.out"
 SLURM_ERR="${SLURM_SUBMIT_DIR:-.}/test_suite.err"
 [[ -f "$SLURM_OUT" ]] && mv "$SLURM_OUT" "$LOG_DEST/moe_diagnostic.out"
