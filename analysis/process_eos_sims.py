@@ -666,8 +666,13 @@ def calc_exp_density(spline, rhomin, rhomax, work=15, verbose=False):
 
 
 
-    # Calculates work at each point along the spline and then calculates where that equals the set work
-    roots = [np.trapz(y[:i+1],x[:i+1]) for i in range(len(x))]
+    # Calculates work at each point along the spline and then calculates where that equals the set work.
+    # np.trapezoid (numpy>=2.0) is the non-deprecated name; np.trapz still works
+    # on 2.x as an alias but is removed on newer numpys — the cluster hits that.
+    # hasattr guard (not `getattr(..., np.trapz)`) so we don't touch np.trapz at
+    # all when it's removed — a plain reference is enough to crash.
+    _trap = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    roots = [_trap(y[:i+1], x[:i+1]) for i in range(len(x))]
     for i, value in enumerate(roots):
         if value > work:
             root = x[i]
