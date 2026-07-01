@@ -42,6 +42,12 @@ def train_from_config(cfg: ALConfig, log=None) -> None:
     elif train_model_type == "gpr_singletask":
         for label_col in [cfg.obj1, cfg.obj2]:
             _kfold_gpr_single_from_config(cfg, label_column=label_col, log=log)
+    elif train_model_type == "moe":
+        # Imported here to avoid a top-level circular: moe_training imports
+        # from surrogates, which itself imports nothing from kfold_training,
+        # but the lazy import keeps the dependency direction obvious.
+        from al_pipeline.training.moe_training import train_moe_from_config
+        train_moe_from_config(cfg, log=log)
     elif train_model_type == "dnn":
         _kfold_dnn_from_config(cfg, log=log) # TODO: implement this function
     else:

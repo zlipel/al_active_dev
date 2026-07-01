@@ -71,7 +71,10 @@ def get_parents(cfg: ALConfig, log=None, stage: str = "base") -> None:
     # Always use normalized generation data for GA + augmentation workflows
     feats_path  = p.features_norm_csv
 
-    if cfg.train_model_type == "gpr_multitask":
+    if cfg.train_model_type in ("gpr_multitask", "moe"):
+        # Both produce a single labels_norm_csv: gpr_multitask writes it from
+        # the multitask training pipeline; moe writes it via the shared label
+        # scalers under scope='all'. Both end up in a common z-space.
         labels_path = p.labels_norm_csv
     elif cfg.train_model_type == "gpr_singletask":
         labels_path = []
@@ -81,7 +84,7 @@ def get_parents(cfg: ALConfig, log=None, stage: str = "base") -> None:
                 raise FileNotFoundError(f"Expected label file for single-task GPR not found: {lbl_path}")
             labels_path.append(lbl_path)
     else:
-        raise ValueError(f"Unknown model_train_type: {cfg.model_train_type} not implemented yet.")
+        raise ValueError(f"Unknown train_model_type: {cfg.train_model_type} not implemented yet.")
 
     # Select sequences + outputs by stage
     if stage == "base":
@@ -108,7 +111,7 @@ def get_parents(cfg: ALConfig, log=None, stage: str = "base") -> None:
 
     features = pd.read_csv(str(feats_path))
 
-    if cfg.train_model_type == "gpr_multitask":
+    if cfg.train_model_type in ("gpr_multitask", "moe"):
         labels   = pd.read_csv(str(labels_path))
     elif cfg.train_model_type == "gpr_singletask":
         label_dfs = []
@@ -132,6 +135,14 @@ def get_parents(cfg: ALConfig, log=None, stage: str = "base") -> None:
 
     pareto_features.to_csv(pareto_feats_path, index=False)
     pareto_labels.to_csv(pareto_labels_path, index=False)
+
+    # Also write the RAW parent features by re-indexing the raw features CSV
+    # at the same Pareto rows. The surrogate-based epsilon-shift in run_ga
+    # consumes these (it takes raw features and normalizes internally —
+    # works the same for global and MoE). The raw rows correspond 1:1 to the
+    # normalized rows since both files index over the same generation set.
+    raw_features = pd.read_csv(str(p.features_csv))
+    raw_features.iloc[indices].reset_index(drop=True).to_csv(p.parent_features_csv, index=False)
 
     with open(pareto_seq_path, "w") as f:
         for seq in sequences:
