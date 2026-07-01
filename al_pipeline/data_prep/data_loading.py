@@ -55,7 +55,10 @@ def convert_features(features_df: pd.DataFrame) -> pd.DataFrame:
         Same shape and columns as the input, with the length-normalized
         operations applied, dtype float32. Input is not mutated.
     """
-    df = features_df.astype(np.float32, copy=True)
+    # `.astype(...).copy()` (not `astype(..., copy=True)`) — the copy= kwarg
+    # is deprecated under pandas Copy-on-Write; astype can return a view we'd
+    # otherwise mutate below.
+    df = features_df.astype(np.float32).copy()
     # First 20 columns are AA counts (in AMINO_ACIDS order).
     for col in df.columns[:20]:
         df[col] = df[col] / df["length"]
@@ -149,7 +152,9 @@ def apply_feature_normalizer(
         Same shape as input, fully normalized, dtype float32. Input is not
         mutated.
     """
-    df = features_converted_df.astype(np.float32, copy=True)
+    # See convert_features above for the `.astype(...).copy()` rationale
+    # (astype's copy= kwarg is deprecated under Copy-on-Write).
+    df = features_converted_df.astype(np.float32).copy()
     for feat, s in stats.items():
         kind = s["type"]
         if kind == "standard":

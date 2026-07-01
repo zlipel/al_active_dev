@@ -11,13 +11,15 @@
 #
 # MoE retrospective diagnostic for ONE model / front.
 #
-# Reads the completed 10-round global-AL artifacts under
-# ${HOME_AL}/<MODEL>/GENERATIONS/iteration_*/, refits MoE + global surrogates
-# per iter on the same training slice, ranks each iter's real children by
-# EHVI under each surrogate, and rolls cumulative HV forward under a
-# counterfactual "half-batch" pick (top-K by EHVI where K = ngen // 2).
+# Reads the completed 10-round global-AL artifacts from
+#   ${SCRATCH_AL}/<MODEL>/GENERATIONS/iteration_*/
+# (via --scratch_path; this is where the AL loop's features/labels actually
+# live — HOME_AL only holds outputs). Refits MoE + global surrogates per iter
+# on the same training slice, ranks each iter's real children by EHVI under
+# each surrogate, and rolls cumulative HV forward under a counterfactual
+# "half-batch" pick (top-K by EHVI where K = ngen // 2).
 #
-# Output: ${HOME_AL}/<MODEL>/DIAGNOSTIC/
+# Output: ${HOME_AL}/<MODEL>/DIAGNOSTIC/  (via --base_path)
 #   retrospective_summary.csv
 #   retrospective_trajectory.json
 #   retrospective_hv.png
@@ -113,7 +115,6 @@ if [[ -z "$MODEL" ]]; then
 fi
 
 CMD=(python -m al_pipeline.cli.moe_diagnostic
-    --runs_root "$HOME_AL"
     --n_iters "$N_ITERS"
     --model "$MODEL"
     --iter 0
@@ -130,6 +131,9 @@ CMD=(python -m al_pipeline.cli.moe_diagnostic
     --scratch_path "$SCRATCH_AL"
     --db_path "$DB_PATH"
 )
+# NOTE: no --runs_root: the CLI defaults to cfg.scratch_path (= $SCRATCH_AL),
+# which is where the AL loop's features/labels/seqs actually live. Only set
+# --runs_root explicitly if you're pointing at an archived copy elsewhere.
 [[ -n "$K_PICK" ]] && CMD+=(--k_pick "$K_PICK")
 CMD+=("${EXTRA_FLAGS[@]}")
 
