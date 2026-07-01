@@ -39,214 +39,45 @@ from __future__ import annotations
 
 import json
 import tempfile
-from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
-from pygmo import hypervolume
 
 from al_pipeline.acquisition import ehvi
 from al_pipeline.core.config import ALConfig
 from al_pipeline.data_prep.data_loading import convert_and_normalize_features
 from al_pipeline.data_prep.parents import find_pareto_front
+from al_pipeline.diagnostic._common import (
+    IterationData,
+    _build_global_surrogate,
+    _build_moe_surrogates,
+    _global_ref_point,
+    _make_iter_cfg,
+    _write_training_slice,
+    compute_hv_raw,
+    compute_target_front,
+    load_completed_run,
+)
 from al_pipeline.ga.augmentation import (
     _reindex_expert,
     _retrain_model_gpr_multitask,
     overlap_batch,
     predict_for_augmentation,
 )
-from al_pipeline.ga.ga_utils import (
-    load_models, load_moe_bundle, load_normalization_stats,
-    make_epsilon_shifted_front,
-)
+from al_pipeline.ga.ga_utils import make_epsilon_shifted_front
 from al_pipeline.surrogates import (
     GlobalGPRSurrogate, MoESurrogate, Surrogate,
     build_rf_features, classifier_p_ps,
 )
-from al_pipeline.training.kfold_training import train_from_config
 
 
-# ---------- data model ----------
-
-@dataclass(frozen=True)
-class IterationData:
-    """
-    All rows across all iters of a completed AL run.
-
-    features_df / labels_df / seqs are cumulative and aligned by row index —
-    row `i` in features_df is the raw features for `seqs[i]` with labels at
-    `labels_df.iloc[i]`. The `generation` column in labels_df identifies
-    which iter each row was simulated at.
-    """
-    features_df: pd.DataFrame
-    labels_df: pd.DataFrame
-    seqs: list[str]
-
-    def __post_init__(self) -> None:
-        n = len(self.labels_df)
-        if len(self.features_df) != n or len(self.seqs) != n:
-            raise ValueError(
-                f"features/labels/seqs mis-aligned: "
-                f"len(features)={len(self.features_df)}, len(labels)={n}, len(seqs)={len(self.seqs)}"
-            )
-        if "generation" not in self.labels_df.columns:
-            raise ValueError("labels_df must have a 'generation' column")
-
-    def training_slice_before(self, gen: int) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-        """Rows where `generation < gen` — what the AL loop had at iter `gen`."""
-        mask = self.labels_df["generation"] < gen
-        return (
-            self.features_df.iloc[mask.values].reset_index(drop=True),
-            self.labels_df.iloc[mask.values].reset_index(drop=True),
-            [s for s, m in zip(self.seqs, mask.values) if m],
-        )
-
-    def proposal_pool_at(self, gen: int) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-        """Rows where `generation == gen` — the real batch of children at iter `gen`."""
-        mask = self.labels_df["generation"] == gen
-        return (
-            self.features_df.iloc[mask.values].reset_index(drop=True),
-            self.labels_df.iloc[mask.values].reset_index(drop=True),
-            [s for s, m in zip(self.seqs, mask.values) if m],
-        )
-
-
-def load_completed_run(runs_root: Path, model: str, n_iters: int) -> IterationData:
-    """
-    Read the final iter's cumulative artifacts. features/labels/seqs are all
-    written cumulatively by the AL loop, so we only need the last iter's files.
-    """
-    runs_root = Path(runs_root)
-    gen_dir = runs_root / model / "GENERATIONS" / f"iteration_{n_iters}"
-    features_path = gen_dir / f"features_gen{n_iters}.csv"
-    labels_path = gen_dir / f"labels_gen{n_iters}.csv"
-    seq_path = gen_dir / f"seq_gen{n_iters}.txt"
-    for pth in (features_path, labels_path, seq_path):
-        if not pth.exists():
-            raise FileNotFoundError(f"Missing completed-run artifact: {pth}")
-
-    features_df = pd.read_csv(features_path)
-    labels_df = pd.read_csv(labels_path)
-    with open(seq_path) as f:
-        seqs = [ln.strip() for ln in f if ln.strip()]
-    return IterationData(features_df=features_df, labels_df=labels_df, seqs=seqs)
-
-
-# ---------- target front ----------
-
-def compute_target_front(labels_df: pd.DataFrame, front: str, obj1: str, obj2: str) -> np.ndarray:
-    """
-    Pareto front from the union of all completed iters — the retrospective's
-    "target". Returned as an (N, 2) array in raw objective space with columns
-    (obj1, obj2), one row per Pareto member.
-    """
-    kind = ["max", "max"] if front == "upper" else ["min", "min"]
-    front_df, _idx = find_pareto_front(
-        labels_df[[obj1, obj2]].reset_index(drop=True),
-        kind=kind,
-        objectives=[obj1, obj2],
-    )
-    # find_pareto_front returns the front in [obj1_key_from_kwargs, obj2_...] column order.
-    return front_df[[obj1, obj2]].to_numpy()
-
-
-# ---------- HV in raw objective space ----------
-
-def _raw_pareto_ref_point(pmax: np.ndarray, pmin: np.ndarray, margin: float = 0.05) -> np.ndarray:
-    """Ref point strictly worse than every observed point (in MIN space)."""
-    return pmax + margin * np.abs(pmax - pmin) + 1e-9
-
-
-def compute_hv_raw(labels_df: pd.DataFrame, front: str, obj1: str, obj2: str,
-                    ref_point_min: np.ndarray) -> float:
-    """
-    HV of `labels_df`'s Pareto front in RAW objective space.
-
-    Both objectives get flipped to MIN space (pygmo convention). For an
-    'upper' front (max-max in raw), we negate both columns; for 'lower',
-    we leave them.
-    """
-    pts = labels_df[[obj1, obj2]].to_numpy(dtype=np.float64)
-    if front == "upper":
-        pts = -pts
-    # Filter dominated so pygmo doesn't do redundant work.
-    _, idx = find_pareto_front(
-        pd.DataFrame(pts, columns=[obj1, obj2]),
-        kind=["min", "min"], objectives=[obj1, obj2],
-    )
-    frontier = pts[idx]
-    # pygmo also requires every point strictly better than the ref.
-    frontier = frontier[np.all(frontier < ref_point_min, axis=1)]
-    if len(frontier) == 0:
-        return 0.0
-    return float(hypervolume(frontier).compute(ref_point_min))
-
-
-def _global_ref_point(all_labels_df: pd.DataFrame, front: str, obj1: str, obj2: str,
-                       margin: float = 0.05) -> np.ndarray:
-    """
-    A single ref point used across all iters + surrogates so HVs are directly
-    comparable. Computed from the WHOLE completed run (worst point + margin).
-    """
-    pts = all_labels_df[[obj1, obj2]].to_numpy(dtype=np.float64)
-    if front == "upper":
-        pts = -pts
-    return _raw_pareto_ref_point(pts.max(axis=0), pts.min(axis=0), margin=margin)
-
-
-# ---------- per-iter surrogate fitting via tempdirs ----------
-
-def _make_iter_cfg(
-    tempdir: Path,
-    cfg_base: ALConfig,
-    iteration: int,
-    train_model_type: str,
-) -> ALConfig:
-    """
-    Rebuild cfg with tempdir as base/scratch. Everything else preserved.
-    """
-    base = tempdir / "home"
-    scratch = tempdir / "scratch"
-    for d in (base, scratch):
-        d.mkdir(parents=True, exist_ok=True)
-    return replace(
-        cfg_base,
-        base_path=base, scratch_path=scratch,
-        iteration=iteration,
-        train_model_type=train_model_type,
-    )
-
-
-def _write_training_slice(cfg: ALConfig, feats: pd.DataFrame, labels: pd.DataFrame) -> None:
-    """Materialize features_csv + labels_csv in the tempdir path scheme."""
-    p = cfg.paths
-    p.iter_scratch_dir.mkdir(parents=True, exist_ok=True)
-    p.models_dir.mkdir(parents=True, exist_ok=True)
-    feats.to_csv(p.features_csv, index=False)
-    labels.to_csv(p.labels_csv, index=False)
-
-
-def _build_moe_surrogates(cfg_moe: ALConfig, policies: tuple[str, ...] = ("soft", "hard")) -> dict[str, Surrogate]:
-    """Train + load MoE bundle; wrap in one Surrogate per policy."""
-    train_from_config(cfg_moe)
-    bundle = load_moe_bundle(cfg_moe, temp=False)
-    return {f"moe_{pol}": MoESurrogate(bundle, policy=pol) for pol in policies}
-
-
-def _build_global_surrogate(cfg_global: ALConfig) -> Surrogate:
-    """Train + load global multitask GPR; wrap in GlobalGPRSurrogate."""
-    train_from_config(cfg_global)
-    model_bundle = load_models(cfg_global, temp=False, device="cpu")
-    normalization_stats = load_normalization_stats(cfg_global.paths.norm_stats)
-    return GlobalGPRSurrogate(
-        mode="gpr_multitask",
-        model_bundle=model_bundle,
-        normalization_stats=normalization_stats,
-        obj1=cfg_global.obj1, obj2=cfg_global.obj2,
-    )
+# (IterationData, load_completed_run, compute_target_front, compute_hv_raw,
+# _global_ref_point, _make_iter_cfg, _write_training_slice, _build_moe_surrogates,
+# _build_global_surrogate have moved to al_pipeline.diagnostic._common — imported
+# above so both this module and al_forward.py share them without duplication.)
 
 
 # ---------- EHVI scoring ----------
@@ -464,6 +295,7 @@ def run_retrospective(
     *,
     k_pick: int | None = None,
     pessimism_start_iter: int = 6,
+    start_iter: int = 1,
     log=None,
 ) -> dict[str, Any]:
     """
@@ -496,6 +328,12 @@ def run_retrospective(
     pessimism_start_iter
         Iter at which pessimism kicks in (matches the user's production
         practice: rounds 1..5 without pessimism, 6+ with). Default 6.
+    start_iter
+        First iter to evaluate. All prior iters (0..start_iter-1) are folded
+        into every policy's initial "picks" as real training data — so
+        divergence between MoE, MoE-hard, and global begins at start_iter.
+        Useful for MoE which needs enough PS examples to be meaningful;
+        default 1 (evaluate from the second real iter onward).
     """
     log_fn = log.info if log is not None else (lambda msg: None)
     runs_root = Path(runs_root)
@@ -517,9 +355,12 @@ def run_retrospective(
     )
     log_fn(f"[retrospective] target HV (union of all iters) = {target_hv:.4f}")
 
-    # Running set of picked children under each policy — starts as the seed pool
-    # (iter 0), which every policy sees identically.
-    seed = all_data.labels_df[all_data.labels_df["generation"] == 0].copy()
+    # Every policy's initial picks = cumulative real data through gen (start_iter - 1).
+    # Under the default (start_iter=1) this is just the seed pool (gen 0);
+    # for larger start_iter it includes the seed pool plus the real iter-N
+    # children through iter start_iter-1, folded in as if the campaign
+    # actually ran up to that point.
+    seed = all_data.labels_df[all_data.labels_df["generation"] < start_iter].copy()
     picks: dict[str, pd.DataFrame] = {
         "moe_soft": seed.copy(),
         "moe_hard": seed.copy(),
@@ -532,7 +373,7 @@ def run_retrospective(
 
     summary_rows: list[dict[str, Any]] = []
 
-    for M in range(1, n_iters + 1):
+    for M in range(start_iter, n_iters + 1):
         log_fn(f"[retrospective] iter {M}: training surrogates on generations < {M}")
         train_feats, train_labels, _train_seqs = all_data.training_slice_before(M)
         pool_feats, pool_labels, _pool_seqs = all_data.proposal_pool_at(M)
@@ -610,8 +451,15 @@ def run_retrospective(
                 f"moe_hard={hv_traj['moe_hard'][-1]:.4f} "
                 f"global={hv_traj['global'][-1]:.4f}")
 
+    # Output filenames get a `_start{N}` suffix so multiple sweeps land
+    # side-by-side under DIAGNOSTIC/. Applied uniformly (including start=1)
+    # so no set of output filenames is "the special default".
+    suffix = f"_start{start_iter}"
+    summary_path    = diagnostic_dir / f"retrospective_summary{suffix}.csv"
+    trajectory_path = diagnostic_dir / f"retrospective_trajectory{suffix}.json"
+
     summary_df = pd.DataFrame(summary_rows)
-    summary_df.to_csv(diagnostic_dir / "retrospective_summary.csv", index=False)
+    summary_df.to_csv(summary_path, index=False)
 
     trajectory = {
         "iters":                hv_traj_iters,
@@ -622,6 +470,7 @@ def run_retrospective(
         "hv_moe_hard":          hv_traj["moe_hard"],
         "hv_global":            hv_traj["global"],
         "k_pick":               k_pick,
+        "start_iter":           start_iter,
         "pessimism_start_iter": pessimism_start_iter,
         "ehvi_variant":         cfg_base.ehvi_variant,
         "epsilon_scale":        cfg_base.epsilon_scale,
@@ -636,11 +485,11 @@ def run_retrospective(
             for name in ("actual", "moe_soft", "moe_hard", "global")
         },
     }
-    with open(diagnostic_dir / "retrospective_trajectory.json", "w") as f:
+    with open(trajectory_path, "w") as f:
         json.dump(trajectory, f, indent=2)
 
-    log_fn(f"[retrospective] wrote {diagnostic_dir / 'retrospective_summary.csv'}")
-    log_fn(f"[retrospective] wrote {diagnostic_dir / 'retrospective_trajectory.json'}")
+    log_fn(f"[retrospective] wrote {summary_path}")
+    log_fn(f"[retrospective] wrote {trajectory_path}")
 
     return {
         "summary_df":  summary_df,

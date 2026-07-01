@@ -68,6 +68,12 @@ def _parse_diagnostic_args(argv: list[str]) -> tuple[argparse.Namespace, list[st
                           help="First iter at which pessimism kicks in inside the KB inner "
                                "loop (default: 6, matches production practice of "
                                "no-pessimism rounds 1-5, pessimism rounds 6+).")
+    parser.add_argument("--start_iter", type=int, default=1,
+                          help="First iter to evaluate. Iters 0..start_iter-1 are folded "
+                               "into every policy's initial picks as real data, so "
+                               "divergence begins at start_iter. Useful for sweeping the "
+                               "MoE-vs-global comparison from later starting points where "
+                               "the PS training set is large enough (default: 1).")
     args, remaining = parser.parse_known_args(argv)
     return args, remaining
 
@@ -122,11 +128,14 @@ def main(argv: list[str] | None = None) -> int:
         n_iters=diag_args.n_iters,
         k_pick=diag_args.k_pick,
         pessimism_start_iter=diag_args.pessimism_start_iter,
+        start_iter=diag_args.start_iter,
         log=log,
     )
 
-    # Plot
-    plot_path = cfg_base.paths.diagnostic_dir / "retrospective_hv.png"
+    # Suffix all outputs by start_iter so sweeps don't clobber each other.
+    suffix = f"_start{diag_args.start_iter}"
+    diag_dir = cfg_base.paths.diagnostic_dir
+    plot_path = diag_dir / f"retrospective_hv{suffix}.png"
     _plot_hv(out["trajectory"], plot_path)
     log.info(f"wrote plot: {plot_path}")
 
@@ -135,8 +144,9 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps({
         "target_hv":            out["target_hv"],
         "rounds_to_95pct_hv":   r2,
-        "summary_csv":          str(cfg_base.paths.diagnostic_dir / "retrospective_summary.csv"),
-        "trajectory_json":      str(cfg_base.paths.diagnostic_dir / "retrospective_trajectory.json"),
+        "start_iter":           diag_args.start_iter,
+        "summary_csv":          str(diag_dir / f"retrospective_summary{suffix}.csv"),
+        "trajectory_json":      str(diag_dir / f"retrospective_trajectory{suffix}.json"),
         "plot":                 str(plot_path),
     }, indent=2))
     return 0
