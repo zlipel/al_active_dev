@@ -46,3 +46,4 @@ for s in 1 3 5 7; do
             --front "$FRONT" \
             --start_iter "$s" \
             "${EXTRA_ARGS[@]}"
+done
