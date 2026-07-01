@@ -280,13 +280,8 @@ def test_alconfig_moe_defaults():
     assert cfg.moe_threshold == 0.5
 
 
-# ---------- augmentation guard ----------
-
-def test_augmentation_blocks_moe_with_clear_message(trained_moe):
-    """kriging_believer+MoE augmentation isn't wired; expect a clear NotImplementedError."""
-    from dataclasses import replace
-    from al_pipeline.ga.augmentation import augment
-    cfg = trained_moe
-    cfg_kb = replace(cfg, exploration_strategy="kriging_believer")
-    with pytest.raises(NotImplementedError, match="MoE"):
-        augment(cfg_kb, seq_id=1, pessimism=False)
+# ---------- augmentation ----------
+# The `NotImplementedError` guard from feat/moe-cli-al is removed as of
+# feat/moe-kriging-believer — MoE + kriging_believer / constant_liar_* is now
+# wired via mixture covariance + hard-gate expert reconditioning. Coverage
+# for that wiring lives in tests/al_pipeline/test_moe_kriging_believer.py.

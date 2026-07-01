@@ -42,6 +42,7 @@ class _MultitaskPoolPosterior(PoolPosterior):
             self._means = posterior.mean.detach().cpu().numpy()
             self._stds = posterior.stddev.detach().cpu().numpy()
         self._posterior = posterior
+        self._cov_cache: np.ndarray | None = None
 
     @property
     def means(self) -> np.ndarray:
@@ -50,6 +51,21 @@ class _MultitaskPoolPosterior(PoolPosterior):
     @property
     def stds(self) -> np.ndarray:
         return self._stds
+
+    @property
+    def covariance(self) -> np.ndarray:
+        # Extract per-candidate (T, T) blocks from the full (B*T, B*T) joint
+        # covariance. Mirrors the reshape used by augmentation.get_cand_stats
+        # so any consumer that switches from the direct-GP path to the
+        # surrogate gets identical numbers.
+        if self._cov_cache is None:
+            with torch.no_grad():
+                B, T = self._means.shape
+                cov = self._posterior.covariance_matrix   # (B*T, B*T)
+                cov = cov.reshape(B, T, B, T)
+                per_cand = cov[torch.arange(B), :, torch.arange(B), :]   # (B, T, T)
+                self._cov_cache = per_cand.detach().cpu().numpy()
+        return self._cov_cache
 
     def sample(self, n_samples: int) -> torch.Tensor:
         with torch.no_grad():
@@ -79,6 +95,18 @@ class _SingletaskPoolPosterior(PoolPosterior):
     @property
     def stds(self) -> np.ndarray:
         return self._stds
+
+    @property
+    def covariance(self) -> np.ndarray:
+        # No cross-objective structure available — return a diagonal fallback
+        # so the pessimism math still runs (it degrades to the marginal-var
+        # case, which is what the pre-refactor singletask path effectively
+        # did in augmentation.py).
+        B, T = self._means.shape
+        cov = np.zeros((B, T, T), dtype=self._stds.dtype)
+        for t in range(T):
+            cov[:, t, t] = self._stds[:, t] ** 2
+        return cov
 
     def sample(self, n_samples: int) -> torch.Tensor:
         # Independent per-objective sampling would not capture cross-objective

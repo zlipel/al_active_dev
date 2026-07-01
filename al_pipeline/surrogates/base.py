@@ -50,6 +50,20 @@ class PoolPosterior(ABC):
     def stds(self) -> np.ndarray:
         """Posterior std per candidate per objective. Shape (B, 2)."""
 
+    @property
+    @abstractmethod
+    def covariance(self) -> np.ndarray:
+        """
+        Per-candidate joint (2, 2) covariance matrix, shape (B, 2, 2).
+
+        Consumed by the pessimism penalty in the augmentation path, which
+        compares candidate uncertainty ellipses against previously selected
+        children. Subclasses that have no cross-objective structure (e.g. the
+        single-task GPR wrapper) return a diagonal fallback so consumers can
+        still call the same code path — the pessimism math degrades to the
+        marginal-variance case.
+        """
+
     @abstractmethod
     def sample(self, n_samples: int) -> torch.Tensor:
         """

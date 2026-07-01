@@ -3,8 +3,13 @@ from __future__ import annotations
 from al_pipeline.core.config import ALConfig
 from al_pipeline.training.ml_models import MultitaskGPRegressionModel, GPRegressionModel
 from al_pipeline.training.kfold_training import save_chkpt
-from al_pipeline.data_prep.data_loading import load_dataset, convert_and_normalize_features
-from .ga_utils import load_normalization_stats, load_models
+from al_pipeline.data_prep.data_loading import (
+    apply_feature_normalizer, convert_features, convert_and_normalize_features, load_dataset,
+)
+from al_pipeline.surrogates import (
+    build_rf_features, classifier_p_ps, make_surrogate, save_rf_bundle,
+)
+from .ga_utils import load_moe_bundle, load_normalization_stats, load_models
 import al_pipeline.featurization.sequence_featurizer as sf
 import numpy as np
 import torch
@@ -101,47 +106,27 @@ def retrain_model(cfg: ALConfig, model_bundle, train_X, train_y):
         raise ValueError(f"Unknown model type: {cfg.train_model_type} not implemented yet.")
     return model_new, likelihood_new
 
-def predict_for_augmentation(model_bundle, Xn, cfg, return_std: bool = False):
-    if cfg.train_model_type == "gpr_multitask":
-        model = model_bundle["model"]
-        Xn = torch.tensor(Xn.copy(), dtype=torch.float32)
-        if Xn.ndim == 1:
-            Xn = Xn.view(1,-1)
-        mu, cov = get_cand_stats(model, Xn)
-        # mu: (N,2), cov: (N,2,2)
+def predict_for_augmentation(surrogate, features_raw_df: pd.DataFrame, return_std: bool = False):
+    """
+    Uniform prediction path for kriging-believer + constant-liar augmentation.
 
-    elif cfg.train_model_type == "gpr_singletask":
-        # No cross-objective covariance for single-task GPs — diagonal cov.
-        # Goes direct to the per-objective models rather than through the
-        # surrogate ABC: the surrogate's `predict_pool` takes raw features
-        # (so MoE/global can share the contract), but here we already have
-        # normalized features handy and don't need MoE in the augmentation
-        # path. Direct calls are simpler than re-inverting the normalization.
-        Xn = torch.tensor(Xn.copy(), dtype=torch.float32)
-        if Xn.ndim == 1:
-            Xn = Xn.view(1,-1)
-        models = model_bundle["models"]
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            post1 = models[cfg.obj1](Xn)
-            post2 = models[cfg.obj2](Xn)
-            mu = np.column_stack([
-                post1.mean.detach().cpu().numpy().reshape(-1),
-                post2.mean.detach().cpu().numpy().reshape(-1),
-            ])
-            std = np.column_stack([
-                post1.stddev.detach().cpu().numpy().reshape(-1),
-                post2.stddev.detach().cpu().numpy().reshape(-1),
-            ])
-        cov = np.zeros((mu.shape[0], 2, 2), dtype=np.float32)
-        cov[:,0,0] = std[:,0]**2
-        cov[:,1,1] = std[:,1]**2
-        
-    else:
-        raise ValueError(f"Unknown model type: {cfg.train_model_type} not implemented yet.")
-    
+    Takes any `Surrogate` (global multitask / singletask GPR or MoE) and raw
+    features as a DataFrame. Returns per-candidate means, per-candidate (2, 2)
+    covariance, and optionally per-candidate marginal stds — all in the
+    normalized objective z-space that the AL loop's Pareto / EHVI machinery
+    already operates in.
+
+    The pessimism formula (see `overlap_batch`) is agnostic to surrogate type;
+    all it needs is `mu` and the joint `cov`. Under MoE the cov is the
+    mixture cov from `MoEPoolPosterior.covariance`; under global multitask
+    it's the per-candidate block from the GP's joint posterior; under
+    single-task it degrades to a diagonal fallback.
+    """
+    pool = surrogate.predict_pool(features_raw_df)
+    mu = pool.means
+    cov = pool.covariance   # (N, 2, 2)
     if return_std:
-        std = np.sqrt(np.diagonal(cov, axis1=1, axis2=2))  # (N,2)
-        return mu, cov, std
+        return mu, cov, pool.stds
     return mu, cov
 
 
@@ -227,6 +212,135 @@ def overlap_batch(mu, S, mu_cands, S_cands, threshold=0.15):
     return total_overlap
 
 
+def _load_surrogate_for_augment(cfg: ALConfig, temp_in: bool):
+    """Load bundle + build Surrogate. Returns (surrogate, model_bundle_or_moe_bundle)."""
+    if cfg.train_model_type == "moe":
+        moe_bundle = load_moe_bundle(cfg, temp=temp_in)
+        surrogate = make_surrogate(
+            cfg, moe_bundle=moe_bundle,
+            moe_policy=cfg.moe_policy, moe_threshold=cfg.moe_threshold,
+        )
+        return surrogate, moe_bundle
+    else:
+        normalization_stats = load_normalization_stats(cfg.paths.norm_stats)
+        model_bundle = load_models(cfg, temp=temp_in, device="cpu")
+        surrogate = make_surrogate(
+            cfg, model_bundle=model_bundle, normalization_stats=normalization_stats,
+        )
+        return surrogate, model_bundle
+
+
+def _reindex_expert(assigned, new_child_raw_df: pd.DataFrame,
+                     new_child_z: np.ndarray, lr: float):
+    """
+    Re-condition ONE MoE expert on an augmented train set (kriging-believer
+    hard-gate assignment). Freezes hyperparameters modulo one Adam step —
+    same "1 epoch" recipe the global multitask path uses.
+
+    Mutates `assigned.model` and `assigned.likelihood` in place. Returns the
+    expanded (train_x, train_y) tensors so the caller can persist them into
+    the temp checkpoint.
+    """
+    # Current expert state (before augmentation)
+    current_train_x = assigned.model.train_inputs[0]
+    current_train_y = assigned.model.train_targets
+
+    # Normalize the new child through THIS expert's own feature normalizer
+    feat_conv = convert_features(new_child_raw_df[assigned.feature_columns])
+    feat_norm = apply_feature_normalizer(feat_conv, assigned.feature_normalizer_stats)
+    new_x = torch.tensor(feat_norm.to_numpy(), dtype=torch.float32)
+    new_y = torch.tensor(np.asarray(new_child_z).reshape(-1, 2), dtype=torch.float32)
+
+    train_x_new = torch.cat([current_train_x, new_x], dim=0)
+    train_y_new = torch.cat([current_train_y, new_y], dim=0)
+
+    # Warm-start ExactGP re-instantiation with the expanded training set —
+    # same shape as _retrain_model_gpr_multitask, just on the assigned expert.
+    likelihood_new = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=2)
+    model_new = MultitaskGPRegressionModel(train_x_new, train_y_new, likelihood_new, num_tasks=2)
+    likelihood_new.load_state_dict(assigned.likelihood.state_dict())
+    model_new.load_state_dict(assigned.model.state_dict())
+
+    model_new.train(); likelihood_new.train()
+    optimizer = torch.optim.Adam(model_new.parameters(), lr=lr / 100.0)
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood_new, model_new)
+    optimizer.zero_grad()
+    output = model_new(train_x_new)
+    loss = -mll(output, train_y_new)
+    loss.backward()
+    optimizer.step()
+    model_new.eval(); likelihood_new.eval()
+
+    assigned.model = model_new
+    assigned.likelihood = likelihood_new
+    return train_x_new, train_y_new
+
+
+def _save_moe_temp(cfg: ALConfig, moe_bundle, assigned_regime: str,
+                    assigned_train_x, assigned_train_y):
+    """
+    Persist MoE temp checkpoints for the next seq_id.
+
+    The assigned expert stores its expanded train tensors directly (temp
+    checkpoints don't need to be re-derivable from CSVs — the batch throws
+    them away once real labels come in). The other expert re-uses whatever
+    train tensors it's currently holding (either the base tensors from
+    original_indices, or the expanded tensors from an earlier seq_id).
+    The RF bundle is saved verbatim (frozen during batch generation).
+    """
+    p = cfg.paths
+    common = {
+        "model_name":         cfg.model,
+        "iteration":          cfg.iteration,
+        "label_scaler_scope": "all",
+    }
+
+    # PS expert
+    ps_train_x = (assigned_train_x if assigned_regime == "ps"
+                  else moe_bundle.ps_expert.model.train_inputs[0])
+    ps_train_y = (assigned_train_y if assigned_regime == "ps"
+                  else moe_bundle.ps_expert.model.train_targets)
+    moe_bundle.ps_expert.save_checkpoint(
+        str(p.moe_ps_chkpt(temp=True)),
+        regime="ps",
+        original_indices=[],   # ignored when direct tensors are present
+        train_x_direct=ps_train_x,
+        train_y_direct=ps_train_y,
+        **common,
+    )
+
+    # nonPS expert
+    nps_train_x = (assigned_train_x if assigned_regime == "nonps"
+                   else moe_bundle.nonps_expert.model.train_inputs[0])
+    nps_train_y = (assigned_train_y if assigned_regime == "nonps"
+                   else moe_bundle.nonps_expert.model.train_targets)
+    moe_bundle.nonps_expert.save_checkpoint(
+        str(p.moe_nonps_chkpt(temp=True)),
+        regime="nonps",
+        original_indices=[],
+        train_x_direct=nps_train_x,
+        train_y_direct=nps_train_y,
+        **common,
+    )
+
+    # RF: verbatim copy of whatever bundle we loaded (base or temp).
+    rf_bundle = moe_bundle.rf_bundle
+    save_rf_bundle(
+        str(p.moe_rf_bundle(temp=True)),
+        moe_bundle.rf,
+        rf_raw_feature_columns=rf_bundle["rf_raw_feature_columns"],
+        rf_converted_feature_columns=rf_bundle["rf_converted_feature_columns"],
+        ps_definition=rf_bundle.get("ps_definition", ""),
+        random_state=rf_bundle.get("random_state", 0),
+        threshold=rf_bundle.get("threshold", 0.5),
+        model_name=cfg.model,
+        iteration=cfg.iteration,
+        transform=rf_bundle.get("transform", cfg.transform),
+        label_scaler_scope="all",
+        best_params=rf_bundle.get("best_params"),
+    )
+
+
 def augment(cfg: ALConfig, *, seq_id: int, pessimism: bool, log=None) -> None:
     """Augment features with previous selected children up to seq_id-1.
     Parameters:
@@ -242,29 +356,14 @@ def augment(cfg: ALConfig, *, seq_id: int, pessimism: bool, log=None) -> None:
     -------
     None
     """
-    # MoE augmentation isn't wired here. The kriging-believer path inside
-    # `predict_for_augmentation` calls `get_cand_stats` which returns the
-    # full per-task covariance matrix from a multitask GP — the MoE
-    # PoolPosterior exposes marginal stds but not cross-objective covariance
-    # over the mixture (would need a separate branch to derive it from the
-    # gate-weighted joint moment match). Lands in a follow-up branch when the
-    # MoE diagnostic loop actually needs augmentation.
-    if cfg.train_model_type == "moe":
-        raise NotImplementedError(
-            "kriging_believer + MoE augmentation is not yet wired. Use "
-            "exploration_strategy in {'standard', 'similarity_penalty'} with "
-            "train_model_type='moe', or fall back to gpr_multitask for the "
-            "kriging-believer path."
-        )
-
     p = cfg.paths
     featurizer = sf.SequenceFeaturizer(cfg.model.lower(), cfg.db_path)
     normalization_stats = load_normalization_stats(p.norm_stats)
     objectives = [cfg.obj1, cfg.obj2]
 
-    feats_total  = pd.read_csv(p.features_norm_csv)
+    feats_total = pd.read_csv(p.features_norm_csv)
 
-    if cfg.train_model_type == "gpr_multitask":
+    if cfg.train_model_type in ("gpr_multitask", "moe"):
         labels_total = pd.read_csv(p.labels_norm_csv)
     elif cfg.train_model_type == "gpr_singletask":
         labels_list = []
@@ -273,151 +372,140 @@ def augment(cfg: ALConfig, *, seq_id: int, pessimism: bool, log=None) -> None:
             y = pd.read_csv(y_path)
             labels_list.append(y)
         labels_total = pd.concat(labels_list, axis=1)
+    else:
+        raise ValueError(f"Unknown train_model_type: {cfg.train_model_type}")
 
-
-    temp_in  = seq_id > 1
+    temp_in = seq_id > 1
     temp_out = True
 
-    model_bundle = load_models(cfg, temp = temp_in, device='cpu')
+    surrogate, bundle = _load_surrogate_for_augment(cfg, temp_in=temp_in)
 
     if seq_id <= 1:
-        seq_file = cfg.paths.seq_gen_txt
+        seq_file = p.seq_gen_txt
         labels_no_pess = labels_total.copy()
         labels_no_pess.to_csv(p.labels_no_pessimism, index=False)
-    else: 
+    else:
         seq_file = p.seq_gen_temp_txt
         labels_no_pess = pd.read_csv(p.labels_no_pessimism)
-    
-    column_names = feats_total.columns.tolist()
 
+    column_names = feats_total.columns.tolist()
     child_file = p.ga_children_dir / f"seq_child_{seq_id}.txt"
 
-    seqs = []
-    with open(child_file, 'r') as f:
-        seq = f.readline().strip()
-        seqs.append(seq)
+    with open(child_file, "r") as f:
+        seqs = [f.readline().strip()]
 
-    # Featurize and normalize
-    features = []
-    # we process one at a time, so the loop is a bit useless, but we can modify later
-    for seq in seqs:
-        #print(seq, flush=True)
-        raw_feats = featurizer.featurize(seq)
-        norm_feats = convert_and_normalize_features(np.asarray(raw_feats).reshape(1, -1), train=False, stats=normalization_stats)
-        features.append(norm_feats.reshape(-1))
+    # Raw + normalized features for the new child. Raw feeds the surrogate
+    # (uniform contract); normalized feeds the on-disk features_norm_csv
+    # append (used by any downstream tool that reads global-normalized data).
+    raw_feats_arr = np.asarray(featurizer.featurize(seqs[0])).reshape(1, -1)
+    raw_feats_df = pd.DataFrame(raw_feats_arr, columns=column_names)
+    norm_feats_arr = convert_and_normalize_features(raw_feats_arr, train=False, stats=normalization_stats)
+    new_frame = pd.DataFrame(norm_feats_arr, columns=column_names)
 
-    features = np.array(features)
-
-    new_frame = pd.DataFrame(features, columns=column_names)
-
-    # concatenate with the total features
     feats_new = pd.concat([feats_total, new_frame], ignore_index=True)
-    # Save the updated features to the generation folder as temp 
     feats_new.to_csv(p.features_norm_csv, index=False)
     if log:
         log.info(f"Features augmented and saved to {p.features_norm_csv}")
-    
-    if 'kriging_believer' in cfg.exploration_strategy:
-        # Use the GPR model to predict the objectives
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            #preds = likelihood(model(torch.tensor(features).float())).mean.detach().numpy()
 
-            preds, S, sig = predict_for_augmentation(model_bundle, features, cfg, return_std=True)
-            
-            if pessimism:
-                # add pessimism to the predictions
-                prev_labels = labels_total.iloc[-seq_id:].values
-                prev_feats = feats_total.iloc[-seq_id:].values
+    # Pessimism/no-pessimism split. Same for all surrogate types now that
+    # predict_for_augmentation is uniform.
+    if "kriging_believer" in cfg.exploration_strategy:
+        preds, S, sig = predict_for_augmentation(surrogate, raw_feats_df, return_std=True)
+        if pessimism and seq_id > 1:
+            prev_feats_raw_df = feats_new.iloc[-seq_id:-1]   # earlier children in this batch
+            mu_cands, S_cands = predict_for_augmentation(surrogate, prev_feats_raw_df, return_std=False)
+            sign = -1.0 if cfg.front == "upper" else +1.0
+            penalty = sign * overlap_batch(preds.copy(), S, mu_cands, S_cands)
+            mu = preds.copy()
+            preds = preds + penalty * sig
+        else:
+            mu = preds.copy()
 
-                if prev_labels.ndim == 1:
-                    prev_labels = prev_labels.copy().reshape(1, -1)
-
-                mu = preds.copy()
-
-                if seq_id > 1:
-                    mu_cands, S_cands = predict_for_augmentation(model_bundle, prev_feats, cfg, return_std=False)
-
-                    sign = -1.0 if cfg.front == 'upper' else +1.0
-
-                    penalty = sign*overlap_batch(mu.copy(), S, mu_cands, S_cands) 
-
-                    preds  = mu + penalty * sig if seq_id > 1  else preds 
-                else:
-                    preds = mu
-            else:
-                mu = preds.copy()
-
-    elif cfg.exploration_strategy in ['constant_liar_min', 'constant_liar_mean', 'constant_liar_max']:
-        # first, get the generation we are at
-
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            #preds = likelihood(model(torch.tensor(features).float())).mean.detach().numpy()
-
-            mu, S, sig = predict_for_augmentation(model_bundle, features, cfg, return_std=True)
-        num_rows = cfg.seed_size + cfg.iteration * cfg.ngen * 2  # 120 is the number of rows in the first generation, 48 is the number of rows added in each subsequent generation
-        
-        # choose either min, mean or max of the labels before our sequential batch generation as a constant lie
-
-        if cfg.exploration_strategy == 'constant_liar_min':
-            preds = labels_total.iloc[:num_rows].min().values
-        elif cfg.exploration_strategy == 'constant_liar_mean':
-            preds = labels_total.iloc[:num_rows].mean().values
-        elif cfg.exploration_strategy == 'constant_liar_max':
-            preds = labels_total.iloc[:num_rows].max().values
-        preds = np.tile(preds, (features.shape[0], 1))
+    elif cfg.exploration_strategy in ("constant_liar_min", "constant_liar_mean", "constant_liar_max"):
+        mu, S, sig = predict_for_augmentation(surrogate, raw_feats_df, return_std=True)
+        num_rows = cfg.seed_size + cfg.iteration * cfg.ngen * 2
+        base = labels_total.iloc[:num_rows]
+        if cfg.exploration_strategy == "constant_liar_min":
+            const = base.min().values
+        elif cfg.exploration_strategy == "constant_liar_mean":
+            const = base.mean().values
+        else:
+            const = base.max().values
+        preds = np.tile(const, (raw_feats_arr.shape[0], 1))
+    else:
+        raise ValueError(
+            f"augment() only supports kriging_believer / constant_liar_*, got {cfg.exploration_strategy!r}"
+        )
 
     new_labels         = pd.DataFrame(preds, columns=labels_total.columns)
     new_labels_no_pess = pd.DataFrame(mu, columns=labels_total.columns)
-    
-    # Concatenate with the total labels
     labels_total         = pd.concat([labels_total, new_labels], ignore_index=True)
     labels_no_pess_total = pd.concat([labels_no_pess, new_labels_no_pess], ignore_index=True)
-    
+
     if log:
         log.info(f"Labels augmented and saved to {p.labels_norm_csv}")
-
-    # Save the labels without pessimism
     labels_no_pess_total.to_csv(p.labels_no_pessimism, index=False)
-    
-    # Save the updated labels to the generation folder as temp
+
     if cfg.train_model_type == "gpr_singletask":
-        for idx, label in enumerate(objectives):
+        for label in objectives:
             y_path = p.labels_norm_csv.with_stem(p.labels_csv.stem + f"_{label}_NORM_{p.tag}")
             labels_total[[label]].to_csv(y_path, index=False)
     else:
         labels_total.to_csv(p.labels_norm_csv, index=False)
 
-    # now that we have the new files, we can retrain our GPR model on the augmented dataset
+    # Retrain / re-condition
+    if cfg.train_model_type == "moe":
+        # Hard-gate assignment on the new child (design memo:
+        # project_moe_kriging_believer). RF is frozen during the batch, so
+        # p_ps here uses whatever RF was loaded (base for seq_id=1, temp
+        # otherwise — both are copies of the same base RF).
+        X_rf, _ = build_rf_features(
+            raw_feats_df, bundle.rf_raw_feature_columns, bundle.rf_converted_feature_columns,
+        )
+        p_ps_child = float(classifier_p_ps(bundle.rf, X_rf)[0])
+        is_ps = p_ps_child >= cfg.moe_threshold
+        assigned = bundle.ps_expert if is_ps else bundle.nonps_expert
+        regime = "ps" if is_ps else "nonps"
 
-    train_X      = torch.tensor(feats_new.values).float()
-    labels_total = labels_total[objectives]
-    train_y      = torch.tensor(labels_total.values).float()
-    
-    model_new, likelihood_new = retrain_model(cfg, model_bundle, train_X, train_y)
-
-    if cfg.train_model_type == "gpr_multitask":
-        gpr_file = p.gpr_multitask_chkpt(temp = temp_out)
-        save_chkpt(gpr_file, model_new)
-    elif cfg.train_model_type == "gpr_singletask":
-        for idx, label in enumerate(objectives):
-            gpr_file = p.gpr_singletask_chkpt([label], temp = temp_out)[0]
-            save_chkpt(gpr_file, model_new[idx])
+        # The child's z-space labels for the expert: use the *no-pessimism*
+        # mean row. Pessimism is an acquisition-side penalty, not a training
+        # label — same convention as the global kriging-believer path,
+        # which trains on `mu` (via labels_total.iloc[-1]) not `preds`.
+        train_x_new, train_y_new = _reindex_expert(
+            assigned, raw_feats_df, mu[-1], lr=cfg.learning_rate,
+        )
+        _save_moe_temp(cfg, bundle, regime, train_x_new, train_y_new)
+        if log:
+            log.info(
+                f"MoE seq_id={seq_id}: hard-gated to {regime!r} "
+                f"(p_ps={p_ps_child:.3f} >= {cfg.moe_threshold}); "
+                f"temp checkpoints saved."
+            )
     else:
-        raise ValueError(f"Unknown model type: {cfg.train_model_type} not implemented yet.")
+        # Global GPR: preserve the pre-refactor pattern exactly.
+        train_X = torch.tensor(feats_new.values).float()
+        train_y = torch.tensor(labels_total[objectives].values).float()
+        model_new, _lik_new = retrain_model(cfg, bundle, train_X, train_y)
 
-    if log:
-        log.info(f"Models retrained and saved to {gpr_file}")
+        if cfg.train_model_type == "gpr_multitask":
+            gpr_file = p.gpr_multitask_chkpt(temp=temp_out)
+            save_chkpt(gpr_file, model_new)
+        elif cfg.train_model_type == "gpr_singletask":
+            for idx, label in enumerate(objectives):
+                gpr_file = p.gpr_singletask_chkpt([label], temp=temp_out)[0]
+                save_chkpt(gpr_file, model_new[idx])
+        if log:
+            log.info("Models retrained and saved.")
 
-    # Save the sequence to the generation folder as temp
-    with open(seq_file, 'r') as f:
-        existing_seqs = f.readlines()
-    existing_seqs = [line.strip() for line in existing_seqs]
-    
-    existing_seqs.append(seqs[0])  # Append the new sequence
-
-    with open(p.seq_gen_temp_txt, 'w') as f:
+    # Sequence bookkeeping — append the child to `seq_gen_temp_txt` so the
+    # next seq_id's get_parents call sees the augmented set. Universal for
+    # both global and MoE paths.
+    with open(seq_file, "r") as f:
+        existing_seqs = [ln.strip() for ln in f.readlines()]
+    existing_seqs.append(seqs[0])
+    with open(p.seq_gen_temp_txt, "w") as f:
         for seq in existing_seqs:
-            f.write(seq + '\n')
+            f.write(seq + "\n")
     
     if log:
         log.info(f"Sequence augmented and saved to {p.seq_gen_temp_txt}")
