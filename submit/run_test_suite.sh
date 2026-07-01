@@ -8,7 +8,7 @@
 #SBATCH --mem-per-cpu=4G
 #SBATCH --time=00:30:00
 #SBATCH --output=test_suite.out
-#SBATCH --error=test_suit.err
+#SBATCH --error=test_suite.err
 
 
 if [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/config/cluster.env" ]]; then
