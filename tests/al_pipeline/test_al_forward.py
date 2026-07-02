@@ -231,3 +231,31 @@ def test_forward_start_iter_shifts_range(tmp_path):
     # Three rows per iter (all + upper + lower).
     assert len(out["classifier_df"]) == 3
     assert out["start_iter"] == 2
+
+
+# ---------- CLI plot helpers ----------
+
+def test_forward_plot_metric_by_iter_writes_png(forward_out, tmp_path):
+    """`_plot_metric_by_iter` writes a non-empty PNG for every (metric, split) combo."""
+    from al_pipeline.cli.moe_forward_diagnostic import _METRIC_SPECS, _plot_metric_by_iter
+
+    out, cfg, _n_iters, _batch = forward_out
+    for metric_col in _METRIC_SPECS:
+        for split in ("all", "ps", "nonps"):
+            path = tmp_path / f"forward_{metric_col}_{split}.png"
+            _plot_metric_by_iter(
+                out["metrics_df"], metric_col, split, cfg.obj1, cfg.obj2, path,
+            )
+            assert path.exists()
+            assert path.stat().st_size > 0
+
+
+def test_forward_plot_classifier_metrics_writes_png(forward_out, tmp_path):
+    """`_plot_classifier_metrics` writes a non-empty PNG from the classifier_df."""
+    from al_pipeline.cli.moe_forward_diagnostic import _plot_classifier_metrics
+
+    out, _cfg, _n_iters, _batch = forward_out
+    path = tmp_path / "forward_classifier.png"
+    _plot_classifier_metrics(out["classifier_df"], path)
+    assert path.exists()
+    assert path.stat().st_size > 0

@@ -22,13 +22,14 @@ Example:
         --scratch_path /scratch/gpfs/zl4808/PROJECTS/MODEL_COMPARISON \\
         --n_iters 10 --start_iter 1
 
-Produces four CSVs and one plot under `<base_path>/<MODEL>/DIAGNOSTIC/`:
+Produces four CSVs and 13 plots under `<base_path>/<MODEL>/DIAGNOSTIC/`:
 
   - forward_predictions_start{N}.csv
   - forward_metrics_start{N}.csv
   - forward_classifier_start{N}.csv
   - forward_ranking_start{N}.csv
-  - forward_rmse_start{N}.png
+  - forward_{rmse,r2,nll_z,spearman}_{all,ps,nonps}_start{N}.png  (12)
+  - forward_classifier_start{N}.png  (RF-gate quality; 2x2 grid)
 """
 from __future__ import annotations
 
@@ -74,18 +75,51 @@ _PREDICTOR_STYLE = {
 }
 
 
-def _plot_rmse_by_iter(metrics_df: pd.DataFrame, obj1: str, obj2: str,
-                         out_path: Path) -> None:
-    """Two-panel plot: z-space RMSE vs. iter, one line per predictor, per objective.
+# y-axis label + optional reference-line (value, color, linestyle) per metric.
+# Reference lines mark the intuitive "no-skill" or "no-bias" level for each
+# metric so eyeballing a single curve against it is meaningful.
+_METRIC_SPECS: dict[str, dict] = {
+    "rmse":     {"ylabel": "RMSE_z",     "hline": None},
+    "r2":       {"ylabel": "R²",    "hline": (0.0, "grey", ":")},
+    "nll_z":    {"ylabel": "NLL_z",      "hline": None},
+    "spearman": {"ylabel": "Spearman ρ", "hline": (0.0, "grey", ":")},
+}
 
-    Aggregated across both fronts (split='all', front_type='all'). Users who
-    want per-front curves can pivot the metrics_long CSV — the `front_type`
-    column carries {all, upper, lower}."""
+_SPLIT_TITLES = {
+    "all":   "all rows",
+    "ps":    "PS rows only (density > 0)",
+    "nonps": "nonPS rows only (density <= 0)",
+}
+
+
+def _plot_metric_by_iter(metrics_df: pd.DataFrame, metric_col: str, split: str,
+                          obj1: str, obj2: str, out_path: Path) -> None:
+    """Two-panel plot: `metric_col` vs. iter, one curve per predictor, per objective.
+
+    Filters to `space='z'`, `front_type='all'`, and the chosen `split`. Users
+    who want per-front breakdowns can pivot the metrics_long CSV — the
+    `front_type` column carries {all, upper, lower}.
+
+    Parameters
+    ----------
+    metrics_df : DataFrame
+        Long-format metrics table from `run_forward` (one row per
+        predictor × property × space × split × front_type × iter).
+    metric_col : str
+        Column to plot on the y-axis. Must be a key of `_METRIC_SPECS`.
+    split : str
+        Which row subset to plot: `'all' | 'ps' | 'nonps'`.
+    obj1, obj2 : str
+        Objective column names — one subplot each.
+    out_path : Path
+        PNG destination.
+    """
+    spec = _METRIC_SPECS[metric_col]
     fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.5), dpi=200, sharex=True)
     for ax, prop in zip(axes, (obj1, obj2)):
         cell = metrics_df[
             (metrics_df["space"] == "z")
-            & (metrics_df["split"] == "all")
+            & (metrics_df["split"] == split)
             & (metrics_df["front_type"] == "all")
             & (metrics_df["property"] == prop)
         ]
@@ -93,14 +127,52 @@ def _plot_rmse_by_iter(metrics_df: pd.DataFrame, obj1: str, obj2: str,
             rows = cell[cell["predictor"] == predictor].sort_values("heldout_iter")
             if rows.empty:
                 continue
-            ax.plot(rows["heldout_iter"], rows["rmse"],
+            ax.plot(rows["heldout_iter"], rows[metric_col],
                     **_PREDICTOR_STYLE[predictor])
-        ax.set_title(f"{prop} (z-space, split=all, both fronts)")
+        if spec["hline"] is not None:
+            val, color, ls = spec["hline"]
+            ax.axhline(val, color=color, linestyle=ls, linewidth=0.7)
+        ax.set_title(f"{prop} (z-space, {_SPLIT_TITLES[split]})")
         ax.set_xlabel("held-out iter")
-        ax.set_ylabel("RMSE_z")
+        ax.set_ylabel(spec["ylabel"])
         ax.grid(True, alpha=0.3)
-    axes[-1].legend(loc="upper right", fontsize=7, frameon=False)
-    fig.suptitle("Forward diagnostic — aggregated across upper + lower", fontsize=10)
+    axes[-1].legend(loc="best", fontsize=7, frameon=False)
+    fig.suptitle(
+        f"Forward diagnostic — {metric_col} — {_SPLIT_TITLES[split]}, both fronts",
+        fontsize=10,
+    )
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def _plot_classifier_metrics(classifier_df: pd.DataFrame, out_path: Path) -> None:
+    """2x2 grid of RF-gate quality metrics vs. heldout_iter (front_type='all').
+
+    Panels: ROC-AUC, F1, PS recall, nonPS FPR. A single black curve per panel
+    (no predictor split — the gate is one classifier). Reference lines mark
+    the "no-skill" baseline (ROC-AUC = 0.5) and the "no false positive" floor
+    (nonPS FPR = 0).
+    """
+    cell = classifier_df[classifier_df["front_type"] == "all"].sort_values("heldout_iter")
+
+    fig, axes = plt.subplots(2, 2, figsize=(8.0, 6.0), dpi=200, sharex=True)
+    panels = [
+        (axes[0, 0], "roc_auc",     "ROC-AUC",  (0.5, "grey", ":")),
+        (axes[0, 1], "f1",          "F1 (PS)",  None),
+        (axes[1, 0], "ps_recall",   "PS recall", None),
+        (axes[1, 1], "nonps_fpr",   "nonPS FPR", (0.0, "grey", ":")),
+    ]
+    for ax, col, ylabel, hline in panels:
+        ax.plot(cell["heldout_iter"], cell[col], color="black", linewidth=1.5)
+        if hline is not None:
+            val, color, ls = hline
+            ax.axhline(val, color=color, linestyle=ls, linewidth=0.7)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+    for ax in axes[1, :]:
+        ax.set_xlabel("held-out iter")
+    fig.suptitle("Forward diagnostic — RF gate quality (both fronts)", fontsize=10)
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
@@ -142,12 +214,24 @@ def main(argv: list[str] | None = None) -> int:
 
     suffix = f"_start{diag_args.start_iter}"
     diag_dir = cfg_base.paths.diagnostic_dir
-    plot_path = diag_dir / f"forward_rmse{suffix}.png"
+    plot_paths: dict[str, dict[str, str]] = {m: {} for m in _METRIC_SPECS}
+    classifier_plot_path: str | None = None
+
     if len(out["metrics_df"]) > 0:
-        _plot_rmse_by_iter(
-            out["metrics_df"], cfg_base.obj1, cfg_base.obj2, plot_path,
-        )
-        log.info(f"wrote plot: {plot_path}")
+        for metric_col in _METRIC_SPECS:
+            for split in ("all", "ps", "nonps"):
+                path = diag_dir / f"forward_{metric_col}_{split}{suffix}.png"
+                _plot_metric_by_iter(
+                    out["metrics_df"], metric_col, split,
+                    cfg_base.obj1, cfg_base.obj2, path,
+                )
+                plot_paths[metric_col][split] = str(path)
+                log.info(f"wrote plot: {path}")
+
+    if len(out["classifier_df"]) > 0:
+        classifier_plot_path = str(diag_dir / f"forward_classifier{suffix}.png")
+        _plot_classifier_metrics(out["classifier_df"], Path(classifier_plot_path))
+        log.info(f"wrote plot: {classifier_plot_path}")
 
     print(json.dumps({
         "start_iter":       diag_args.start_iter,
@@ -156,7 +240,10 @@ def main(argv: list[str] | None = None) -> int:
         "metrics_csv":      str(out["paths"]["metrics"]),
         "classifier_csv":   str(out["paths"]["classifier"]),
         "ranking_csv":      str(out["paths"]["ranking"]),
-        "plot":             str(plot_path),
+        "plots": {
+            **plot_paths,
+            "classifier": classifier_plot_path,
+        },
     }, indent=2))
     return 0
 
