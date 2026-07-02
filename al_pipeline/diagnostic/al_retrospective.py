@@ -343,6 +343,14 @@ def run_retrospective(
     if k_pick is None:
         k_pick = max(1, cfg_base.ngen // 2)
 
+    # Seed torch + numpy so sibling upper/lower jobs with the same cfg.seed_base
+    # produce identical per-iter surrogate training states. Training is front-
+    # agnostic (see _build_*_surrogate); the only front-dependent step is the
+    # KB acquisition inside _kb_inner_loop. Seeding here removes RNG drift as a
+    # confounder between the two jobs.
+    torch.manual_seed(cfg_base.seed_base)
+    np.random.seed(cfg_base.seed_base % (2**32 - 1))
+
     log_fn(f"[retrospective] loading completed run from {runs_root / model}")
     all_data = load_completed_run(runs_root, model, n_iters)
 
@@ -451,10 +459,12 @@ def run_retrospective(
                 f"moe_hard={hv_traj['moe_hard'][-1]:.4f} "
                 f"global={hv_traj['global'][-1]:.4f}")
 
-    # Output filenames get a `_start{N}` suffix so multiple sweeps land
-    # side-by-side under DIAGNOSTIC/. Applied uniformly (including start=1)
-    # so no set of output filenames is "the special default".
-    suffix = f"_start{start_iter}"
+    # Filenames include BOTH front and start_iter so sibling upper/lower
+    # jobs with the same start_iter can land side-by-side under DIAGNOSTIC/
+    # without clobbering each other. Retrospective results ARE front-specific
+    # (the KB acquisition uses front for sign/Pareto direction), so both
+    # dimensions matter.
+    suffix = f"_{front}_start{start_iter}"
     summary_path    = diagnostic_dir / f"retrospective_summary{suffix}.csv"
     trajectory_path = diagnostic_dir / f"retrospective_trajectory{suffix}.json"
 

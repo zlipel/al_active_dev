@@ -74,6 +74,20 @@ def test_forward_predictions_shape(forward_out):
         assert col in df.columns, f"missing column {col}"
 
 
+def test_forward_predictions_front_type_is_per_row(forward_out):
+    """`front_type` is inferred per row (upper=first half, lower=second half)."""
+    out, _, _, _ = forward_out
+    df = out["predictions_df"]
+    fronts = set(df["front_type"].unique())
+    assert fronts == {"upper", "lower"}
+    # Each iter's rows should split roughly half-half across upper and lower.
+    for heldout_iter in df["heldout_iter"].unique():
+        per_iter = df[(df["heldout_iter"] == heldout_iter) & (df["predictor"] == "global")]
+        n_upper = int((per_iter["front_type"] == "upper").sum())
+        n_lower = int((per_iter["front_type"] == "lower").sum())
+        assert n_upper > 0 and n_lower > 0
+
+
 def test_forward_predictions_ps_guarded_has_nans(forward_out):
     """`ps_guarded` sets NaN on rows below the p_ps threshold."""
     out, _, _, _ = forward_out
@@ -92,15 +106,16 @@ def test_forward_predictions_ps_guarded_has_nans(forward_out):
 # ---------- metrics_long ----------
 
 def test_forward_metrics_shape(forward_out):
-    """n_iters × n_predictors × 2 objectives × 2 spaces × 3 splits rows."""
+    """n_iters × n_predictors × 2 objectives × 2 spaces × 3 splits × 3 front_types rows."""
     out, _, n_iters, _ = forward_out
     df = out["metrics_df"]
-    expected = n_iters * len(ALL_PREDICTORS) * 2 * 2 * 3
+    expected = n_iters * len(ALL_PREDICTORS) * 2 * 2 * 3 * 3
     assert len(df) == expected
     for col in ("heldout_iter", "predictor", "property", "space", "split",
-                 "threshold", "coverage", "n", "rmse", "mae", "bias",
-                 "r2", "spearman", "nll_z"):
+                 "front_type", "threshold", "coverage", "n", "rmse", "mae",
+                 "bias", "r2", "spearman", "nll_z"):
         assert col in df.columns, f"missing column {col}"
+    assert set(df["front_type"].unique()) == {"all", "upper", "lower"}
 
 
 def test_forward_metrics_nll_z_only_populated_for_z_space(forward_out):
@@ -113,20 +128,21 @@ def test_forward_metrics_nll_z_only_populated_for_z_space(forward_out):
 # ---------- classifier ----------
 
 def test_forward_classifier_columns(forward_out):
-    """One row per iter with the RF gate summary columns."""
+    """Three rows per iter (all/upper/lower) with the RF gate summary columns."""
     out, _, n_iters, _ = forward_out
     df = out["classifier_df"]
-    assert len(df) == n_iters
-    for col in ("heldout_iter", "n_candidates", "n_ps_true", "n_nonps_true",
-                 "roc_auc", "ps_recall", "ps_precision", "f1", "nonps_fpr",
-                 "tp", "tn", "fp", "fn"):
+    assert len(df) == n_iters * 3
+    for col in ("heldout_iter", "front_type", "n_candidates", "n_ps_true",
+                 "n_nonps_true", "roc_auc", "ps_recall", "ps_precision", "f1",
+                 "nonps_fpr", "tp", "tn", "fp", "fn"):
         assert col in df.columns, f"missing column {col}"
+    assert set(df["front_type"].unique()) == {"all", "upper", "lower"}
 
 
 # ---------- ranking ----------
 
 def test_forward_ranking_matches_metrics_aggregate(forward_out):
-    """`mean_RMSE_z_ps` for each predictor equals the raw metrics mean."""
+    """`mean_RMSE_z_ps` for each predictor equals the raw metrics mean (front_type=all)."""
     out, _, _, _ = forward_out
     metrics = out["metrics_df"]
     ranking = out["ranking_df"]
@@ -136,12 +152,35 @@ def test_forward_ranking_matches_metrics_aggregate(forward_out):
             (metrics["predictor"] == predictor)
             & (metrics["space"] == "z")
             & (metrics["split"] == "ps")
+            & (metrics["front_type"] == "all")
         ]["rmse"].mean())
         # Both may be NaN when no PS rows exist in that iter.
         if pd.isna(expected):
             assert pd.isna(row["mean_RMSE_z_ps"])
         else:
             assert row["mean_RMSE_z_ps"] == pytest.approx(expected, rel=1e-9, nan_ok=True)
+
+
+def test_forward_ranking_has_per_front_columns(forward_out):
+    """Ranking exposes per-front macro-mean RMSE_z columns and they match metrics."""
+    out, _, _, _ = forward_out
+    metrics = out["metrics_df"]
+    ranking = out["ranking_df"]
+    for col in ("mean_RMSE_z_upper", "mean_RMSE_z_lower"):
+        assert col in ranking.columns, f"missing column {col}"
+    for _, row in ranking.iterrows():
+        predictor = row["predictor"]
+        for front, col in (("upper", "mean_RMSE_z_upper"), ("lower", "mean_RMSE_z_lower")):
+            expected = float(metrics[
+                (metrics["predictor"] == predictor)
+                & (metrics["space"] == "z")
+                & (metrics["split"] == "all")
+                & (metrics["front_type"] == front)
+            ]["rmse"].mean())
+            if pd.isna(expected):
+                assert pd.isna(row[col])
+            else:
+                assert row[col] == pytest.approx(expected, rel=1e-9, nan_ok=True)
 
 
 def test_forward_ranking_labels_guarded_correctly(forward_out):
@@ -180,5 +219,6 @@ def test_forward_start_iter_shifts_range(tmp_path):
     # Only iter M=2 is evaluated.
     assert set(out["predictions_df"]["heldout_iter"].unique()) == {2}
     assert set(out["classifier_df"]["heldout_iter"].unique()) == {2}
-    assert len(out["classifier_df"]) == 1
+    # Three rows per iter (all + upper + lower).
+    assert len(out["classifier_df"]) == 3
     assert out["start_iter"] == 2

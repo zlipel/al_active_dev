@@ -295,8 +295,9 @@ def test_run_retrospective_end_to_end_synthetic(tmp_path):
     )
 
     diag_dir = cfg_base.paths.diagnostic_dir
-    summary_path    = diag_dir / f"retrospective_summary_start{start_iter}.csv"
-    trajectory_path = diag_dir / f"retrospective_trajectory_start{start_iter}.json"
+    front = cfg_base.front
+    summary_path    = diag_dir / f"retrospective_summary_{front}_start{start_iter}.csv"
+    trajectory_path = diag_dir / f"retrospective_trajectory_{front}_start{start_iter}.json"
     assert summary_path.exists()
     assert trajectory_path.exists()
 
@@ -367,8 +368,9 @@ def test_run_retrospective_start_iter_shifts_range(tmp_path):
     )
 
     diag_dir = cfg_base.paths.diagnostic_dir
-    summary_path    = diag_dir / f"retrospective_summary_start{start_iter}.csv"
-    trajectory_path = diag_dir / f"retrospective_trajectory_start{start_iter}.json"
+    front = cfg_base.front
+    summary_path    = diag_dir / f"retrospective_summary_{front}_start{start_iter}.csv"
+    trajectory_path = diag_dir / f"retrospective_trajectory_{front}_start{start_iter}.json"
     assert summary_path.exists()
     assert trajectory_path.exists()
 
