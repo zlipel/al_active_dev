@@ -9,6 +9,15 @@ three splits (all, ps, nonps) × three front_types (all, upper, lower), plus
 the RF gate's quality per iter × per front. This is the port of MCSC's
 `run_generation_forward_moe_validation.py` into al_active_dev.
 
+The six predictors are the operationally-deployed routing policies only:
+`global` (baseline), `moe_soft` (calibrated-p weighted blend), and four
+`moe_hard_tXXX` variants (hard gate at threshold 0.15, 0.30, 0.50, 0.70;
+routes to PS expert if p_ps ≥ t else nonPS expert). Raw `ps_expert` /
+`nonps_expert` predictions on all rows are NOT reported — evaluating an
+expert on rows the gate would never route to it has no operational meaning.
+`ps_guarded` (PS expert + NaN below threshold) is likewise omitted; the
+matching `moe_hard_tXXX` predictor is the deployed equivalent.
+
 Front handling: the trained model is front-agnostic (it sees every training
 row regardless of front target). Non-seed generations contribute `cfg.ngen`
 upper-front candidates followed by `cfg.ngen` lower-front candidates in
@@ -21,12 +30,12 @@ Framing:
   - Each iter M is a train/test split defined by the completed run's
     `generation` column: train = gens < M, test = gen == M. No leakage.
   - Six predictors evaluated on the test set:
-      * `global`       — GlobalGPRSurrogate.predict_pool
-      * `ps_expert`    — bundle.ps_expert.predict (native z-space)
-      * `nonps_expert` — bundle.nonps_expert.predict
-      * `moe_soft`     — MoESurrogate(policy='soft').predict_pool
-      * `moe_hard`     — MoESurrogate(policy='hard', cfg.moe_threshold).predict_pool
-      * `ps_guarded`   — PS expert on rows where p_ps ≥ cfg.moe_threshold, NaN elsewhere
+      * `global`         — GlobalGPRSurrogate.predict_pool
+      * `moe_soft`       — combine_soft(p, μ_ps, μ_nps) + soft-mixture var
+      * `moe_hard_t015`  — μ_ps if p_ps ≥ 0.15 else μ_nps
+      * `moe_hard_t030`  — μ_ps if p_ps ≥ 0.30 else μ_nps
+      * `moe_hard_t050`  — μ_ps if p_ps ≥ 0.50 else μ_nps
+      * `moe_hard_t070`  — μ_ps if p_ps ≥ 0.70 else μ_nps
   - Label scalers are refit from the training slice via
     `_fit_label_scalers`. Under scope='all' this exactly matches the MoE
     bundle's internal scalers and approximates the global GPR's (which
@@ -65,15 +74,27 @@ from al_pipeline.diagnostic._common import (
 )
 from al_pipeline.ga.ga_utils import load_moe_bundle
 from al_pipeline.surrogates import (
-    GlobalGPRSurrogate, MoEBundle, MoESurrogate,
+    GlobalGPRSurrogate, MoEBundle,
     build_rf_features, classifier_p_ps,
 )
+from al_pipeline.surrogates.moe_combine import combine_soft, soft_mixture_variance
 from al_pipeline.training.moe_training import _fit_label_scalers
 
 
-PREDICTORS_FULL_COVERAGE = ("global", "ps_expert", "nonps_expert", "moe_soft", "moe_hard")
-PREDICTORS_GUARDED = ("ps_guarded",)
-ALL_PREDICTORS = PREDICTORS_FULL_COVERAGE + PREDICTORS_GUARDED
+# Hard-gate threshold sweep. Each threshold becomes its own predictor so the
+# ranking table shows where the accuracy/coverage tradeoff sits.
+HARD_THRESHOLDS: tuple[float, ...] = (0.15, 0.30, 0.50, 0.70)
+
+
+def _hard_predictor_name(t: float) -> str:
+    return f"moe_hard_t{int(round(t * 100)):03d}"
+
+
+ALL_PREDICTORS: tuple[str, ...] = (
+    "global",
+    "moe_soft",
+    *tuple(_hard_predictor_name(t) for t in HARD_THRESHOLDS),
+)
 
 
 # ---------- z ↔ physical inversion ----------
@@ -138,43 +159,48 @@ def _collect_predictions(
     cfg_base: ALConfig,
     bundle: MoEBundle,
     global_sur: GlobalGPRSurrogate,
-    moe_soft: MoESurrogate,
-    moe_hard: MoESurrogate,
     pool_feats_raw_df: pd.DataFrame,
     p_ps: np.ndarray,
 ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """
-    Per-predictor (means_z, stds_z) shape-(B, 2) arrays. `ps_guarded` has NaN
-    rows where `p_ps < cfg.moe_threshold`.
+    Per-predictor (means_z, stds_z) shape-(B, 2) arrays for the deployed
+    routing policies only: `global`, `moe_soft`, and one `moe_hard_tXXX`
+    per entry in HARD_THRESHOLDS.
+
+    Standalone `ps_expert` / `nonps_expert` predictors are intentionally
+    absent — evaluating an expert on rows the gate would never route to it
+    has no operational meaning. `ps_guarded` (PS expert + NaN below
+    threshold) is likewise absent; `moe_hard_tXXX` at the same threshold
+    routes to nonPS instead of NaN, which is what the deployed system does.
     """
-    threshold = float(cfg_base.moe_threshold)
     out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
-    # Global
+    # Global baseline.
     pool = global_sur.predict_pool(pool_feats_raw_df)
     out["global"] = (pool.means.copy(), pool.stds.copy())
 
-    # Per-expert (native z-space)
+    # Compute each expert's z-space prediction ONCE. Every MoE predictor
+    # below is a routing over the same (mu, var) tensors.
     ps_m, ps_s = _predict_per_expert_z(bundle.ps_expert, pool_feats_raw_df)
-    out["ps_expert"] = (ps_m, ps_s)
-
     nps_m, nps_s = _predict_per_expert_z(bundle.nonps_expert, pool_feats_raw_df)
-    out["nonps_expert"] = (nps_m, nps_s)
+    var_ps = ps_s ** 2
+    var_nps = nps_s ** 2
 
-    # MoE blends
-    pool_soft = moe_soft.predict_pool(pool_feats_raw_df)
-    out["moe_soft"] = (pool_soft.means.copy(), pool_soft.stds.copy())
+    # Soft mixture: p * mu_ps + (1-p) * mu_nps for the mean; law-of-total-
+    # variance moment match for the variance. Matches MoESurrogate('soft').
+    p_col = p_ps[:, None]
+    soft_mean = combine_soft(p_col, ps_m, nps_m)
+    soft_var = soft_mixture_variance(p_col, ps_m, var_ps, nps_m, var_nps)
+    soft_std = np.sqrt(np.maximum(soft_var, 0.0))
+    out["moe_soft"] = (soft_mean, soft_std)
 
-    pool_hard = moe_hard.predict_pool(pool_feats_raw_df)
-    out["moe_hard"] = (pool_hard.means.copy(), pool_hard.stds.copy())
-
-    # PS-guarded: PS-expert predictions where p_ps ≥ threshold, NaN otherwise.
-    ps_guard_m = ps_m.copy()
-    ps_guard_s = ps_s.copy()
-    mask = p_ps < threshold
-    ps_guard_m[mask] = np.nan
-    ps_guard_s[mask] = np.nan
-    out["ps_guarded"] = (ps_guard_m, ps_guard_s)
+    # Hard-gate sweep — each threshold is its own predictor. Fallback to
+    # nonPS below threshold (matches MoESurrogate('hard'); NOT NaN).
+    for t in HARD_THRESHOLDS:
+        use_ps = (p_ps >= t)[:, None]
+        mean = np.where(use_ps, ps_m, nps_m)
+        std = np.where(use_ps, ps_s, nps_s)
+        out[_hard_predictor_name(t)] = (mean, std)
 
     return out
 
@@ -310,6 +336,14 @@ def _classifier_metrics_row(
 
 # ---------- ranking summary ----------
 
+def _predictor_hard_threshold(predictor: str) -> float:
+    """Extract the hard-gate threshold from a `moe_hard_tXXX` name; NaN otherwise."""
+    for t in HARD_THRESHOLDS:
+        if predictor == _hard_predictor_name(t):
+            return float(t)
+    return float("nan")
+
+
 def _ranking_summary(metrics_df: pd.DataFrame) -> pd.DataFrame:
     """
     Cross-iter aggregate per predictor in z-space.
@@ -320,7 +354,11 @@ def _ranking_summary(metrics_df: pd.DataFrame) -> pd.DataFrame:
       - mean_RMSE_z_{ps,nonps}: split-conditional averages across both fronts
       - mean_RMSE_z_{upper,lower}: front-conditional averages across both splits
       - mean_NLL_z_{ps,nonps}
-      - coverage_all_z_mean: fraction of test rows the predictor is defined on
+      - coverage_all_z_mean: always ~1.0 since every predictor is full-coverage
+        by construction; retained for schema stability.
+      - hard_threshold: the gate cutoff for `moe_hard_tXXX` rows; NaN for
+        `global` / `moe_soft`.
+
     Sorted by macro_mean_RMSE_z ascending (best predictor first).
     """
     z_only = metrics_df[metrics_df["space"] == "z"]
@@ -335,7 +373,7 @@ def _ranking_summary(metrics_df: pd.DataFrame) -> pd.DataFrame:
                        .groupby("property")["rmse"].mean().mean())
         row = {
             "predictor":            predictor,
-            "threshold":            float(g["threshold"].dropna().iloc[0]) if g["threshold"].notna().any() else float("nan"),
+            "hard_threshold":       _predictor_hard_threshold(predictor),
             "coverage_all_z_mean":  float(cell("all", "all")["coverage"].mean()),
             "macro_mean_RMSE_z":    float(macro_rmse) if pd.notna(macro_rmse) else float("nan"),
             "mean_RMSE_z_ps":       float(cell("ps", "all")["rmse"].mean()),
@@ -344,7 +382,6 @@ def _ranking_summary(metrics_df: pd.DataFrame) -> pd.DataFrame:
             "mean_RMSE_z_lower":    float(cell("all", "lower")["rmse"].mean()),
             "mean_NLL_z_ps":        float(cell("ps", "all")["nll_z"].mean()),
             "mean_NLL_z_nonps":     float(cell("nonps", "all")["nll_z"].mean()),
-            "policy_class":         ("guarded" if predictor in PREDICTORS_GUARDED else "full_coverage"),
         }
         rows.append(row)
     df = pd.DataFrame(rows)
@@ -402,19 +439,19 @@ def run_forward(
         scaler1, scaler2 = _fit_label_scalers(train_labels_raw, [obj1, obj2], cfg_base.transform)
 
         # Train MoE + global inside a per-iter tempdir (matches the retrospective).
+        # We only need the loaded bundle (experts + RF); the routing math for
+        # `moe_soft` / `moe_hard_tXXX` is done directly in `_collect_predictions`
+        # against cached expert tensors, so no MoESurrogate wrapper needed.
         with tempfile.TemporaryDirectory() as tempdir_str:
             tempdir = Path(tempdir_str)
             cfg_moe = _make_iter_cfg(tempdir / "moe", cfg_base, iteration=M - 1, train_model_type="moe")
             _write_training_slice(cfg_moe, train_feats, train_labels_raw)
-            moe_surs = _build_moe_surrogates(cfg_moe)
+            _build_moe_surrogates(cfg_moe)  # persists artifacts to tempdir
             bundle = load_moe_bundle(cfg_moe, temp=False)
 
             cfg_global = _make_iter_cfg(tempdir / "global", cfg_base, iteration=M - 1, train_model_type="gpr_multitask")
             _write_training_slice(cfg_global, train_feats, train_labels_raw)
             global_sur = _build_global_surrogate(cfg_global)
-
-        moe_soft = moe_surs["moe_soft"]
-        moe_hard = moe_surs["moe_hard"]
 
         # RF gate: p_ps + ground truth for classifier metrics
         X_rf, _ = build_rf_features(pool_feats, bundle.rf_raw_feature_columns,
@@ -449,7 +486,7 @@ def run_forward(
         true_phys = pool_labels_raw[[obj1, obj2]].to_numpy(dtype=np.float64)
         true_z = _transform_true_labels_to_z(pool_labels_raw, obj1, obj2, cfg_base.transform, scaler1, scaler2)
 
-        preds = _collect_predictions(cfg_base, bundle, global_sur, moe_soft, moe_hard, pool_feats, p_ps)
+        preds = _collect_predictions(cfg_base, bundle, global_sur, pool_feats, p_ps)
 
         # Long predictions rows — one per (row × predictor). front_type varies
         # per row (upper for the first half, lower for the second).

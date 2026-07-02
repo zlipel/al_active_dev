@@ -16,6 +16,12 @@
 # `front_type` (upper/lower) is inferred from the gen-N pool's row order.
 # --front is required by ALConfig but ignored by the forward evaluation.
 #
+# Reports the six operationally-deployed predictors — `global`, `moe_soft`,
+# and `moe_hard_t{015,030,050,070}` (hard-gate at p_ps threshold 0.15..0.70).
+# Raw expert predictions are NOT reported: evaluating one expert on rows the
+# gate would never route to it has no operational meaning. The MoE RF gate
+# is calibrated via CalibratedClassifierCV (see cfg.moe_calibration_method).
+#
 # Reads completed AL artifacts from
 #   ${SCRATCH_AL}/<MODEL>/GENERATIONS/iteration_*/
 # (via --scratch_path). Writes four CSVs + one plot to

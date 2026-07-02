@@ -98,6 +98,10 @@ class ALConfig:
     #          sequences only" acquisition.
     moe_policy:    str   = "soft"
     moe_threshold: float = 0.5
+    # Post-hoc RF-gate calibration. 'sigmoid' (Platt) is well-behaved when the
+    # PS class is scarce (early AL iters); 'isotonic' is safe once N_ps grows.
+    # 'none' returns the raw RF for one-line rollback.
+    moe_calibration_method: str = "sigmoid"
 
     def validate(self) -> None:
         """Validate the configuration parameters."""
@@ -120,6 +124,11 @@ class ALConfig:
             raise ValueError("gpr_singletask requires obj1 and obj2")
         if self.train_model_type == "moe" and self.moe_policy not in ("soft", "hard"):
             raise ValueError(f"moe_policy must be 'soft' or 'hard', got {self.moe_policy!r}")
+        if self.moe_calibration_method not in ("sigmoid", "isotonic", "none"):
+            raise ValueError(
+                f"moe_calibration_method must be 'sigmoid', 'isotonic', or 'none'; "
+                f"got {self.moe_calibration_method!r}"
+            )
         _ = self.paths.tag
         
     @property

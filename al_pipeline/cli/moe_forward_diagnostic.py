@@ -65,12 +65,12 @@ def _parse_diagnostic_args(argv: list[str]) -> tuple[argparse.Namespace, list[st
 
 
 _PREDICTOR_STYLE = {
-    "global":       {"color": "tab:blue",   "linestyle": "-",  "linewidth": 1.5},
-    "moe_soft":     {"color": "tab:orange", "linestyle": "-",  "linewidth": 1.5},
-    "moe_hard":     {"color": "tab:green",  "linestyle": "-",  "linewidth": 1.5},
-    "ps_expert":    {"color": "tab:red",    "linestyle": "--", "linewidth": 1.3},
-    "nonps_expert": {"color": "tab:purple", "linestyle": "--", "linewidth": 1.3},
-    "ps_guarded":   {"color": "tab:brown",  "linestyle": ":",  "linewidth": 1.3},
+    "global":         {"color": "tab:blue",   "linestyle": "-",  "linewidth": 1.6, "label": "global"},
+    "moe_soft":       {"color": "tab:orange", "linestyle": "-",  "linewidth": 1.6, "label": "soft"},
+    "moe_hard_t015":  {"color": "#c7e9c0",    "linestyle": "--", "linewidth": 1.4, "label": "hard@0.15"},
+    "moe_hard_t030":  {"color": "#74c476",    "linestyle": "--", "linewidth": 1.4, "label": "hard@0.30"},
+    "moe_hard_t050":  {"color": "#238b45",    "linestyle": "--", "linewidth": 1.4, "label": "hard@0.50"},
+    "moe_hard_t070":  {"color": "#00441b",    "linestyle": "--", "linewidth": 1.4, "label": "hard@0.70"},
 }
 
 
@@ -94,7 +94,7 @@ def _plot_rmse_by_iter(metrics_df: pd.DataFrame, obj1: str, obj2: str,
             if rows.empty:
                 continue
             ax.plot(rows["heldout_iter"], rows["rmse"],
-                    label=predictor, **_PREDICTOR_STYLE[predictor])
+                    **_PREDICTOR_STYLE[predictor])
         ax.set_title(f"{prop} (z-space, split=all, both fronts)")
         ax.set_xlabel("held-out iter")
         ax.set_ylabel("RMSE_z")
