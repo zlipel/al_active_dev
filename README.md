@@ -18,7 +18,7 @@ al_active_dev/
 ├── external/           # Vendored cluster code: core.py + md_calcs C++ extension
 ├── submit/             # All SLURM job-submission scripts (consolidated, top-level)
 ├── utils/              # Shared visualization and Pareto-front utilities
-├── tests/              # pytest suite (~100 tests covering AL math + helpers)
+├── tests/              # pytest suite (~195 tests covering AL math + MoE + diagnostics)
 ├── config/             # cluster.env + environment.yml
 ├── runs/               # (gitignored) HOME-side artifacts: .pt models, plots, logs
 └── archive/            # (gitignored) Superseded scripts — preserved locally for reference
@@ -40,7 +40,7 @@ conda env create -f config/environment.yml
 conda activate al_active_dev
 pip install -e .              # installs al_pipeline in editable mode
 
-pytest tests/                 # 102 tests; should pass with no extra setup
+pytest tests/                 # ~195 tests; should pass with no extra setup
 ```
 
 The vendored C++ MSD extension and `mpi4py` are stubbed by the test suite, so
@@ -106,7 +106,7 @@ python -c "from mpi4py import MPI; print('mpi4py:', MPI.Get_library_version())"
 
 ```bash
 conda activate al_active_dev
-pytest tests/                       # should be 102 passed
+pytest tests/                       # should be ~195 passed
 CLUSTER_TESTS=1 pytest tests/       # also runs @pytest.mark.cluster tests
 ```
 
@@ -172,10 +172,14 @@ Key options (see `--help` for full list):
 |------|---------|---------|
 | `--model` | — | Force field: `CALVADOS`, `HPS_URRY`, `MPIPI`, `HPS_KR`, `MARTINI` |
 | `--front` | `upper` | Pareto front direction: `upper` (maximize both) or `lower` |
+| `--train_model_type` | `gpr_multitask` | Surrogate: `gpr_multitask` (global GPR), `gpr_singletask`, `moe` (MoE: PS + nonPS experts + calibrated RF gate), `dnn` |
 | `--ehvi_variant` | `epsilon` | `epsilon` (ε-EHVI) or `standard` |
 | `--exploration_strategy` | `kriging_believer` | `kriging_believer`, `constant_liar_min/mean/max`, `similarity_penalty` |
 | `--transform` | `yeoj` | Label transform: `yeoj` (Yeo-Johnson) or `log` |
 | `--mc_ehvi` | off | Monte Carlo EHVI (use `pygmo.hypervolume` backend) |
+| `--moe_policy` | `soft` | (MoE only) `soft` blend by calibrated `p(ps)` or `hard` gate at threshold |
+| `--moe_threshold` | `0.5` | (MoE only) Hard-gate cutoff on `p(ps)` |
+| `--moe_calibration_method` | `sigmoid` | (MoE only) RF-gate calibration: `sigmoid` (Platt), `isotonic`, or `none` |
 
 The pipeline writes results to the `ALPaths` directory tree rooted at
 `$SCRATCH_AL/$MODEL/`, including: `features_gen{N}.csv`, `labels_gen{N}.csv`,
@@ -291,6 +295,8 @@ Every script:
 | `submit/al_master.sh` | **One sbatch per AL iteration** — production AL run |
 | `submit/al_master_acq_test.sh` | Acquisition-function diagnostic (separate scratch path) |
 | `submit/run_acq_sweep.sh` | Convenience wrapper to submit acq-test runs per `(model, ehvi, explore)` tuple |
+| `submit/moe_diagnostic.sh` | MoE retrospective HV diagnostic (per (model, front, start_iter)) |
+| `submit/moe_forward_diagnostic.sh` | MoE forward (generation-forward) predictive-accuracy diagnostic |
 
 ### AL master examples
 
@@ -327,6 +333,39 @@ done
 
 Acq-test runs write to `${SCRATCH_AL_ACQ}` (a separate scratch root from
 `${SCRATCH_AL}`) so production state is never touched.
+
+### MoE diagnostics
+
+Two post-hoc diagnostics for the MoE surrogate track. Both walk completed AL
+iterations (train on gens 0..N-1, evaluate on gen N) and are cheap enough for
+a login node under toy defaults. Outputs land under `${HOME_AL}/<MODEL>/DIAGNOSTIC/`.
+
+**Retrospective HV diagnostic** — counterfactual re-selection: replay each
+iter picking children under `{global, moe_soft, moe_hard}` and compute
+cumulative HV against a fixed target Pareto front:
+
+```bash
+sbatch submit/moe_diagnostic.sh --model HPS_URRY --front upper
+sbatch submit/moe_diagnostic.sh --model HPS_URRY --front upper --start_iter 5
+```
+
+Front-specific outputs are suffixed `_{front}_start{N}` so upper/lower and
+different sweep starts coexist without clobber.
+
+**Forward (generation-forward) diagnostic** — per-iter predictive accuracy
+in z-space and physical space, per PS/nonPS split and per upper/lower front,
+across the deployed routing policies only (`global`, `moe_soft`, and the
+`moe_hard_t{015,030,050,070}` hard-gate sweep). Covers BOTH fronts in a
+single run:
+
+```bash
+sbatch submit/moe_forward_diagnostic.sh --model HPS_URRY
+sbatch submit/moe_forward_diagnostic.sh --model HPS_URRY --start_iter 5
+```
+
+Four CSVs (`forward_predictions_*`, `forward_metrics_*`, `forward_classifier_*`,
+`forward_ranking_*`) plus one plot per run. `forward_ranking_*` is the
+publication-ready summary, sorted by macro-mean z-space RMSE.
 
 ---
 
