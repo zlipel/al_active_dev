@@ -17,7 +17,7 @@ import torch
 
 from al_pipeline.core.config import ALConfig
 from al_pipeline.diagnostic.al_forward import (
-    ALL_PREDICTORS, PREDICTORS_FULL_COVERAGE, PREDICTORS_GUARDED, run_forward,
+    ALL_PREDICTORS, HARD_THRESHOLDS, run_forward,
 )
 from tests.al_pipeline.test_al_retrospective import _write_completed_run
 
@@ -88,19 +88,24 @@ def test_forward_predictions_front_type_is_per_row(forward_out):
         assert n_upper > 0 and n_lower > 0
 
 
-def test_forward_predictions_ps_guarded_has_nans(forward_out):
-    """`ps_guarded` sets NaN on rows below the p_ps threshold."""
+def test_forward_predictions_all_full_coverage(forward_out):
+    """Every predictor emits a non-NaN prediction on every row (no guarded)."""
     out, _, _, _ = forward_out
-    guarded = out["predictions_df"][out["predictions_df"]["predictor"] == "ps_guarded"]
-    # At least SOME rows should be NaN across all four synthetic iters; if the
-    # gate is never < threshold on our synthetic data the coverage is 1.0 and
-    # this test's premise doesn't hold — accept coverage∈[0,1] here.
-    n_nan = int(guarded["pred_exp_density_z"].isna().sum())
-    assert 0 <= n_nan <= len(guarded)
-    # Full-coverage predictors never emit NaN.
-    for predictor in PREDICTORS_FULL_COVERAGE:
-        rows = out["predictions_df"][out["predictions_df"]["predictor"] == predictor]
+    df = out["predictions_df"]
+    for predictor in ALL_PREDICTORS:
+        rows = df[df["predictor"] == predictor]
         assert not rows["pred_exp_density_z"].isna().any(), f"{predictor} unexpected NaN"
+        assert not rows["pred_diff_z"].isna().any(), f"{predictor} unexpected NaN in diff"
+
+
+def test_forward_predictor_set_matches_spec(forward_out):
+    """Predictor set is exactly `global`, `moe_soft`, and the hard-threshold sweep."""
+    out, _, _, _ = forward_out
+    expected = {"global", "moe_soft"} | {f"moe_hard_t{int(round(t*100)):03d}" for t in HARD_THRESHOLDS}
+    assert set(out["predictions_df"]["predictor"].unique()) == expected
+    # No dropped predictors leak in.
+    for gone in ("ps_expert", "nonps_expert", "ps_guarded", "moe_hard"):
+        assert gone not in set(out["predictions_df"]["predictor"].unique())
 
 
 # ---------- metrics_long ----------
@@ -183,14 +188,18 @@ def test_forward_ranking_has_per_front_columns(forward_out):
                 assert row[col] == pytest.approx(expected, rel=1e-9, nan_ok=True)
 
 
-def test_forward_ranking_labels_guarded_correctly(forward_out):
-    """`ps_guarded` is labelled 'guarded'; others 'full_coverage'."""
-    _, _, _, _ = forward_out
-    ranking = forward_out[0]["ranking_df"]
-    for _, row in ranking.iterrows():
-        predictor = row["predictor"]
-        expected = "guarded" if predictor in PREDICTORS_GUARDED else "full_coverage"
-        assert row["policy_class"] == expected
+def test_forward_ranking_has_hard_threshold_column(forward_out):
+    """`hard_threshold` populated for moe_hard_tXXX rows, NaN for global/moe_soft."""
+    out, _, _, _ = forward_out
+    ranking = out["ranking_df"]
+    assert "hard_threshold" in ranking.columns
+    assert "policy_class" not in ranking.columns  # dropped by design
+    by_pred = ranking.set_index("predictor")
+    assert pd.isna(by_pred.loc["global", "hard_threshold"])
+    assert pd.isna(by_pred.loc["moe_soft", "hard_threshold"])
+    for t in HARD_THRESHOLDS:
+        name = f"moe_hard_t{int(round(t*100)):03d}"
+        assert by_pred.loc[name, "hard_threshold"] == pytest.approx(t)
 
 
 # ---------- start_iter shifts range ----------

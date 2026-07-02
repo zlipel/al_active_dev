@@ -36,8 +36,9 @@ import gpytorch
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import GridSearchCV, KFold
+from sklearn.model_selection import GridSearchCV, KFold, StratifiedKFold
 from sklearn.preprocessing import PowerTransformer, StandardScaler
 
 from al_pipeline.core.config import ALConfig
@@ -226,26 +227,36 @@ def _train_rf_gate(
     *,
     seed: int = 42,
     cv: int = 5,
+    calibration_method: str = "sigmoid",
     log=None,
-) -> tuple[RandomForestClassifier, list[str], dict]:
+) -> tuple[Any, list[str], dict]:
     """
-    CV grid-search the RF, then refit on all data with the best params.
+    Grid-search the RF hyperparameters, then wrap the best RF in
+    CalibratedClassifierCV so the returned classifier exposes calibrated
+    P(PS | x). Raw RF predict_proba is notoriously miscalibrated at the
+    tails, which corrupts both the soft-blend arithmetic and the hard-gate
+    threshold interpretation.
 
-    Single-class degenerate case (only one regime present in training): skip
-    CV and fit a default RF. The classifier will return p=0 or p=1 for every
-    candidate, which is the correct degenerate behavior — the gate has no
-    signal yet.
+    `calibration_method`:
+      - 'sigmoid'  — Platt scaling (2-parameter fit; safe under class scarcity).
+      - 'isotonic' — nonparametric; recommended once N_ps is large.
+      - 'none'     — return the raw refit RF (rollback path).
+
+    Single-class degenerate case (only one regime present in training):
+    calibration is undefined, so skip both CV and calibration and return a
+    default RF. It will return p=0 or p=1 for every candidate — the correct
+    degenerate behavior when the gate has no signal.
     """
     X_rf, conv_cols = build_rf_features(features_df, FEATURE_COLUMNS, None)
 
     if len(np.unique(is_ps)) < 2:
         if log:
-            log.warning("Only one PS class in training data; using default RF (no CV).")
+            log.warning("Only one PS class in training data; using default RF (no CV, no calibration).")
         rf = RandomForestClassifier(n_estimators=100, random_state=seed)
         rf.fit(X_rf, is_ps)
         return rf, conv_cols, {}
 
-    # Make sure cv is feasible: each fold needs at least 1 sample of each class.
+    # Feasibility: each CV fold needs at least 1 sample of each class.
     min_class = int(min(np.sum(is_ps == 0), np.sum(is_ps == 1)))
     effective_cv = max(2, min(cv, min_class))
     search = GridSearchCV(
@@ -257,12 +268,26 @@ def _train_rf_gate(
         refit=True,
     )
     search.fit(X_rf, is_ps)
+    best_params = dict(search.best_params_)
     if log:
         log.info(
-            f"[moe rf gridsearch] best_params={search.best_params_} "
+            f"[moe rf gridsearch] best_params={best_params} "
             f"best_roc_auc={search.best_score_:.4f} (cv={effective_cv})"
         )
-    return search.best_estimator_, conv_cols, dict(search.best_params_)
+
+    if calibration_method == "none":
+        return search.best_estimator_, conv_cols, best_params
+
+    # Wrap a fresh RF (with best hyperparams) in CalibratedClassifierCV so the
+    # calibrator fits inner CV folds around it. Explicit StratifiedKFold keeps
+    # the fit deterministic under `seed`.
+    base = RandomForestClassifier(**best_params, random_state=seed)
+    calib_cv = StratifiedKFold(n_splits=effective_cv, shuffle=True, random_state=seed)
+    gate = CalibratedClassifierCV(base, method=calibration_method, cv=calib_cv)
+    gate.fit(X_rf, is_ps)
+    if log:
+        log.info(f"[moe rf calibration] method={calibration_method} cv={effective_cv}")
+    return gate, conv_cols, best_params
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +396,8 @@ def train_moe_from_config(cfg: ALConfig, log=None) -> dict[str, Any]:
     if log:
         log.info("[moe train] training RF gate...")
     rf, conv_cols, best_params = _train_rf_gate(
-        features_df, is_ps, seed=cfg.seed_base, log=log,
+        features_df, is_ps, seed=cfg.seed_base,
+        calibration_method=cfg.moe_calibration_method, log=log,
     )
 
     # Save artifacts. Provenance stamps must agree across all three — that's

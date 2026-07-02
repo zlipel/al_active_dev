@@ -234,3 +234,50 @@ def test_rf_gate_with_two_classes_runs_grid_search():
     assert best != {}
     assert "n_estimators" in best
     assert sorted(rf.classes_) == [0, 1]
+
+
+def test_rf_gate_returns_calibrated_by_default():
+    """Two-class case: the returned gate wraps the RF in CalibratedClassifierCV."""
+    from sklearn.calibration import CalibratedClassifierCV
+
+    feats_df = _make_raw_features_df(40, seed=3)
+    is_ps = np.zeros(40, dtype=int)
+    is_ps[20:] = 1
+    np.random.default_rng(4).shuffle(is_ps)
+    gate, _conv, best = _train_rf_gate(feats_df, is_ps, seed=42, cv=3)
+    assert isinstance(gate, CalibratedClassifierCV)
+    assert best != {}   # calibration wraps the grid-searched best params
+    # Same predict_proba contract as raw RF.
+    X = feats_df[FEATURE_COLUMNS].to_numpy()
+    proba = gate.predict_proba(X)
+    assert proba.shape == (40, 2)
+    assert np.allclose(proba.sum(axis=1), 1.0, atol=1e-6)
+
+
+def test_rf_gate_calibration_none_returns_raw_rf():
+    """`calibration_method='none'` bypasses the wrap and returns the RF directly."""
+    from sklearn.ensemble import RandomForestClassifier
+
+    feats_df = _make_raw_features_df(40, seed=5)
+    is_ps = np.zeros(40, dtype=int)
+    is_ps[20:] = 1
+    np.random.default_rng(6).shuffle(is_ps)
+    rf, _conv, best = _train_rf_gate(
+        feats_df, is_ps, seed=42, cv=3, calibration_method="none",
+    )
+    assert isinstance(rf, RandomForestClassifier)
+    assert best != {}
+
+
+def test_rf_gate_isotonic_method_works():
+    """`calibration_method='isotonic'` also returns a CalibratedClassifierCV."""
+    from sklearn.calibration import CalibratedClassifierCV
+
+    feats_df = _make_raw_features_df(60, seed=7)
+    is_ps = np.zeros(60, dtype=int)
+    is_ps[30:] = 1
+    np.random.default_rng(8).shuffle(is_ps)
+    gate, _conv, _best = _train_rf_gate(
+        feats_df, is_ps, seed=42, cv=3, calibration_method="isotonic",
+    )
+    assert isinstance(gate, CalibratedClassifierCV)
