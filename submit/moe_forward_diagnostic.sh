@@ -9,7 +9,12 @@
 #SBATCH --output=moe_fwd.out
 #SBATCH --error=moe_fwd.err
 #
-# MoE forward (generation-forward) diagnostic for ONE model / front.
+# MoE forward (generation-forward) diagnostic for ONE model.
+#
+# Trains ONE surrogate set per iter on gens 0..N-1 and evaluates it on gen N.
+# Covers BOTH fronts in a single run — the model is front-agnostic; per-row
+# `front_type` (upper/lower) is inferred from the gen-N pool's row order.
+# --front is required by ALConfig but ignored by the forward evaluation.
 #
 # Reads completed AL artifacts from
 #   ${SCRATCH_AL}/<MODEL>/GENERATIONS/iteration_*/
@@ -18,8 +23,8 @@
 # with a `_start{N}` suffix so different --start_iter values coexist.
 #
 # Usage:
-#   sbatch submit/moe_forward_diagnostic.sh --model MPIPI --front upper
-#   sbatch submit/moe_forward_diagnostic.sh --model HPS_URRY --front upper --start_iter 3
+#   sbatch submit/moe_forward_diagnostic.sh --model MPIPI
+#   sbatch submit/moe_forward_diagnostic.sh --model HPS_URRY --start_iter 3
 
 set -eo pipefail
 

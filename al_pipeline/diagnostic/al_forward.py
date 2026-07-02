@@ -5,9 +5,17 @@ Sister to `al_retrospective.py`. Same iter-walk pattern (train on gens 0..N-1,
 evaluate on gen N), but instead of HV under counterfactual re-selection this
 module reports per-predictor prediction quality: RMSE, MAE, R², bias, Spearman,
 and z-space NLL for six predictors × two objectives × two spaces (z, phys) ×
-three splits (all, ps, nonps), plus the RF gate's quality on the held-out
-gen-N ground truth. This is the port of MCSC's
+three splits (all, ps, nonps) × three front_types (all, upper, lower), plus
+the RF gate's quality per iter × per front. This is the port of MCSC's
 `run_generation_forward_moe_validation.py` into al_active_dev.
+
+Front handling: the trained model is front-agnostic (it sees every training
+row regardless of front target). Non-seed generations contribute `cfg.ngen`
+upper-front candidates followed by `cfg.ngen` lower-front candidates in
+labels_gen{N}.csv row order — so the first half of each gen-M pool is
+"upper" and the second half is "lower". ONE forward run covers both fronts;
+`cfg.front` is only used to satisfy ALConfig.from_cli's required arg and is
+otherwise ignored (see moe_forward_diagnostic CLI).
 
 Framing:
   - Each iter M is a train/test split defined by the completed run's
@@ -221,16 +229,17 @@ def _nll_z_gaussian(pred_mean: np.ndarray, pred_std: np.ndarray, true: np.ndarra
 
 def _metrics_row(
     predictor: str, heldout_iter: int, property_name: str, space: str, split: str,
-    threshold: float, coverage: float,
+    front_type: str, threshold: float, coverage: float,
     pred_mean: np.ndarray, pred_std: np.ndarray | None, true: np.ndarray,
 ) -> dict[str, Any]:
-    """Build one metrics-CSV row for a (predictor × property × space × split) cell."""
+    """Build one metrics-CSV row for a (predictor × property × space × split × front_type) cell."""
     return {
         "heldout_iter": heldout_iter,
         "predictor":    predictor,
         "property":     property_name,
         "space":        space,
         "split":        split,
+        "front_type":   front_type,
         "threshold":    threshold,
         "coverage":     coverage,
         "n":            int(len(pred_mean)),
@@ -243,15 +252,36 @@ def _metrics_row(
     }
 
 
+# ---------- front inference (upper/lower per pool row) ----------
+
+def _infer_front_types(pool_labels_raw: pd.DataFrame) -> np.ndarray:
+    """
+    Split the iter-M pool into upper / lower halves by row position.
+
+    The AL loop convention (per the user): each non-seed generation contributes
+    ngen candidates targeting the upper front, then ngen targeting the lower
+    front, in that order. features_gen{N}.csv and labels_gen{N}.csv preserve
+    that order. So for a gen-M pool of length L:
+        rows [0 : L//2]         → 'upper'
+        rows [L//2 : L]         → 'lower'
+    Handles odd L gracefully (extra row goes to 'lower'), and single-row pools
+    default to 'upper'.
+    """
+    n = len(pool_labels_raw)
+    half = n // 2
+    return np.array(["upper"] * half + ["lower"] * (n - half), dtype=object)
+
+
 # ---------- RF gate metrics ----------
 
 def _classifier_metrics_row(
-    heldout_iter: int, y_true_ps: np.ndarray, p_ps: np.ndarray, threshold: float,
+    heldout_iter: int, front_type: str,
+    y_true_ps: np.ndarray, p_ps: np.ndarray, threshold: float,
 ) -> dict[str, Any]:
-    """One-row RF-gate summary for iter M."""
+    """One-row RF-gate summary for (iter × front_type)."""
     n = len(y_true_ps)
     if n == 0:
-        return {"heldout_iter": heldout_iter, "n_candidates": 0}
+        return {"heldout_iter": heldout_iter, "front_type": front_type, "n_candidates": 0}
 
     y_pred = (p_ps >= threshold).astype(int)
 
@@ -265,6 +295,7 @@ def _classifier_metrics_row(
     n_nonps = int(n - n_ps)
     return {
         "heldout_iter":  heldout_iter,
+        "front_type":    front_type,
         "n_candidates":  n,
         "n_ps_true":     n_ps,
         "n_nonps_true":  n_nonps,
@@ -281,27 +312,38 @@ def _classifier_metrics_row(
 
 def _ranking_summary(metrics_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Average `metrics_long` across `heldout_iter` per predictor in z-space.
+    Cross-iter aggregate per predictor in z-space.
 
-    Returns one row per predictor with cross-iter aggregates; sorted by
-    `macro_mean_RMSE_z` ascending (best predictor first).
+    Returns one row per predictor with:
+      - macro_mean_RMSE_z: per-objective mean, then averaged across objectives,
+        for (split='all', front_type='all')
+      - mean_RMSE_z_{ps,nonps}: split-conditional averages across both fronts
+      - mean_RMSE_z_{upper,lower}: front-conditional averages across both splits
+      - mean_NLL_z_{ps,nonps}
+      - coverage_all_z_mean: fraction of test rows the predictor is defined on
+    Sorted by macro_mean_RMSE_z ascending (best predictor first).
     """
     z_only = metrics_df[metrics_df["space"] == "z"]
     rows: list[dict[str, Any]] = []
     for predictor, g in z_only.groupby("predictor"):
-        # macro mean = per objective mean, then averaged across objectives
-        # (matches how MCSC reports it for symmetry between exp_density & diff)
-        macro_rmse = (g[g["split"] == "all"]
+        # Cell selectors used repeatedly below.
+        def cell(split: str, front_type: str) -> pd.DataFrame:
+            return g[(g["split"] == split) & (g["front_type"] == front_type)]
+
+        # macro mean = per objective mean, then averaged across objectives.
+        macro_rmse = (cell("all", "all")
                        .groupby("property")["rmse"].mean().mean())
         row = {
             "predictor":            predictor,
             "threshold":            float(g["threshold"].dropna().iloc[0]) if g["threshold"].notna().any() else float("nan"),
-            "coverage_all_z_mean":  float(g[g["split"] == "all"]["coverage"].mean()),
+            "coverage_all_z_mean":  float(cell("all", "all")["coverage"].mean()),
             "macro_mean_RMSE_z":    float(macro_rmse) if pd.notna(macro_rmse) else float("nan"),
-            "mean_RMSE_z_ps":       float(g[g["split"] == "ps"]["rmse"].mean()),
-            "mean_RMSE_z_nonps":    float(g[g["split"] == "nonps"]["rmse"].mean()),
-            "mean_NLL_z_ps":        float(g[g["split"] == "ps"]["nll_z"].mean()),
-            "mean_NLL_z_nonps":     float(g[g["split"] == "nonps"]["nll_z"].mean()),
+            "mean_RMSE_z_ps":       float(cell("ps", "all")["rmse"].mean()),
+            "mean_RMSE_z_nonps":    float(cell("nonps", "all")["rmse"].mean()),
+            "mean_RMSE_z_upper":    float(cell("all", "upper")["rmse"].mean()),
+            "mean_RMSE_z_lower":    float(cell("all", "lower")["rmse"].mean()),
+            "mean_NLL_z_ps":        float(cell("ps", "all")["nll_z"].mean()),
+            "mean_NLL_z_nonps":     float(cell("nonps", "all")["nll_z"].mean()),
             "policy_class":         ("guarded" if predictor in PREDICTORS_GUARDED else "full_coverage"),
         }
         rows.append(row)
@@ -379,23 +421,45 @@ def run_forward(
                                       bundle.rf_converted_feature_columns)
         p_ps = classifier_p_ps(bundle.rf, X_rf)
         y_true_ps = (pool_labels_raw[aux_col].to_numpy() > 0).astype(int)
-        classifier_rows.append(_classifier_metrics_row(M, y_true_ps, p_ps, threshold))
+
+        # Per-row front inference. The AL loop's convention: first half of a
+        # non-seed generation is upper-front, second half is lower-front. See
+        # _infer_front_types. Under this design, ONE forward run covers both
+        # fronts — cfg.front is not used for training or evaluation.
+        front_types_arr = _infer_front_types(pool_labels_raw)
+        front_masks = {
+            "all":   np.ones(len(pool_labels_raw), dtype=bool),
+            "upper": front_types_arr == "upper",
+            "lower": front_types_arr == "lower",
+        }
+        splits = _split_indices(pool_labels_raw, aux_col)
+
+        # Classifier metrics per front (all + upper + lower). The RF gate
+        # predicts the same p_ps for a given row regardless of front — this
+        # slices by ground-truth front position so front-shaped gate bias
+        # (e.g. "gate does well on upper front but not lower") surfaces.
+        for front_name, front_mask in front_masks.items():
+            if not front_mask.any():
+                continue
+            classifier_rows.append(_classifier_metrics_row(
+                M, front_name, y_true_ps[front_mask], p_ps[front_mask], threshold,
+            ))
 
         # True labels in both spaces (z uses the refit scalers).
         true_phys = pool_labels_raw[[obj1, obj2]].to_numpy(dtype=np.float64)
         true_z = _transform_true_labels_to_z(pool_labels_raw, obj1, obj2, cfg_base.transform, scaler1, scaler2)
 
-        splits = _split_indices(pool_labels_raw, aux_col)
         preds = _collect_predictions(cfg_base, bundle, global_sur, moe_soft, moe_hard, pool_feats, p_ps)
 
-        # Long predictions rows — one per (row × predictor).
+        # Long predictions rows — one per (row × predictor). front_type varies
+        # per row (upper for the first half, lower for the second).
         for predictor, (mean_z, std_z) in preds.items():
             mean_phys = _invert_z_to_phys(mean_z, scaler1, scaler2, cfg_base.transform)
             for i in range(len(pool_feats)):
                 predictions_rows.append({
                     "heldout_iter":          M,
                     "original_index":        int(pool_labels_raw.index[i]),
-                    "front_type":            cfg_base.front,
+                    "front_type":            str(front_types_arr[i]),
                     "predictor":             predictor,
                     "p_ps":                  float(p_ps[i]),
                     "pred_exp_density_z":       float(mean_z[i, 0]),
@@ -410,7 +474,7 @@ def run_forward(
                     "true_is_ps":               int(y_true_ps[i]),
                 })
 
-        # Long metrics rows — per (predictor × property × space × split).
+        # Long metrics rows — per (predictor × property × space × split × front_type).
         for predictor, (mean_z, std_z) in preds.items():
             mean_phys = _invert_z_to_phys(mean_z, scaler1, scaler2, cfg_base.transform)
             valid_pred = ~np.isnan(mean_z).any(axis=1)
@@ -420,23 +484,25 @@ def run_forward(
                     std_arr = std_z[:, prop_idx] if space == "z" else None
                     true_arr = (true_z if space == "z" else true_phys)[:, prop_idx]
                     for split_name, split_mask in splits.items():
-                        # Coverage = fraction of split rows the predictor is defined on.
-                        n_split = int(split_mask.sum())
-                        if n_split == 0:
+                        for front_name, front_mask in front_masks.items():
+                            cell_mask = split_mask & front_mask
+                            n_cell = int(cell_mask.sum())
+                            if n_cell == 0:
+                                metrics_rows.append(_metrics_row(
+                                    predictor, M, prop_name, space, split_name, front_name,
+                                    threshold, coverage=0.0,
+                                    pred_mean=np.array([]), pred_std=None, true=np.array([]),
+                                ))
+                                continue
+                            eval_mask = cell_mask & valid_pred
+                            coverage = float(eval_mask.sum() / n_cell)
                             metrics_rows.append(_metrics_row(
-                                predictor, M, prop_name, space, split_name, threshold,
-                                coverage=0.0, pred_mean=np.array([]), pred_std=None, true=np.array([]),
+                                predictor, M, prop_name, space, split_name, front_name,
+                                threshold, coverage=coverage,
+                                pred_mean=pred_arr[eval_mask],
+                                pred_std=std_arr[eval_mask] if std_arr is not None else None,
+                                true=true_arr[eval_mask],
                             ))
-                            continue
-                        eval_mask = split_mask & valid_pred
-                        coverage = float(eval_mask.sum() / n_split)
-                        metrics_rows.append(_metrics_row(
-                            predictor, M, prop_name, space, split_name, threshold,
-                            coverage=coverage,
-                            pred_mean=pred_arr[eval_mask],
-                            pred_std=std_arr[eval_mask] if std_arr is not None else None,
-                            true=true_arr[eval_mask],
-                        ))
 
     # DataFrame + write.
     suffix = f"_start{start_iter}"
@@ -475,5 +541,7 @@ def run_forward(
         "n_iters":    n_iters,
         "obj1":       obj1,
         "obj2":       obj2,
-        "front":      cfg_base.front,
+        # Note: no "front" key. run_forward covers BOTH fronts in a single
+        # pass; front is a per-row attribute in predictions_df / metrics_df /
+        # classifier_df, not a run-level constant.
     }

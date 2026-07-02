@@ -74,14 +74,19 @@ _PREDICTOR_STYLE = {
 }
 
 
-def _plot_rmse_by_iter(metrics_df: pd.DataFrame, obj1: str, obj2: str, front: str,
-                        out_path: Path) -> None:
-    """Two-panel plot: z-space RMSE vs. iter, one line per predictor, per objective."""
+def _plot_rmse_by_iter(metrics_df: pd.DataFrame, obj1: str, obj2: str,
+                         out_path: Path) -> None:
+    """Two-panel plot: z-space RMSE vs. iter, one line per predictor, per objective.
+
+    Aggregated across both fronts (split='all', front_type='all'). Users who
+    want per-front curves can pivot the metrics_long CSV — the `front_type`
+    column carries {all, upper, lower}."""
     fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.5), dpi=200, sharex=True)
     for ax, prop in zip(axes, (obj1, obj2)):
         cell = metrics_df[
             (metrics_df["space"] == "z")
             & (metrics_df["split"] == "all")
+            & (metrics_df["front_type"] == "all")
             & (metrics_df["property"] == prop)
         ]
         for predictor in ALL_PREDICTORS:
@@ -90,12 +95,12 @@ def _plot_rmse_by_iter(metrics_df: pd.DataFrame, obj1: str, obj2: str, front: st
                 continue
             ax.plot(rows["heldout_iter"], rows["rmse"],
                     label=predictor, **_PREDICTOR_STYLE[predictor])
-        ax.set_title(f"{prop} (z-space, split=all)")
+        ax.set_title(f"{prop} (z-space, split=all, both fronts)")
         ax.set_xlabel("held-out iter")
         ax.set_ylabel("RMSE_z")
         ax.grid(True, alpha=0.3)
     axes[-1].legend(loc="upper right", fontsize=7, frameon=False)
-    fig.suptitle(f"Forward diagnostic — front={front}", fontsize=10)
+    fig.suptitle("Forward diagnostic — aggregated across upper + lower", fontsize=10)
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
@@ -117,6 +122,15 @@ def main(argv: list[str] | None = None) -> int:
     runs_root = diag_args.runs_root if diag_args.runs_root is not None else cfg_base.scratch_path
     log.info(f"reading completed-run artifacts from {runs_root}")
 
+    # cfg.front is required by ALConfig.from_cli but the forward diagnostic
+    # covers both fronts in one run (train once, evaluate against both halves
+    # of every gen-N pool). Warn if the user thought otherwise.
+    log.warning(
+        "--front is required by ALConfig but is IGNORED by the forward "
+        "diagnostic. One run covers both fronts; front is a per-row "
+        "attribute in the outputs (front_type column)."
+    )
+
     out = run_forward(
         runs_root=runs_root,
         model=cfg_base.model,
@@ -131,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     plot_path = diag_dir / f"forward_rmse{suffix}.png"
     if len(out["metrics_df"]) > 0:
         _plot_rmse_by_iter(
-            out["metrics_df"], cfg_base.obj1, cfg_base.obj2, cfg_base.front, plot_path,
+            out["metrics_df"], cfg_base.obj1, cfg_base.obj2, plot_path,
         )
         log.info(f"wrote plot: {plot_path}")
 

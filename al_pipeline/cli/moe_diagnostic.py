@@ -132,8 +132,10 @@ def main(argv: list[str] | None = None) -> int:
         log=log,
     )
 
-    # Suffix all outputs by start_iter so sweeps don't clobber each other.
-    suffix = f"_start{diag_args.start_iter}"
+    # Filenames include both front and start_iter so sibling upper/lower
+    # jobs don't clobber each other (retrospective results ARE front-specific
+    # because acquisition depends on front).
+    suffix = f"_{cfg_base.front}_start{diag_args.start_iter}"
     diag_dir = cfg_base.paths.diagnostic_dir
     plot_path = diag_dir / f"retrospective_hv{suffix}.png"
     _plot_hv(out["trajectory"], plot_path)
@@ -144,6 +146,7 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps({
         "target_hv":            out["target_hv"],
         "rounds_to_95pct_hv":   r2,
+        "front":                cfg_base.front,
         "start_iter":           diag_args.start_iter,
         "summary_csv":          str(diag_dir / f"retrospective_summary{suffix}.csv"),
         "trajectory_json":      str(diag_dir / f"retrospective_trajectory{suffix}.json"),
