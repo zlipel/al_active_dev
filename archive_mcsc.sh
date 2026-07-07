@@ -39,7 +39,7 @@
 #   ./archive_mcsc.sh --runs-root /path/to/runs    # override runs/ location
 #   ./archive_mcsc.sh --archive-root /path/dest    # override archive/ location
 
-set -euo pipefail
+set -eo pipefail
 shopt -s nullglob
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
