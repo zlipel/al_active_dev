@@ -1,313 +1,256 @@
 # cross_paths/model_io.py
 #
-# Merged from cross_paths/io.py and cross_paths/io_test.py.
-# Canonical implementation: io_test.py (correct local path, separate if/else branches).
+# Row 8 beam-surrogate-cleanup: the file is a thin, drift-safe wrapper around
+# `al_pipeline.surrogates.load_surrogate` + the ported numba featurizer.
 #
-# Changes vs either source file:
-#   - All path resolution uses ALPaths instances (no hardcoded strings, no os.getcwd heuristic)
-#   - GPR checkpoint: tries al_pipeline naming first, falls back to legacy (no _{front}) with warning
-#   - Normalization stats: handles both old {std_normal_dict, maxS} and new {means, stds, max_S} formats
-#   - standard_normalize_features (scalar version, unused) removed
-#   - Dead commented-out code blocks removed
-#   - Imports for gpr_model, data_preprocessing_gpr, sequence_featurizer* come from al_pipeline
+# Removed vs. the pre-refactor version:
+#   * `_fit_label_scalers`  — refit `PowerTransformer` at load time on the
+#     labeled data. Discarded the persisted scalers the AL surrogate used;
+#     drift-prone. Bundles now expose the scalers baked into `MoEBundle`
+#     (via each `GPRExpert.label_scaler1/2`), shared under
+#     `label_scaler_scope='all'`.
+#   * `standard_normalize_features_vec`  — reimplemented feature normalization
+#     with hardcoded column indices and a JSON side-channel. Normalization
+#     now happens inside `Surrogate.predict_design`; the caller passes raw
+#     featurizer output DataFrames.
+#   * `sequence_featurizer_numba` / `sequence_featurizer` imports off
+#     `PYTHONPATH`. Ported to
+#     `al_pipeline.featurization.sequence_featurizer_numba` and imported by
+#     dotted path here.
+#
+# The public surface preserved for beam_search.py / run_beams_mpi.py:
+#   * `load_all_models(paths, db_dir) -> {model: BeamBundle}` (kept for API
+#     compat; a single-model wrapper around `load_beam_bundle`).
+#   * `predict_labels_for_sequences(bundle, seqs, ..., feat_threads=1)`
+#     returns z-space means (B, 2) matching the pre-refactor signature so
+#     `predict_candidate_frames` in beam_search.py is untouched by Row 8.
+#     Row 9 (`feat/beam-policy`) will collapse this call into the policy
+#     layer alongside the physical + gate outputs from `predict_design`.
 
 from __future__ import annotations
-import json
-import warnings
+
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
-import gpytorch
 import numpy as np
+import pandas as pd
 import torch
-from sklearn.preprocessing import PowerTransformer
-from time import time
 
+from al_pipeline.core.config import ALConfig
 from al_pipeline.core.paths import ALPaths
-from al_pipeline.training.ml_models import MultitaskGPRegressionModel
-from al_pipeline.data_prep.data_loading import load_dataset
-
-import sequence_featurizer_numba as sff   # fast featurizer (must be on PYTHONPATH)
-import sequence_featurizer as sf           # slower / reference featurizer
-
-
-# ---------------------------------------------------------------------------
-# Compatibility shims for legacy on-disk formats
-# ---------------------------------------------------------------------------
-
-def _load_norm_stats(path: Path) -> dict:
-    """
-    Load normalization_stats.json, handling both on-disk formats:
-
-    al_pipeline format (new):
-        {"means": {feat: float}, "stds": {feat: float}, "min_L": ..., "max_L": ..., "max_S": ...}
-
-    Legacy format (old calculate_normalization_stats.py):
-        {"std_normal_dict": {feat: [mean, std]}, "min_L": ..., "max_L": ..., "maxS": ...}
-    """
-    with open(path) as f:
-        raw = json.load(f)
-    if "means" in raw:
-        return raw  # al_pipeline format — pass through
-    elif "std_normal_dict" in raw:
-        warnings.warn(
-            "Legacy normalization_stats.json format detected. "
-            "Regenerate by re-running training with al_pipeline.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        snd = raw["std_normal_dict"]
-        return {
-            "means": {k: v[0] for k, v in snd.items()},
-            "stds":  {k: v[1] for k, v in snd.items()},
-            "min_L": raw["min_L"],
-            "max_L": raw["max_L"],
-            "max_S": raw["maxS"],
-        }
-    else:
-        raise ValueError(f"Unrecognized normalization_stats.json schema in {path}")
-
-
-def _resolve_gpr_checkpoint(paths: ALPaths) -> Path:
-    """
-    Try the al_pipeline checkpoint name first (includes _{front}).
-    Fall back to the legacy name (no _{front} suffix) with a deprecation warning.
-    Raise FileNotFoundError if neither exists.
-    """
-    new_path = paths.gpr_multitask_chkpt(temp=False)
-    if new_path.exists():
-        return new_path
-
-    # Legacy pattern: GPR_iter{N}_{ehvi_variant}_{exploration_strategy}_{transform}.pt
-    old_name = (
-        f"GPR_iter{paths.iteration}_"
-        f"{paths.ehvi_variant}_"
-        f"{paths.exploration_strategy}_"
-        f"{paths.transform}.pt"
-    )
-    old_path = paths.models_dir / old_name
-    if old_path.exists():
-        warnings.warn(
-            f"Legacy checkpoint name detected: {old_path.name}. "
-            "Retrain with al_pipeline to use new naming convention (includes _{front}).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return old_path
-
-    raise FileNotFoundError(
-        f"GPR checkpoint not found.\n  Tried: {new_path}\n  Tried: {old_path}"
-    )
+from al_pipeline.featurization.sequence_featurizer_numba import (
+    SequenceFeaturizer as SequenceFeaturizerNumba,
+)
+from al_pipeline.surrogates import DesignPrediction, Surrogate, load_surrogate
+from al_pipeline.surrogates.moe import MoESurrogate
 
 
 # ---------------------------------------------------------------------------
-# Data structures
+# Bundle
 # ---------------------------------------------------------------------------
 
 @dataclass
-class ModelResources:
+class BeamBundle:
+    """Everything the beam-search MPI dispatch needs for one model.
+
+    ``surrogate`` handles featurization + normalization + prediction end to
+    end via ``predict_design``. The other fields carry the labeled iter-N
+    training-set arrays the beam uses for start selection (III.2) and the
+    endpoints-CSV bookkeeping (III.8): both physical objective values
+    (``labels_exp_density``, ``labels_diff``) and the regime label
+    (``density``).
+
+    ``label_scalers`` is a ``(scaler1, scaler2)`` pair matching the shared
+    scalers from ``MoEBundle`` (both experts hold identical instances under
+    ``label_scaler_scope='all'``). Row 8's `predict_labels_for_sequences`
+    doesn't use them, but ``beam_search.beam_search_paths`` still calls
+    ``label_scalers[i].transform`` to place the start sequence in z-space —
+    keep them exposed until Row 9 replaces that path.
+    """
     model_name: str
-    model: gpytorch.models.ExactGP
-    likelihood: gpytorch.likelihoods.Likelihood
-    label_scalers: Tuple[PowerTransformer, PowerTransformer]  # (exp_density, diff)
+    surrogate: Surrogate
     sequences: List[str]
-    features: np.ndarray
-    labels: np.ndarray
-    normalization_stats: dict
-    featurizer_fast: object
-    featurizer_slow: object
-    device: torch.device
-    feature_dim: int
+    features: pd.DataFrame                    # raw featurizer output (N, 29)
+    labels_exp_density: np.ndarray            # (N,) physical
+    labels_diff: np.ndarray                   # (N,) physical
+    labels_density: np.ndarray | None         # (N,) physical or None if column absent
+    start_regime: np.ndarray | None           # (N,) bool: density > 0
+    label_scaler1: Any                        # inherits from persisted MoE / GPRExpert
+    label_scaler2: Any
+    featurizer: SequenceFeaturizerNumba
+
+    @property
+    def labels(self) -> np.ndarray:
+        """(N, 2) physical labels stacked as (exp_density, diff) for legacy callers."""
+        return np.stack([self.labels_exp_density, self.labels_diff], axis=-1)
+
+    @property
+    def label_scalers(self) -> tuple:
+        """(scaler1, scaler2) tuple — pre-refactor compat for beam_search_paths."""
+        return (self.label_scaler1, self.label_scaler2)
 
 
 # ---------------------------------------------------------------------------
-# Label scalers
+# Loader
 # ---------------------------------------------------------------------------
 
-def _fit_label_scalers(
-    labels_exp: torch.Tensor,
-    labels_diff: torch.Tensor,
-) -> Tuple[Tuple[PowerTransformer, PowerTransformer], torch.Tensor, torch.Tensor]:
-    s1 = PowerTransformer(method="yeo-johnson", standardize=True)
-    s2 = PowerTransformer(method="yeo-johnson", standardize=True)
-    y1 = torch.tensor(
-        s1.fit_transform(labels_exp.view(-1, 1)), dtype=torch.float32
-    ).flatten()
-    y2 = torch.tensor(
-        s2.fit_transform(labels_diff.view(-1, 1)), dtype=torch.float32
-    ).flatten()
-    return (s1, s2), y1, y2
+def _cfg_from_paths(paths: ALPaths, *, db_path: Path) -> ALConfig:
+    """Build a minimal `ALConfig` from an `ALPaths` for surrogate loading.
+
+    Beam prepare_endpoints hands us an `ALPaths` (the pre-Row-8 API). The
+    surrogate loader wants an `ALConfig` — so lift the fields the loader
+    reads: base_path/scratch_path, iteration, model, front,
+    ehvi/exploration/transform, train_model_type='moe', obj1/obj2/aux1_obj1.
+
+    ``ALConfig.paths`` is a derived @property, so we can't hand it in
+    directly; we pass the underlying ``base_path`` / ``scratch_path`` and
+    let the config reconstruct the equivalent ``ALPaths``.
+    """
+    return ALConfig(
+        model=paths.model,
+        iteration=paths.iteration,
+        front=paths.front,
+        ehvi_variant=paths.ehvi_variant,
+        exploration_strategy=paths.exploration_strategy,
+        transform=paths.transform,
+        mc_ehvi=paths.mc_ehvi,
+        base_path=Path(paths.base_path),
+        scratch_path=Path(paths.scratch_path),
+        db_path=Path(db_path),
+        train_model_type="moe",
+        obj1="exp_density",
+        obj2="diff",
+        aux1_obj1="density",
+    )
 
 
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
+def _scaler_pair_from_surrogate(surrogate: Surrogate) -> tuple:
+    """Extract ``(label_scaler1, label_scaler2)`` from an MoE surrogate.
 
-def load_model_bundle(
+    Both experts hold identical instances under ``label_scaler_scope='all'``
+    — read them off the PS expert. Global GPR surrogates don't persist
+    scalers (see `GlobalGPRSurrogate.predict_design` docstring), so beam-side
+    consumers using ``--policy global`` in a future iteration will need a
+    separate scaler-load path.
+    """
+    if not isinstance(surrogate, MoESurrogate):
+        raise TypeError(
+            "Beam bundle currently only supports MoE surrogates for scaler "
+            "extraction. Global-GPR beam runs need scaler persistence in "
+            "kfold_training first (deferred, see plan §III.6)."
+        )
+    ps_expert = surrogate.bundle.ps_expert
+    return (ps_expert.label_scaler1, ps_expert.label_scaler2)
+
+
+def load_beam_bundle(
     paths: ALPaths,
     db_dir: str | Path,
-    device: Optional[torch.device] = None,
-) -> ModelResources:
-    """
-    Load a single model bundle (weights, likelihood, scalers, featurizers,
-    sequences, normalization stats) using an ALPaths instance for all path
-    resolution.
+    *,
+    device: torch.device | str = "cpu",
+) -> BeamBundle:
+    """Load the full beam-side bundle for one model at ``paths.iteration``.
+
+    Pulls the surrogate through `al_pipeline.surrogates.load_surrogate`,
+    loads the labeled features + both objective labels + the ``density``
+    regime column (per III.8 of the beam plan), and instantiates the numba
+    featurizer against the FF database at ``db_dir``.
 
     Parameters
     ----------
     paths : ALPaths
-        Fully-populated ALPaths instance (model, iteration, front, etc.).
-        Provides all file locations: features_csv, labels_csv, seq_gen_txt,
-        norm_stats, models_dir.
+        Fully-populated. Provides features_csv, labels_csv, seq_gen_txt.
     db_dir : str or Path
-        Path to the sequence feature databases directory.
-    device : torch.device, optional
-        Inference device. Defaults to CPU.
+        Directory containing ``ff_db.py`` and the model parameter files.
+    device : torch.device
+        Passed to `load_surrogate`. Beam runs CPU-only by default.
     """
+    del device  # load_surrogate handles device internally; beam is CPU-only
     db_dir = Path(db_dir)
+    cfg = _cfg_from_paths(paths, db_path=db_dir)
 
-    # Resolve GPR checkpoint (al_pipeline naming, with legacy fallback)
-    ckpt_path = _resolve_gpr_checkpoint(paths)
-
-    # Validate required paths
-    required = {
+    # Existence check per §IV.pre-diagnostic-verification.
+    for name, p in {
         "features_csv": paths.features_csv,
         "labels_csv":   paths.labels_csv,
         "seq_gen_txt":  paths.seq_gen_txt,
-        "norm_stats":   paths.norm_stats,
-    }
-    for name, p in required.items():
-        if not p.exists():
+        "moe_ps":       paths.moe_ps_chkpt(temp=False),
+        "moe_nonps":    paths.moe_nonps_chkpt(temp=False),
+        "moe_rf":       paths.moe_rf_bundle(temp=False),
+    }.items():
+        if not Path(p).exists():
             raise FileNotFoundError(f"[{paths.model}] Missing {name}: {p}")
 
-    # Load features + labels
-    feats_np, exp_density_np = load_dataset(
-        str(paths.features_csv), str(paths.labels_csv), label_column="exp_density"
-    )
-    _, diff_np = load_dataset(
-        str(paths.features_csv), str(paths.labels_csv), label_column="diff"
-    )
+    surrogate = load_surrogate(cfg, temp=False)
 
-    feats = torch.tensor(feats_np, dtype=torch.float32)
-    y1 = torch.tensor(exp_density_np, dtype=torch.float32).flatten()
-    y2 = torch.tensor(diff_np, dtype=torch.float32).flatten()
+    # Load features + all three physical label columns in one shot. Load
+    # `density` alongside `exp_density` and `diff` per III.8 — the regime
+    # label is `density > 0`, the quantile axis is `exp_density`, and both
+    # need to be recorded in the endpoints CSV.
+    labels_df = pd.read_csv(paths.labels_csv)
+    features_df = pd.read_csv(paths.features_csv)
 
-    # Fit label scalers on the same data slice
-    (scaler1, scaler2), y1_scaled, y2_scaled = _fit_label_scalers(y1, y2)
-    labels_scaled = torch.stack([y1_scaled, y2_scaled], dim=-1)  # (N, 2)
+    for col in ("exp_density", "diff"):
+        if col not in labels_df.columns:
+            raise KeyError(f"[{paths.model}] labels_csv missing required column {col!r}")
+    # `density` is optional at load time but required for regime split;
+    # surface a clear error rather than silently defaulting to `exp_density`.
+    density_col = "density"
+    if density_col not in labels_df.columns:
+        raise KeyError(
+            f"[{paths.model}] labels_csv missing 'density' column — needed "
+            "for regime split (III.8). Was moe_regime_oof.py run against a "
+            "labels CSV that has this column? See plan §I.2-B."
+        )
 
-    # Load GP model
-    likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=2)
-    gp = MultitaskGPRegressionModel(feats, labels_scaled, likelihood, num_tasks=2)
+    labels_df_clean = labels_df.dropna(subset=["exp_density", "diff", density_col])
+    features_clean = features_df.loc[labels_df_clean.index].reset_index(drop=True)
+    labels_clean = labels_df_clean.reset_index(drop=True)
 
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-    gp.load_state_dict(ckpt["model"])
-    gp.eval()
-    likelihood.eval()
+    labels_exp_density = labels_clean["exp_density"].to_numpy(dtype=np.float64)
+    labels_diff = labels_clean["diff"].to_numpy(dtype=np.float64)
+    labels_density = labels_clean[density_col].to_numpy(dtype=np.float64)
+    start_regime = labels_density > 0.0
 
-    # Device placement
-    if device is None:
-        device = torch.device("cpu")
-    gp.to(device)
-    likelihood.to(device)
-    feats = feats.to(device)
-
-    # Sequences + normalization stats + featurizers
+    # Sequences — one per feature row. seq_gen_txt is the AL training
+    # sequences file; slice to the clean-index subset in case any labels were
+    # dropped above.
     with open(paths.seq_gen_txt, "r") as f:
-        seqs = [ln.strip() for ln in f if ln.strip()]
+        all_seqs = [ln.strip() for ln in f if ln.strip()]
+    if len(all_seqs) != len(labels_df):
+        raise ValueError(
+            f"[{paths.model}] sequence count mismatch: seq_gen_txt has "
+            f"{len(all_seqs)} rows but labels_csv has {len(labels_df)}"
+        )
+    sequences_clean = [all_seqs[i] for i in labels_df_clean.index]
 
-    norm_stats = _load_norm_stats(paths.norm_stats)
-    feat_fast = sff.SequenceFeaturizer(paths.model.lower(), str(db_dir))
-    feat_slow = sf.SequenceFeaturizer(paths.model.lower(), str(db_dir))
+    label_scaler1, label_scaler2 = _scaler_pair_from_surrogate(surrogate)
+    featurizer = SequenceFeaturizerNumba(paths.model.lower(), str(db_dir))
 
-    return ModelResources(
+    return BeamBundle(
         model_name=paths.model,
-        model=gp,
-        likelihood=likelihood,
-        label_scalers=(scaler1, scaler2),
-        sequences=seqs,
-        features=feats_np,
-        labels=np.stack([exp_density_np, diff_np], axis=-1),
-        normalization_stats=norm_stats,
-        featurizer_fast=feat_fast,
-        featurizer_slow=feat_slow,
-        device=device,
-        feature_dim=feats.shape[1],
+        surrogate=surrogate,
+        sequences=sequences_clean,
+        features=features_clean,
+        labels_exp_density=labels_exp_density,
+        labels_diff=labels_diff,
+        labels_density=labels_density,
+        start_regime=start_regime,
+        label_scaler1=label_scaler1,
+        label_scaler2=label_scaler2,
+        featurizer=featurizer,
     )
 
 
-def load_all_models(
-    paths: ALPaths,
-    db_dir: str | Path,
-) -> Dict[str, ModelResources]:
+def load_all_models(paths: ALPaths, db_dir: str | Path) -> Dict[str, BeamBundle]:
+    """API-compat wrapper: one-model bundle keyed by ``paths.model``.
+
+    Beam callers that predate the surrogate refactor still iterate
+    ``bundles[model_name]``. Multi-model dispatch is not currently a beam
+    concern; the caller loops over models separately.
     """
-    Load a single model bundle as a dict keyed by model name.
-    (ALPaths encodes one model; call separately for each model if needed.)
-    """
-    return {paths.model: load_model_bundle(paths, db_dir)}
-
-
-# ---------------------------------------------------------------------------
-# Feature normalization
-# ---------------------------------------------------------------------------
-
-def standard_normalize_features_vec(X: np.ndarray, normalization_stats: dict) -> np.ndarray:
-    """
-    Normalize a feature array in-place and return it.
-
-    X: shape (29,) or (N, 29)
-    Applies:
-      - divide count features and selected scalar features by sequence length
-      - min-max normalize length
-      - z-score normalize SCD, SHD, |net charge|, sum lambda, beads(+/-), mol wt
-      - scale shannon entropy: S / max_S - 1
-    """
-    means_d = normalization_stats["means"]
-    stds_d  = normalization_stats["stds"]
-    min_L   = normalization_stats["min_L"]
-    max_L   = normalization_stats["max_L"]
-    max_S   = normalization_stats["max_S"]
-
-    X = np.asarray(X)
-    denom = max_L - min_L
-
-    feat_names = ["SCD", "SHD", "|net charge|", "sum lambda", "beads(+)", "beads(-)", "mol wt"]
-    idxs  = np.array([21, 22, 23, 24, 25, 26, 28], dtype=int)
-    means = np.array([means_d[f] for f in feat_names], dtype=X.dtype)
-    stds  = np.array([stds_d[f]  for f in feat_names], dtype=X.dtype)
-
-    if X.ndim == 1:
-        L    = X[20]
-        invL = 1.0 / L
-
-        X[:20] *= invL
-        X[23]  *= invL
-        X[24]  *= invL
-        X[25]  *= invL
-        X[26]  *= invL
-        X[28]  *= invL
-
-        X[20]   = (X[20] - min_L) / denom
-        X[27]   = X[27] / max_S - 1.0
-        X[idxs] = (X[idxs] - means) / stds
-        return X
-
-    # 2D case: (N, 29)
-    L    = X[:, 20]
-    invL = 1.0 / L
-
-    X[:, :20] *= invL[:, None]
-    X[:, 23]  *= invL
-    X[:, 24]  *= invL
-    X[:, 25]  *= invL
-    X[:, 26]  *= invL
-    X[:, 28]  *= invL
-
-    X[:, 20]   = (X[:, 20] - min_L) / denom
-    X[:, 27]   = X[:, 27] / max_S - 1.0
-    X[:, idxs] = (X[:, idxs] - means[None, :]) / stds[None, :]
-    return X
+    return {paths.model: load_beam_bundle(paths, db_dir)}
 
 
 # ---------------------------------------------------------------------------
@@ -315,64 +258,46 @@ def standard_normalize_features_vec(X: np.ndarray, normalization_stats: dict) ->
 # ---------------------------------------------------------------------------
 
 def predict_labels_for_sequences(
-    bundle: ModelResources,
+    bundle: BeamBundle,
     sequences: List[str],
     return_std: bool = False,
     batch_size: int = 4096,
     feat_threads: int = 1,
-) -> np.ndarray | Tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """Batched predict in z-space via `Surrogate.predict_design`.
+
+    Preserves the pre-refactor return shape so `beam_search.beam_search_paths`
+    (which was written against z-space z outputs and does its own physical
+    inversion via ``bundle.label_scalers``) works unchanged. Row 9 will
+    replace the caller with a policy-aware path that consumes
+    `predict_design` directly (per-expert + physical + gate).
+
+    Parameters
+    ----------
+    bundle : BeamBundle
+        From `load_beam_bundle`.
+    sequences : list[str]
+        Candidates to predict.
+    return_std : bool
+        If True, return ``(mu, sd)`` in z-space rather than just ``mu``.
+    batch_size : int
+        Passed to the featurizer / surrogate for chunking. Currently the
+        surrogate reads all at once; kept for API compat.
+    feat_threads : int
+        Passed to the numba featurizer.
     """
-    Featurize → normalize → GP posterior in one call.
+    del batch_size  # surrogate batches internally; kept for API compat
+    if not sequences:
+        empty = np.zeros((0, 2), dtype=np.float64)
+        return (empty, empty) if return_std else empty
 
-    Returns scaled-prediction means (and optionally stds) in the same scaled
-    space the model was trained on. To get physical units, apply
-    bundle.label_scalers[i].inverse_transform() outside.
-    """
-    t0 = time()
-
-    # Featurize
-    feat_threads_eff = 1 if len(sequences) < 64 else feat_threads
-    X = bundle.featurizer_fast.featurize_many_fast(sequences, feat_threads_eff, as_df=False)
-
-    t1 = time()
-
-    # Normalize
-    X = standard_normalize_features_vec(X, bundle.normalization_stats)
-
-    t2 = time()
-
-    # To tensor
-    Xt = torch.tensor(X, dtype=torch.float32, device=bundle.device)
-
-    t3 = time()
-
-    # Predict in batches
-    means = []
-    bundle.model.eval()
-    bundle.likelihood.eval()
-
+    feat_threads_eff = 1 if len(sequences) < 64 else int(feat_threads)
+    X = bundle.featurizer.featurize_many_fast(
+        sequences, feat_threads_eff, as_df=True,
+    )
+    pred: DesignPrediction = bundle.surrogate.predict_design(X)
+    z_mean = np.asarray(pred.z_mean, dtype=np.float64)
     if return_std:
-        stds = []
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            for i in range(0, Xt.shape[0], batch_size):
-                xb   = Xt[i : i + batch_size]
-                post = bundle.model(xb)
-                m    = post.mean.detach().cpu().numpy()       # (B, 2)
-                v    = post.variance.detach().cpu().numpy()   # (B, 2)
-                means.append(m)
-                stds.append(np.sqrt(v))
-
-        mu = np.vstack(means)
-        sd = np.vstack(stds)
-        return mu, sd
-
-    else:
-        with torch.no_grad(), gpytorch.settings.fast_pred_var():
-            for i in range(0, Xt.shape[0], batch_size):
-                xb   = Xt[i : i + batch_size]
-                post = bundle.model(xb)
-                m    = post.mean.detach().cpu().numpy()       # (B, 2)
-                means.append(m)
-
-        mu = np.vstack(means)
-        return mu
+        z_std = np.asarray(pred.z_std, dtype=np.float64)
+        return z_mean, z_std
+    return z_mean

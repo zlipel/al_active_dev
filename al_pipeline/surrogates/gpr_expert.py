@@ -207,6 +207,31 @@ class GPRExpert:
             "diff_std_norm":        np.sqrt(var_z[:, 1]),
         }
 
+    def inverse_scale_z(self, z: np.ndarray) -> np.ndarray:
+        """Invert ``(B, 2)`` z-space values back to physical units.
+
+        Uses the persisted `label_scaler1` / `label_scaler2` for each
+        objective, then reverses the ``log`` pre-transform on the diff
+        channel when applicable. Matches the semantics of the training-time
+        `_prepare_label_array` used to fit the scalers, so a round trip
+        (physical → z via train-time scaler → physical via `inverse_scale_z`)
+        recovers the original physical value up to float rounding.
+
+        Accepts either a ``(B, 2)`` array (both objectives) or a ``(B, 2)``
+        sample from a joint z-posterior — the shape is preserved.
+        """
+        z = np.asarray(z, dtype=np.float64)
+        if z.ndim != 2 or z.shape[1] != 2:
+            raise ValueError(f"inverse_scale_z expects shape (B, 2); got {z.shape}")
+        phys = np.empty_like(z)
+        phys[:, 0] = self.label_scaler1.inverse_transform(z[:, [0]]).ravel()
+        phys[:, 1] = self.label_scaler2.inverse_transform(z[:, [1]]).ravel()
+        if self.transform == "log":
+            # Undo the log(y + 1e-8) applied to the diff channel in
+            # `_prepare_label_array` at training time.
+            phys[:, 1] = np.exp(phys[:, 1]) - 1e-8
+        return phys
+
     # ------------------------------------------------------------------
     # Checkpoint round-trip
     # ------------------------------------------------------------------

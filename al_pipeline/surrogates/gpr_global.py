@@ -27,7 +27,7 @@ import pandas as pd
 import torch
 
 from al_pipeline.data_prep.data_loading import convert_and_normalize_features
-from al_pipeline.surrogates.base import PoolPosterior, Surrogate
+from al_pipeline.surrogates.base import DesignPrediction, PoolPosterior, Surrogate
 
 
 class _MultitaskPoolPosterior(PoolPosterior):
@@ -190,6 +190,32 @@ class GlobalGPRSurrogate(Surrogate):
             post1 = models[self._obj1](X_tensor)
             post2 = models[self._obj2](X_tensor)
         return _SingletaskPoolPosterior(post1, post2)
+
+    def predict_design(self, X_raw: pd.DataFrame) -> DesignPrediction:
+        """Beam-facing prediction for the global GPR baseline.
+
+        Returns z-space mean + std; ``phys_mean`` is left as ``None`` because
+        the global GPR training path currently writes the pre-scaled
+        ``labels_norm_csv`` but does *not* persist the fitted
+        `PowerTransformer` instances. Beam's ``--policy global`` cannot
+        therefore recover physical values without refitting scalers from the
+        raw labels — the same drift risk Row 8 is removing. A follow-up
+        branch will add scaler persistence to `kfold_training`; until then,
+        MoE surrogates are the only path with a fully-specified physical
+        inversion (persisted in `GPRExpert` checkpoints).
+        """
+        pool = self.predict_pool(X_raw)
+        z_mean = np.asarray(pool.means, dtype=np.float64)
+        z_std = np.asarray(pool.stds, dtype=np.float64)
+        return DesignPrediction(
+            z_mean=z_mean,
+            z_std=z_std,
+            sigma_z=z_std,
+            phys_mean=None,
+            phys_std=None,
+            p_ps=None,
+            per_expert=None,
+        )
 
 
 def make_surrogate(

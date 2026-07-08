@@ -20,14 +20,82 @@ tomorrow) has to satisfy:
     repeatedly in its convergence loop. The posterior is computed *once* by
     `predict_pool` and reused across sample chunks — single-task GPs that
     can't joint-sample raise from `.sample(...)`.
+
+  - `Surrogate.predict_design(X_raw) -> DesignPrediction`
+    Beam-search-facing surface. Returns z-space + physical-space (via
+    persisted per-expert label scalers) + gate (if MoE) + per-expert
+    breakdown (if MoE). The beam ranks in quantile space derived from
+    physical, so physical is a required output. See §III.6 of the
+    beam-search reimplementation plan for the mixture-mechanics rationale.
+
+  - `Surrogate.predict_design_sampled(X_raw, n_samples)` (optional)
+    Sample from the z-distribution, inverse-transform each sample, then
+    average in physical. Yields the unbiased physical mean E[Y] rather than
+    the point-estimate s⁻¹(E[Z]) that `predict_design` returns. Only meant
+    for a small validation-endpoint set — never called in the beam hot loop.
 """
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 import torch
+
+
+@dataclass(frozen=True)
+class DesignPrediction:
+    """Prediction payload consumed by the beam search.
+
+    All arrays are ``(B, 2)`` with column order ``(obj1, obj2)`` matching the
+    surrogate's training configuration, unless noted. Physical values are in
+    the raw label units (e.g. g/mL for ``exp_density``, model-specific units
+    for ``diff``) — the beam runs a QuantileTransformer on ``phys_mean``
+    before ranking.
+
+    Attributes
+    ----------
+    z_mean, z_std
+        Marginal per-objective mean and std in the surrogate's normalized
+        (YJ + standardize) output space. ``z_std`` is the per-expert std for
+        single-expert surrogates; for MoE it is the mixture marginal std
+        matching ``sigma_z``.
+    sigma_z
+        Alias of ``z_std`` kept explicit to match the plan's III.6 notation.
+        For MoE-soft this is the law-of-total-variance mixture σ (includes
+        the between-expert term). For anchored / hard / global surrogates it
+        equals the underlying expert's ``z_std``.
+    phys_mean
+        Inverse-scaled ``z_mean`` in physical units. This is the *point
+        estimate* ``s⁻¹(E[Z])`` — under a nonlinear label transform (YJ) it
+        is closer to the physical median than the mean. Use
+        ``predict_design_sampled`` when an unbiased ``E[Y]`` is required for
+        validation-endpoint comparison with simulation. May be ``None`` for
+        surrogates that do not persist label scalers.
+    phys_std
+        Physical-space marginal std. ``None`` for the deterministic
+        ``predict_design`` path (delta-method transformation from ``z_std``
+        is deferred to reliability code that needs it). Populated by
+        ``predict_design_sampled`` from the sample dispersion.
+    p_ps
+        Per-candidate gate probability of PS regime under the calibrated RF.
+        ``None`` for surrogates without a gate (e.g. global GPR).
+    per_expert
+        Per-expert breakdown for MoE surrogates. Keys are ``"ps"`` and
+        ``"nonps"`` (the bundle intentionally does not carry an ``"all"``
+        expert — global-GPR comparisons go through a separately-loaded
+        `GlobalGPRSurrogate`). Each value is a nested dict with ``z_mean``,
+        ``z_std``, ``phys_mean``. ``None`` for non-MoE surrogates.
+    """
+
+    z_mean: np.ndarray
+    z_std: np.ndarray
+    sigma_z: np.ndarray
+    phys_mean: np.ndarray | None
+    phys_std: np.ndarray | None
+    p_ps: np.ndarray | None
+    per_expert: dict[str, dict[str, np.ndarray]] | None
 
 
 class PoolPosterior(ABC):
@@ -124,3 +192,36 @@ class Surrogate(ABC):
         True for multitask GPR and MoE; False for the single-task GPR mode
         (which has no cross-objective covariance and is analytic-only).
         """
+
+    @abstractmethod
+    def predict_design(self, X_raw: pd.DataFrame) -> DesignPrediction:
+        """
+        Beam-search-facing prediction surface.
+
+        Same input contract as ``predict_pool`` — raw feature rows straight
+        off the featurizer. Returns a `DesignPrediction` carrying z-space +
+        physical + (optionally) gate + per-expert outputs. The beam uses the
+        physical mean to feed a quantile transform for distance ranking; the
+        gate + per-expert values feed the anchored / hard / expert-tied
+        policies without reaching around the surrogate into the bundle.
+        """
+
+    def predict_design_sampled(
+        self, X_raw: pd.DataFrame, *, n_samples: int = 200
+    ) -> DesignPrediction:
+        """
+        Unbiased physical-space prediction via sampling.
+
+        Draws ``n_samples`` from the surrogate's joint z-posterior,
+        inverse-transforms each sample through the persisted per-expert
+        label scalers, and averages in physical to yield ``E[Y]`` and its
+        marginal std. Costs ``n_samples`` inverse-transform calls per
+        batch — only meant for the validation-endpoint set (§III.6).
+
+        Default implementation raises ``NotImplementedError``; surrogates
+        that persist label scalers override.
+        """
+        del X_raw, n_samples  # subclasses that support sampling override this
+        raise NotImplementedError(
+            f"{type(self).__name__}.predict_design_sampled is not implemented"
+        )

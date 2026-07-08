@@ -41,7 +41,7 @@ import pandas as pd
 import torch
 
 from al_pipeline.data_prep.data_loading import convert_features
-from al_pipeline.surrogates.base import PoolPosterior, Surrogate
+from al_pipeline.surrogates.base import DesignPrediction, PoolPosterior, Surrogate
 from al_pipeline.surrogates.gpr_expert import GPRExpert
 from al_pipeline.surrogates.moe_combine import soft_mixture_variance
 
@@ -505,4 +505,143 @@ class MoESurrogate(Surrogate):
             post_nonps=post_nonps,
             policy=self._policy,
             threshold=self._threshold,
+        )
+
+    def _per_expert_z_stats(
+        self, X_raw: pd.DataFrame,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return ``(p_ps, mu_z_ps, var_z_ps, mu_z_nonps, var_z_nonps)``.
+
+        Shapes: ``p_ps`` is ``(B,)``, the rest are ``(B, 2)``. Variances are
+        clipped at zero to match `GPRExpert.predict`. Used by both
+        `predict_design` and `predict_design_sampled` to avoid recomputing
+        the per-expert posteriors.
+        """
+        X_rf, _ = build_rf_features(
+            X_raw,
+            self._bundle.rf_raw_feature_columns,
+            self._bundle.rf_converted_feature_columns,
+        )
+        p_ps = classifier_p_ps(self._bundle.rf, X_rf).astype(np.float64)
+        post_ps = self._bundle.ps_expert.posterior(X_raw)
+        post_nonps = self._bundle.nonps_expert.posterior(X_raw)
+        with torch.no_grad():
+            mu_ps = post_ps.mean.detach().cpu().numpy().astype(np.float64)
+            var_ps = post_ps.variance.detach().cpu().numpy().astype(np.float64)
+            mu_nonps = post_nonps.mean.detach().cpu().numpy().astype(np.float64)
+            var_nonps = post_nonps.variance.detach().cpu().numpy().astype(np.float64)
+        var_ps = np.clip(var_ps, 0.0, None)
+        var_nonps = np.clip(var_nonps, 0.0, None)
+        return p_ps, mu_ps, var_ps, mu_nonps, var_nonps
+
+    def predict_design(self, X_raw: pd.DataFrame) -> DesignPrediction:
+        """Beam-facing prediction across both experts + the gate.
+
+        Returns a `DesignPrediction` where ``z_mean`` / ``z_std`` / ``sigma_z``
+        follow the surrogate's ``policy`` (soft mixture or hard gate), while
+        ``per_expert`` carries the raw PS / nonPS expert outputs unblended.
+        The ``expert_tied`` policy in the beam engine reads only
+        ``per_expert[start_regime]``; anchored / hard / soft policies read the
+        blended mean and (optionally) the gate.
+
+        Physical means are inverse-scaled from each expert's ``z_mean`` via
+        the persisted `label_scaler1` / `label_scaler2` (`GPRExpert.
+        inverse_scale_z`). Under ``label_scaler_scope='all'`` both experts
+        share those scalers, so the blended physical mean is
+        ``s⁻¹(p·μ_PS_z + (1-p)·μ_nonPS_z)`` computed once. This is the point
+        estimate ``s⁻¹(E[Z])`` — for the unbiased ``E[Y]`` used at validation
+        endpoints, use `predict_design_sampled`.
+        """
+        p_ps, mu_ps, var_ps, mu_nonps, var_nonps = self._per_expert_z_stats(X_raw)
+        std_ps = np.sqrt(var_ps)
+        std_nonps = np.sqrt(var_nonps)
+
+        # Per-expert physical means. Under `label_scaler_scope='all'` both
+        # experts hold the same scaler instances, but call each explicitly so
+        # a future per-regime scaler variant (mentioned in the `MoESurrogate`
+        # docstring as a beam-only future consumer) drops in without a rewrite.
+        phys_ps = self._bundle.ps_expert.inverse_scale_z(mu_ps)
+        phys_nonps = self._bundle.nonps_expert.inverse_scale_z(mu_nonps)
+
+        if self._policy == "soft":
+            p = p_ps[:, None]                                        # (B, 1) broadcast
+            mu_z = p * mu_ps + (1.0 - p) * mu_nonps                  # (B, 2)
+            var_z = np.column_stack([
+                soft_mixture_variance(
+                    p_ps, mu_ps[:, i], var_ps[:, i], mu_nonps[:, i], var_nonps[:, i],
+                )
+                for i in range(mu_ps.shape[1])
+            ])
+            std_z = np.sqrt(np.clip(var_z, 0.0, None))
+            phys_mean = self._bundle.ps_expert.inverse_scale_z(mu_z)
+        else:  # hard
+            use_ps = (p_ps >= self._threshold)[:, None]              # (B, 1)
+            mu_z = np.where(use_ps, mu_ps, mu_nonps)
+            std_z = np.where(use_ps, std_ps, std_nonps)
+            phys_mean = np.where(use_ps, phys_ps, phys_nonps)
+
+        per_expert = {
+            "ps":    {"z_mean": mu_ps,    "z_std": std_ps,    "phys_mean": phys_ps},
+            "nonps": {"z_mean": mu_nonps, "z_std": std_nonps, "phys_mean": phys_nonps},
+        }
+        return DesignPrediction(
+            z_mean=mu_z,
+            z_std=std_z,
+            sigma_z=std_z,
+            phys_mean=phys_mean,
+            phys_std=None,
+            p_ps=p_ps,
+            per_expert=per_expert,
+        )
+
+    def predict_design_sampled(
+        self, X_raw: pd.DataFrame, *, n_samples: int = 200,
+    ) -> DesignPrediction:
+        """Unbiased physical prediction via sampling — for validation endpoints only.
+
+        Reuses the analytic ``predict_design`` output for everything except
+        ``phys_mean`` and ``phys_std``, which come from averaging
+        ``n_samples`` z-space draws after per-sample inverse-transform. For
+        the soft policy the draws respect the per-candidate Bernoulli gate
+        (same routing as `MoEPoolPosterior.sample`); for hard the gate is
+        deterministic.
+
+        Cost is ~``n_samples`` inverse-transform calls per batch — cheap for
+        the ~30 validation endpoints the beam-diagnostic sim campaign
+        targets, but not something to call in the beam hot loop (III.6).
+        """
+        if n_samples < 2:
+            raise ValueError(f"n_samples must be >= 2 for sample std; got {n_samples}")
+
+        det = self.predict_design(X_raw)
+        pool = self.predict_pool(X_raw)
+        # Draw (n, B, 2) z-space samples with the policy's gate routing.
+        with torch.no_grad():
+            z_samples = pool.sample(n_samples).detach().cpu().numpy().astype(np.float64)
+
+        # Inverse-transform through the shared scalers. Reshape to (n*B, 1) so
+        # the sklearn transformer processes all draws in one call per objective.
+        n, B, _ = z_samples.shape
+        y_samples = np.empty_like(z_samples)
+        expert = self._bundle.ps_expert  # scalers shared under scope='all'
+        y_samples[..., 0] = expert.label_scaler1.inverse_transform(
+            z_samples[..., 0].reshape(-1, 1),
+        ).reshape(n, B)
+        y_samples[..., 1] = expert.label_scaler2.inverse_transform(
+            z_samples[..., 1].reshape(-1, 1),
+        ).reshape(n, B)
+        if expert.transform == "log":
+            y_samples[..., 1] = np.exp(y_samples[..., 1]) - 1e-8
+
+        phys_mean = y_samples.mean(axis=0)
+        phys_std = y_samples.std(axis=0, ddof=0)
+
+        return DesignPrediction(
+            z_mean=det.z_mean,
+            z_std=det.z_std,
+            sigma_z=det.sigma_z,
+            phys_mean=phys_mean,
+            phys_std=phys_std,
+            p_ps=det.p_ps,
+            per_expert=det.per_expert,
         )
