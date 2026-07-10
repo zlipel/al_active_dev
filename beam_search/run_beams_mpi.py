@@ -6,8 +6,9 @@ from sklearn.preprocessing import QuantileTransformer
 from mpi4py import MPI
 from time import time
  
-from cross_paths.model_io import load_all_models, predict_labels_for_sequences
+from cross_paths.model_io import load_all_models
 from cross_paths.beam_search import beam_search_paths
+from beam_search.policy import BeamPolicy
 from al_pipeline.core.paths import ALPaths
 import torch
 import numba as nb
@@ -134,8 +135,30 @@ def handoutWork(start_indices, comm, numProcesses):
         comm.send(-1, dest=idx, tag=DIETAG)
 
 
+def _build_policy(bundle, q_rho, q_diff, *, kind, start_regime,
+                  hard_threshold, reject_threshold, feat_threads):
+    """Construct a `BeamPolicy` for one start.
+
+    Called once per start inside `doWork` so ``start_regime`` can vary
+    across the AL start pool. Cheap — `BeamPolicy.__init__` only wraps
+    references to the existing bundle + transforms.
+    """
+    return BeamPolicy(
+        kind=kind,
+        surrogate=bundle.surrogate,
+        featurizer=bundle.featurizer,
+        q_rho=q_rho,
+        q_diff=q_diff,
+        start_regime=start_regime,
+        hard_threshold=hard_threshold,
+        reject_threshold=reject_threshold,
+        feat_threads=feat_threads,
+    )
+
+
 def worker(comm, groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
            quantile_tol, feat_threads, beam_width, max_steps, length_changes,
+           policy_kind, hard_threshold, reject_threshold,
            resume=False, extend_no_finished=False, extra_steps=0,
            patience=0, min_delta=0.0,
            profile_rank=-1):
@@ -144,17 +167,18 @@ def worker(comm, groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
     bundle = bundles[model]
     dummy = [bundle.sequences[0]]
 
-    # warm up numba featurizer
-    _ = bundle.featurizer_fast.featurize_many_fast(dummy, feat_threads, as_df=False)
-
-    # warm up GP / predictive path
-    _ = predict_labels_for_sequences(
-        bundle,
-        dummy,
-        return_std=False,
-        batch_size=1,
+    # warm up numba featurizer + GP posterior. Use a synthetic PS start so
+    # expert_tied/anchored_reject construction is valid during warm-up; the
+    # policy's own predict_candidates path warms up both featurizer and GP.
+    warm_policy = _build_policy(
+        bundle, q_rho, q_diff,
+        kind=policy_kind,
+        start_regime="ps" if policy_kind in ("expert_tied", "anchored_reject") else None,
+        hard_threshold=hard_threshold,
+        reject_threshold=reject_threshold,
         feat_threads=feat_threads,
     )
+    _ = warm_policy.predict_candidates(dummy)
     while True:
         stat = MPI.Status()
         start_idx = comm.recv(source=0, tag=MPI.ANY_TAG, status=stat)
@@ -165,18 +189,31 @@ def worker(comm, groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
         start_time = time()
         nb.set_num_threads(int(os.environ.get("SLURM_CPUS_PER_TASK", "1")))
         print(f"[rank {comm.Get_rank()}] after set: numba={nb.get_num_threads()} layer={nb.threading_layer()}", flush=True)
+        do_kwargs = dict(
+            groups_by_start=groups_by_start,
+            paths_dir=paths_dir,
+            bundle=bundle,
+            model=model,
+            q_rho=q_rho,
+            q_diff=q_diff,
+            quantile_tol=quantile_tol,
+            feat_threads=feat_threads,
+            beam_width=beam_width,
+            max_steps=max_steps,
+            length_changes=length_changes,
+            policy_kind=policy_kind,
+            hard_threshold=hard_threshold,
+            reject_threshold=reject_threshold,
+            resume=resume,
+            extend_no_finished=extend_no_finished,
+            extra_steps=extra_steps,
+            patience=patience,
+            min_delta=min_delta,
+        )
         if profile_rank == comm.Get_rank() and not _profiled:
             pr = cProfile.Profile()
             pr.enable()
-            doWork(
-                int(start_idx), groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
-                quantile_tol, feat_threads, beam_width, max_steps, length_changes,
-                resume=resume,
-                extend_no_finished=extend_no_finished,
-                extra_steps=extra_steps,
-                patience=patience,
-                min_delta=min_delta,
-            )
+            doWork(int(start_idx), **do_kwargs)
             pr.disable()
             _profiled = True
             s = _sysio.StringIO()
@@ -186,15 +223,7 @@ def worker(comm, groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
                 f.write(s.getvalue())
             print(f"[rank {comm.Get_rank()}] cProfile written to {profile_path}", flush=True)
         else:
-            doWork(
-                int(start_idx), groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
-                quantile_tol, feat_threads, beam_width, max_steps, length_changes,
-                resume=resume,
-                extend_no_finished=extend_no_finished,
-                extra_steps=extra_steps,
-                patience=patience,
-                min_delta=min_delta,
-            )
+            doWork(int(start_idx), **do_kwargs)
         elapsed = time() - start_time
         hrs = int(elapsed // 3600)
         mins = int((elapsed % 3600) // 60)
@@ -203,8 +232,9 @@ def worker(comm, groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
         comm.send(start_idx, dest=0)
 
 
-def doWork(start_idx, groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
+def doWork(start_idx, groups_by_start, paths_dir, bundle, model, q_rho, q_diff,
            quantile_tol, feat_threads, beam_width, max_steps, length_changes,
+           policy_kind, hard_threshold, reject_threshold,
            resume=False, extend_no_finished=False, extra_steps=0,
            patience=0, min_delta=0.0):
     if int(start_idx) not in groups_by_start:
@@ -243,9 +273,22 @@ def doWork(start_idx, groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
     u_start = float(sub["u_start"].iloc[0])
     v_start = float(sub["v_start"].iloc[0])
 
-    bundle = bundles[model]
-    s_rho, s_diff = bundle.label_scalers
+    # Row 8 wrote `start_regime` (ps/nonps) into every endpoint row per §III.8.
+    # All rows for this start_idx share it — read once from the first row.
+    start_regime = None
+    if "start_regime" in sub.columns:
+        start_regime = str(sub["start_regime"].iloc[0])
 
+    policy = _build_policy(
+        bundle, q_rho, q_diff,
+        kind=policy_kind,
+        start_regime=start_regime,
+        hard_threshold=hard_threshold,
+        reject_threshold=reject_threshold,
+        feat_threads=feat_threads,
+    )
+
+    s_rho, s_diff = policy.label_scalers
     z_rho_start = float(s_rho.transform([[rho_start]])[0, 0])
     z_diff_start = float(s_diff.transform([[diff_start]])[0, 0])
 
@@ -299,12 +342,9 @@ def doWork(start_idx, groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
 
         #_t_ep = time()
         finished, beam_tail = beam_search_paths(
-            bundles=bundles,
+            policy=policy,
             start_seq=row.start_seq,
-            model_name=model,
             uv_target=np.array([u_t, v_t], dtype=float),
-            q_rho=q_rho,
-            q_diff=q_diff,
             start_phys=start_phys,
             start_uv=start_uv,
             start_z=start_z,
@@ -314,7 +354,6 @@ def doWork(start_idx, groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
             diversity="none",
             diversity_radius=0.0,
             budget_cost=None,
-            feat_threads=feat_threads,
             length_changes=length_changes,
             axis_weights=(1.0, 1.0),
             min_positive=1e-12,
@@ -363,8 +402,6 @@ def doWork(start_idx, groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
         rho_end, diff_end = best["preds_phys"][-1]
         u_end, v_end = best["preds_uv"][-1]
 
-        bundle = bundles[model]
-        s_rho, s_diff = bundle.label_scalers
         z_rho_t = float(s_rho.transform([[rho_t]])[0, 0])
         z_diff_t = float(s_diff.transform([[diff_t]])[0, 0])
 
@@ -389,6 +426,7 @@ def doWork(start_idx, groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
             drho=float(rho_end - rho_start),
             ddiff=float(diff_end - diff_start),
             end_seq=best["path"][-1],
+            endpoint_p_ps=float(best.get("endpoint_p_ps", float("nan"))),
         ))
         rows_out.append(d)
 
@@ -449,6 +487,21 @@ def main():
                         help="Label transform (default: yeoj)")
     parser.add_argument("--mc_ehvi", action="store_true",
                         help="Use MC-EHVI checkpoint naming")
+    # --- Row 9: beam policy ---
+    parser.add_argument(
+        "--policy",
+        choices=["expert_tied", "anchored_reject", "soft", "hard", "global"],
+        default="expert_tied",
+        help=(
+            "Beam-search policy (Row 9). expert_tied is the diagnostic "
+            "primary; others are reachable but not analyzed this branch."
+        ),
+    )
+    parser.add_argument("--hard_threshold", type=float, default=0.5,
+                        help="Gate threshold for --policy hard")
+    parser.add_argument("--reject_threshold", type=float, default=0.5,
+                        help="Gate threshold for --policy anchored_reject "
+                             "(candidates confidently opposite-regime are rejected)")
     args = parser.parse_args()
 
     comm = MPI.COMM_WORLD
@@ -456,12 +509,21 @@ def main():
     size = comm.Get_size()
     model = args.model
 
-    print(f"[rank {rank}] Starting run_beams_mpi_v2 for model={model} with length_changes={args.length_changes}", flush=True)
+    print(f"[rank {rank}] Starting run_beams_mpi for model={model} policy={args.policy} length_changes={args.length_changes}", flush=True)
 
-    paths_dir = os.path.join(args.scratch_dir, "PATHS", model) if args.length_changes else os.path.join(args.scratch_dir, "PATHS_FIXED_LENGTH", model)
+    # Endpoint CSVs are policy-agnostic (same start × target grid feeds every
+    # policy); result CSVs are policy-scoped so runs don't cross-contaminate
+    # (§IV.output-layout of the plan).
+    endpoints_root = os.path.join(
+        args.scratch_dir,
+        "PATHS" if args.length_changes else "PATHS_FIXED_LENGTH",
+        model,
+    )
+    paths_dir = os.path.join(endpoints_root, args.policy)
+    os.makedirs(paths_dir, exist_ok=True)
 
     if rank == 0:
-        endpoints_csv = os.path.join(paths_dir, f"endpoints_{args.model}.csv")
+        endpoints_csv = os.path.join(endpoints_root, f"endpoints_{args.model}.csv")
         print(f"[rank 0] Loading endpoints from {endpoints_csv}", flush=True)
         endpoints_all = pd.read_csv(endpoints_csv)
     else:
@@ -502,9 +564,8 @@ def main():
     )
     bundles = load_all_models(al_paths, db_dir=os.path.join(args.db_root, "databases"))
     bundle = bundles[model]
-    labels = bundle.labels
-    rho = labels[:, 0]
-    diff = labels[:, 1]
+    rho = bundle.labels_exp_density
+    diff = bundle.labels_diff
 
     q_rho = QuantileTransformer(n_quantiles=min(1000, len(rho)), random_state=0, output_distribution="uniform").fit(rho.reshape(-1, 1))
     q_diff = QuantileTransformer(n_quantiles=min(1000, len(diff)), random_state=0, output_distribution="uniform").fit(diff.reshape(-1, 1))
@@ -521,6 +582,9 @@ def main():
         worker(
             comm, groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
             quantile_tol, args.feat_threads, args.beam_width, args.max_steps, args.length_changes,
+            policy_kind=args.policy,
+            hard_threshold=args.hard_threshold,
+            reject_threshold=args.reject_threshold,
             resume=args.resume,
             extend_no_finished=args.extend_no_finished,
             extra_steps=args.extra_steps,

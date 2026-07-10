@@ -1,7 +1,29 @@
+"""Beam-search kernel — Row 9 refactor.
+
+The kernel no longer knows about surrogates, quantile transforms, or label
+scalers. Everything policy-specific lives on ``policy`` (a `BeamPolicy`);
+the kernel just calls ``policy.predict_candidates(seqs)`` at every step.
+This lets Row 10 stack analysis + policy comparisons on top of the same
+kernel without touching this file again.
+
+Node record shape (extended for Row 9):
+
+  seq, parent, edit, z, phys, uv, dist, cost, depth, finish_du, finish_dv,
+  p_ps, reason
+
+``p_ps`` is the per-candidate gate probability under the current surrogate
+(``None`` for global). ``reason`` is one of ``"ok"``, ``"invalid_phys"``,
+``"rejected_by_gate"``; ``ok`` for finished paths, other values only appear
+on invalid candidates that never became a node (they're filtered before
+``make_node``).
+"""
+from __future__ import annotations
+
 import numpy as np
-from time import perf_counter
 from mpi4py import MPI
-from .model_io import predict_labels_for_sequences
+
+from beam_search.policy import BeamPolicy
+
 
 AA = list("ACDEFGHIKLMNPQRSTVWY")
 
@@ -12,7 +34,7 @@ def edit_unit_cost(op: str) -> int:
 
 def apply_edit(seq, op, pos, aa=None):
     if op == 'sub':
-        return seq[:pos] + aa + seq[pos+1:]
+        return seq[:pos] + aa + seq[pos + 1:]
     if op == 'ins':
         return aa + seq if pos == 'start' else seq + aa
     if op == 'del':
@@ -44,47 +66,22 @@ def enumerate_neighbors(seq, length_changes=True, sub_palette=None):
 
 # ---------------- prediction helpers ----------------
 
-def predict_candidate_frames(
-    bundles: dict,
-    model_name: str,
-    seq_list,
-    q_rho,
-    q_diff,
-    feat_threads: int = 1,
-    min_positive: float = 1e-12,
-):
+def predict_candidate_frames(policy: BeamPolicy, seq_list):
+    """Thin adapter around ``policy.predict_candidates`` for the beam loop.
+
+    Preserves the pre-Row-9 return-dict shape ({z, phys, uv, valid}) so the
+    kernel body reads the same, and adds two new keys the kernel uses to
+    populate the node record: ``p_ps`` and ``reason``.
     """
-    Predict candidates in the model's native YJ space, then map to physical and
-    quantile space for search scoring.
-
-    Returns a dict with keys:
-      - z:      (n,2) predicted means in YJ/scaled label space
-      - phys:   (n,2) physical (rho_exp, diff)
-      - uv:     (n,2) quantile coordinates
-      - valid:  (n,) boolean physical-feasibility mask
-    """
-    bundle = bundles[model_name]
-    z = predict_labels_for_sequences(
-        bundle,
-        seq_list,
-        return_std=False,
-        batch_size=min(len(seq_list), 4096),
-        feat_threads=feat_threads,
-    )
-
-    s_rho, s_diff = bundle.label_scalers
-    rho_phys = s_rho.inverse_transform(z[:, [0]]).ravel()
-    diff_phys = s_diff.inverse_transform(z[:, [1]]).ravel()
-
-    valid = np.isfinite(rho_phys) & np.isfinite(diff_phys) & (rho_phys > min_positive) & (diff_phys > min_positive)
-
-    uv = np.full((len(seq_list), 2), np.nan, dtype=float)
-    if np.any(valid):
-        uv[valid, 0] = q_rho.transform(rho_phys[valid].reshape(-1, 1)).ravel()
-        uv[valid, 1] = q_diff.transform(diff_phys[valid].reshape(-1, 1)).ravel()
-
-    phys = np.column_stack([rho_phys, diff_phys])
-    return {"z": z, "phys": phys, "uv": uv, "valid": valid}
+    pred = policy.predict_candidates(seq_list)
+    return {
+        "z":      pred.z_mean,
+        "phys":   pred.phys,
+        "uv":     pred.uv,
+        "valid":  pred.valid,
+        "p_ps":   pred.p_ps,
+        "reason": pred.reason,
+    }
 
 
 def quantile_distance(uv, uv_target, axis_weights=(1.0, 1.0)):
@@ -95,19 +92,22 @@ def quantile_distance(uv, uv_target, axis_weights=(1.0, 1.0)):
 
 # ---------------- lightweight node + reconstruction ----------------
 
-def make_node(seq, parent, edit, z, phys, uv, dist, cost, depth, finish_du, finish_dv):
+def make_node(seq, parent, edit, z, phys, uv, dist, cost, depth,
+              finish_du, finish_dv, p_ps=None, reason="ok"):
     return {
-        "seq": seq,
-        "parent": parent,
-        "edit": edit,
-        "z": z,
-        "phys": phys,
-        "uv": uv,
-        "dist": dist,
-        "cost": cost,
-        "depth": depth,
-        "finish_du": finish_du,
-        "finish_dv": finish_dv,
+        "seq":        seq,
+        "parent":     parent,
+        "edit":       edit,
+        "z":          z,
+        "phys":       phys,
+        "uv":         uv,
+        "dist":       dist,
+        "cost":       cost,
+        "depth":      depth,
+        "finish_du":  finish_du,
+        "finish_dv":  finish_dv,
+        "p_ps":       p_ps,
+        "reason":     reason,
     }
 
 
@@ -117,6 +117,8 @@ def reconstruct_record(node):
     preds_z = []
     preds_phys = []
     preds_uv = []
+    preds_p_ps = []
+    reasons = []
 
     cur = node
     while cur is not None:
@@ -124,6 +126,8 @@ def reconstruct_record(node):
         preds_z.append(cur["z"])
         preds_phys.append(cur["phys"])
         preds_uv.append(cur["uv"])
+        preds_p_ps.append(cur.get("p_ps", np.nan))
+        reasons.append(cur.get("reason", "ok"))
         if cur["edit"] is not None:
             edits.append(cur["edit"])
         cur = cur["parent"]
@@ -133,17 +137,25 @@ def reconstruct_record(node):
     preds_z.reverse()
     preds_phys.reverse()
     preds_uv.reverse()
+    preds_p_ps.reverse()
+    reasons.reverse()
 
     return {
-        "path": path,
-        "edits": edits,
-        "preds_z": np.vstack(preds_z),
+        "path":       path,
+        "edits":      edits,
+        "preds_z":    np.vstack(preds_z),
         "preds_phys": np.vstack(preds_phys),
-        "preds_uv": np.vstack(preds_uv),
-        "dist": node["dist"],
-        "cost": node["cost"],
-        "finish_du": node["finish_du"],
-        "finish_dv": node["finish_dv"],
+        "preds_uv":   np.vstack(preds_uv),
+        "preds_p_ps": np.array([np.nan if v is None else v for v in preds_p_ps], dtype=float),
+        "reasons":    list(reasons),
+        "dist":       node["dist"],
+        "cost":       node["cost"],
+        "finish_du":  node["finish_du"],
+        "finish_dv":  node["finish_dv"],
+        # Endpoint drift diagnostic per §IV.endpoints — record the tip's
+        # gate probability so the endpoints CSV can flag "policy is wrong"
+        # vs. "beam walked out of the chosen expert's domain".
+        "endpoint_p_ps": (float(node["p_ps"]) if node.get("p_ps") is not None else float("nan")),
     }
 
 
@@ -154,12 +166,9 @@ def reconstruct_many(nodes):
 # ---------------- search ----------------
 
 def beam_search_paths(
-    bundles: dict,
+    policy: BeamPolicy,
     start_seq: str,
-    model_name: str,
     uv_target,
-    q_rho,
-    q_diff,
     start_phys,
     start_uv,
     start_z=None,
@@ -169,20 +178,26 @@ def beam_search_paths(
     diversity: str = "none",
     diversity_radius: float = 0.0,
     budget_cost=None,
-    feat_threads: int = 1,
     length_changes: bool = True,
     axis_weights=(1.0, 1.0),
     min_positive: float = 1e-12,
     patience: int = 0,
     min_delta: float = 0.0,
 ):
+    """Run beam search from ``start_seq`` toward ``uv_target``.
+
+    The policy owns the surrogate, featurizer, quantile transforms, and any
+    gate thresholds — the kernel only calls ``policy.predict_candidates``.
+    ``min_positive`` here is a redundancy safety net; policy already applies
+    the same physical-validity check with the same default. Kept as a kernel
+    kwarg so callers can still tighten it independently of the policy.
+    """
     uv_target = np.asarray(uv_target, dtype=float)
     phys0 = np.asarray(start_phys, dtype=float)
     uv0 = np.asarray(start_uv, dtype=float)
 
     if start_z is None:
-        bundle = bundles[model_name]
-        s_rho, s_diff = bundle.label_scalers
+        s_rho, s_diff = policy.label_scalers
         z0 = np.array([
             float(s_rho.transform([[phys0[0]]])[0, 0]),
             float(s_diff.transform([[phys0[1]]])[0, 0]),
@@ -190,8 +205,15 @@ def beam_search_paths(
     else:
         z0 = np.asarray(start_z, dtype=float)
 
-    if not (np.isfinite(phys0[0]) and np.isfinite(phys0[1]) and phys0[0] > min_positive and phys0[1] > min_positive):
+    if not (np.isfinite(phys0[0]) and np.isfinite(phys0[1])
+            and phys0[0] > min_positive and phys0[1] > min_positive):
         raise ValueError(f"Start sequence {start_seq!r} has invalid provided start_phys={phys0}.")
+
+    # Best-effort start p_ps for the drift diagnostic. Cheap: a single-row
+    # predict on the start's featurized row. Uses the policy's own surrogate
+    # so the p_ps here matches what candidates get.
+    start_pred = policy.predict_candidates([start_seq])
+    start_p_ps = float(start_pred.p_ps[0]) if start_pred.p_ps is not None else None
 
     start = make_node(
         seq=start_seq,
@@ -205,6 +227,8 @@ def beam_search_paths(
         depth=0,
         finish_du=uv0[0] - uv_target[0],
         finish_dv=uv0[1] - uv_target[1],
+        p_ps=start_p_ps,
+        reason="ok",
     )
 
     finished = []
@@ -214,9 +238,6 @@ def beam_search_paths(
     stagnant_steps = 0
 
     for _step in range(max_steps):
-        #_L = len(beam[0]["seq"])
-        #_t0 = perf_counter()
-
         cand_meta = []
         for bi, rec in enumerate(beam):
             tip_seq = rec["seq"]
@@ -228,7 +249,6 @@ def beam_search_paths(
                 if budget_cost is not None and new_cost > budget_cost:
                     continue
                 cand_meta.append((bi, op, pos, aa, s2, new_cost))
-        #_t1 = perf_counter()
 
         if not cand_meta:
             break
@@ -239,18 +259,8 @@ def beam_search_paths(
             if s2 not in uniq_map:
                 uniq_map[s2] = len(uniq_list)
                 uniq_list.append(s2)
-        #_t2 = perf_counter()
 
-        pred = predict_candidate_frames(
-            bundles=bundles,
-            model_name=model_name,
-            seq_list=uniq_list,
-            q_rho=q_rho,
-            q_diff=q_diff,
-            feat_threads=feat_threads,
-            min_positive=min_positive,
-        )
-        #_t3 = perf_counter()
+        pred = predict_candidate_frames(policy, uniq_list)
 
         expansions = []
         new_finished = []
@@ -262,6 +272,7 @@ def beam_search_paths(
             z2 = pred["z"][k]
             phys2 = pred["phys"][k]
             uv2 = pred["uv"][k]
+            p_ps2 = (float(pred["p_ps"][k]) if pred["p_ps"] is not None else None)
             parent = beam[bi]
 
             du = uv2[0] - uv_target[0]
@@ -279,17 +290,17 @@ def beam_search_paths(
                 depth=parent["depth"] + 1,
                 finish_du=du,
                 finish_dv=dv,
+                p_ps=p_ps2,
+                reason="ok",
             )
 
             if (abs(du) <= tol[0]) and (abs(dv) <= tol[1]):
                 new_finished.append(new_rec)
             else:
                 expansions.append(new_rec)
-        #_t4 = perf_counter()
 
         finished.extend(new_finished)
         if not expansions:
-            #print(f"[TIMING beam] rank={_rank} step={_step} L={_L} n_cands={len(cand_meta)} uniq={len(uniq_list)} enum={_t1-_t0:.3f}s dedup={_t2-_t1:.3f}s predict={_t3-_t2:.3f}s expand={_t4-_t3:.3f}s sort=n/a", flush=True)
             break
 
         expansions.sort(key=lambda r: (r["dist"], r["cost"], r["depth"]))
@@ -302,9 +313,6 @@ def beam_search_paths(
             ):
                 kept_by_end[end] = r
         unique_expansions = list(kept_by_end.values())
-        #_t5 = perf_counter()
-
-        #print(f"[TIMING beam] rank={_rank} step={_step} L={_L} n_cands={len(cand_meta)} uniq={len(uniq_list)} enum={_t1-_t0:.3f}s dedup={_t2-_t1:.3f}s predict={_t3-_t2:.3f}s expand={_t4-_t3:.3f}s sort={_t5-_t4:.3f}s", flush=True)
 
         if diversity == "outcome" and len(unique_expansions) > 1 and diversity_radius > 0:
             selected = [unique_expansions[0]]
@@ -325,8 +333,8 @@ def beam_search_paths(
             stagnant_steps = 0
         else:
             stagnant_steps += 1
-        
-        if patience> 0 and stagnant_steps >= patience:
+
+        if patience > 0 and stagnant_steps >= patience:
             break
 
         if len(finished) > 5 * beam_width:

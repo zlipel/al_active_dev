@@ -90,8 +90,50 @@ def _install_ray_stub() -> None:
     sys.modules["ray"] = stub
 
 
+def _install_mpi4py_stub() -> None:
+    """Inject a minimal `mpi4py` so beam_search modules import without MPI installed.
+
+    Real mpi4py has to be built against the cluster's openmpi (see the
+    cluster bootstrap in README.md). Locally we don't run MPI code, but
+    beam_search.cross_paths.beam_search imports ``from mpi4py import MPI``
+    at module top-level to read the process rank for debug prints. The stub
+    provides a shape-faithful `COMM_WORLD.Get_rank()` returning 0 so tests
+    that import the beam module (Row 9 policy tests) don't fail at
+    collection time.
+    """
+    if "mpi4py" in sys.modules:
+        return
+    stub = types.ModuleType("mpi4py")
+
+    class _Comm:
+        def Get_rank(self):
+            return 0
+
+        def Get_size(self):
+            return 1
+
+        def Barrier(self):
+            pass
+
+    class _MPI:
+        COMM_WORLD = _Comm()
+        ANY_SOURCE = -1
+        ANY_TAG = -1
+
+        class Status:
+            def Get_source(self):
+                return 0
+
+            def Get_tag(self):
+                return 0
+
+    stub.MPI = _MPI
+    sys.modules["mpi4py"] = stub
+
+
 _install_md_calcs_stub()
 _install_ray_stub()
+_install_mpi4py_stub()
 
 
 def pytest_configure(config: pytest.Config) -> None:
