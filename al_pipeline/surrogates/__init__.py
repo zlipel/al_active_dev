@@ -1,6 +1,7 @@
-from al_pipeline.surrogates.base import PoolPosterior, Surrogate
+from al_pipeline.surrogates.base import DesignPrediction, PoolPosterior, Surrogate
 from al_pipeline.surrogates.gpr_expert import GPRExpert
 from al_pipeline.surrogates.gpr_global import GlobalGPRSurrogate, make_surrogate
+from al_pipeline.surrogates.loader import load_surrogate
 from al_pipeline.surrogates.moe import (
     MoEBundle,
     MoEPoolPosterior,
@@ -18,6 +19,7 @@ from al_pipeline.surrogates.moe_combine import (
 )
 
 __all__ = [
+    "DesignPrediction",
     "PoolPosterior",
     "Surrogate",
     "GPRExpert",
@@ -30,6 +32,7 @@ __all__ = [
     "combine_hard",
     "combine_soft",
     "load_rf_bundle",
+    "load_surrogate",
     "make_surrogate",
     "ps_guarded",
     "save_rf_bundle",

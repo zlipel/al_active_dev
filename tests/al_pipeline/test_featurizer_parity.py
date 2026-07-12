@@ -194,3 +194,44 @@ def test_alpipeline_matches_mcsc_serial(model: str):
         X_al, X_ser, rtol=1e-12, atol=1e-12,
         err_msg=f"[{model}] al_pipeline serial diverges from MCSC serial",
     )
+
+
+# --- ported numba featurizer parity ---
+#
+# After the port (Row 8 of the beam-search reimplementation), the numba
+# featurizer lives under al_pipeline and no longer requires MCSC on
+# ``PYTHONPATH``. This test validates the ported version against the
+# al_pipeline serial reference with the same tolerance the MCSC-numba
+# parity test uses.
+
+@requires_db
+@pytest.mark.parametrize("model", ["hps_urry", "hps_kr", "mpipi", "calvados"])
+def test_alpipeline_numba_matches_serial(model: str):
+    """
+    Ported al_pipeline numba == al_pipeline serial to within fastmath +
+    parallel reduction noise.
+
+    Tolerance mirrors the MCSC-numba test (rtol=1e-4, atol=1e-3): fastmath
+    reorders float summations, so bit-exact match with the serial doubles
+    isn't achievable. Empirically the discrepancy stays ~1e-6 on our test
+    sequences.
+    """
+    from al_pipeline.featurization.sequence_featurizer import SequenceFeaturizer as ALSF
+    from al_pipeline.featurization.sequence_featurizer_numba import (
+        SequenceFeaturizer as ALNF,
+    )
+
+    seqs = make_test_seqs()
+    db = str(DB_PATH)
+
+    al = ALSF(model, db)
+    nu = ALNF(model, db)
+
+    X_al = al.featurize_many(seqs).to_numpy()
+    _ = nu.featurize_many_fast(seqs[:2], feat_threads=2, as_df=False)  # JIT warm-up
+    X_nu = np.asarray(nu.featurize_many_fast(seqs, feat_threads=2, as_df=False))
+
+    np.testing.assert_allclose(
+        X_al, X_nu, rtol=1e-4, atol=1e-3,
+        err_msg=f"[{model}] al_pipeline serial diverges from al_pipeline numba",
+    )
