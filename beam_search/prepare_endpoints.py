@@ -33,6 +33,7 @@ import argparse
 import json
 import math
 import os
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -317,9 +318,14 @@ def main():
 
     rng = np.random.default_rng(args.seed)
 
+    # ALPaths type-annotates base_path/scratch_path as Path but is a frozen
+    # dataclass with no converter — passing strings makes ``scratch_path /
+    # model`` fail at property-access time. ALConfig.paths callers avoid
+    # this because ALConfig already stores Path fields; the two beam
+    # scripts get their paths from argparse (str), so we wrap here.
     al_paths = ALPaths(
-        base_path=args.home_dir,
-        scratch_path=args.scratch_dir,
+        base_path=Path(args.home_dir),
+        scratch_path=Path(args.scratch_dir),
         iteration=args.final_iter,
         front=args.front,
         model=args.model,

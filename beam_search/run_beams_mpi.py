@@ -2,6 +2,8 @@ import os
 import argparse
 import functools
 import time as _time_mod
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import QuantileTransformer
@@ -667,9 +669,11 @@ def main():
         first_shown = start_indices[:20]
         print(f"  first {len(first_shown)} pending indices      : {first_shown}", flush=True)
 
+    # ALPaths is a frozen dataclass with no str→Path converter; passing
+    # argparse strings makes ``scratch_path / model`` fail. Wrap explicitly.
     al_paths = ALPaths(
-        base_path=args.home_dir,
-        scratch_path=args.scratch_dir,
+        base_path=Path(args.home_dir),
+        scratch_path=Path(args.scratch_dir),
         iteration=args.final_iter,
         front=args.front,
         model=model,
