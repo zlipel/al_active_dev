@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=4G
 #SBATCH --time=00:30:00
-#SBATCH --output=prep_endpoints.out
-#SBATCH --error=prep_endpoints.err
+#SBATCH --output=%x_%j.out
+#SBATCH --error=%x_%j.err
 #
 # Prepare beam-search endpoint targets for one model.
 #
@@ -185,14 +185,17 @@ CMD+=("${EXTRA_FLAGS[@]}")
 echo "Running: ${CMD[*]}"
 "${CMD[@]}"
 
-# Route SLURM logs to the mode subfolder for easy tracing.
+# Route SLURM logs to the mode subfolder for easy tracing. Header uses
+# `%x_%j.out` so the scheduler-written filename is `<jobname>_<jobid>.out`
+# — reconstruct that here to find and move it.
 LENGTH_DIR="PATHS_FIXED_LENGTH"
 [[ "$LENGTH_CHANGES" == true ]] && LENGTH_DIR="PATHS"
 LOG_DEST="${SCRATCH_AL}/${LENGTH_DIR}/${MODEL}/${MODE^^}/logs"
 mkdir -p "$LOG_DEST"
-SLURM_OUT="${SLURM_SUBMIT_DIR:-.}/prep_endpoints.out"
-SLURM_ERR="${SLURM_SUBMIT_DIR:-.}/prep_endpoints.err"
-[[ -f "$SLURM_OUT" ]] && mv "$SLURM_OUT" "$LOG_DEST/prep_endpoints_${SLURM_JOB_ID:-local}.out"
-[[ -f "$SLURM_ERR" ]] && mv "$SLURM_ERR" "$LOG_DEST/prep_endpoints_${SLURM_JOB_ID:-local}.err"
+JOB_LOG_BASE="${SLURM_JOB_NAME:-prepare_endpoints}_${SLURM_JOB_ID:-local}"
+SLURM_OUT="${SLURM_SUBMIT_DIR:-.}/${JOB_LOG_BASE}.out"
+SLURM_ERR="${SLURM_SUBMIT_DIR:-.}/${JOB_LOG_BASE}.err"
+[[ -f "$SLURM_OUT" ]] && mv "$SLURM_OUT" "$LOG_DEST/${JOB_LOG_BASE}.out"
+[[ -f "$SLURM_ERR" ]] && mv "$SLURM_ERR" "$LOG_DEST/${JOB_LOG_BASE}.err"
 
 conda deactivate
