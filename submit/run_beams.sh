@@ -11,9 +11,9 @@
 # init_beams.sh — mode / policy / profile / beam_width / etc. all belong
 # there and shouldn't be re-parsed here.
 #
-# Also forwards sbatch-level flags via a `--sbatch <flag>` escape so
+# Also forwards sbatch-level flags via a `--sbatch_args <flag>` escape so
 # per-run tuning (--ntasks, --time) doesn't require editing init_beams.sh:
-#   ./submit/run_beams.sh --sbatch "--ntasks=5 --time=01:00:00" \
+#   ./submit/run_beams.sh --sbatch_args "--ntasks=5 --time=01:00:00" \
 #       --mode benchmark --policy expert_tied --profile
 #
 # Usage:
@@ -40,7 +40,7 @@ FORWARD=()
 
 usage() {
     cat <<EOF
-Usage: $0 [--models "M1 M2 M3"] [--after-prep IDS] [--sbatch "FLAGS"]
+Usage: $0 [--models "M1 M2 M3"] [--after-prep IDS] [--sbatch_args "FLAGS"]
           [flags forwarded to init_beams.sh]
 
 Wrapper-only options:
@@ -48,8 +48,8 @@ Wrapper-only options:
                         (default: HPS_URRY MPIPI CALVADOS)
   --after-prep IDS      Colon-separated prep jobids to depend on
                         (chains via sbatch --dependency=afterok:IDS)
-  --sbatch "FLAGS"      Extra sbatch-level flags — quoted string, e.g.
-                        --sbatch "--ntasks=5 --time=01:00:00"
+  --sbatch_args "FLAGS"      Extra sbatch-level flags — quoted string, e.g.
+                        --sbatch_args "--ntasks=5 --time=01:00:00"
 
 Everything else (--mode, --policy, --profile, --beam_width, etc.) is
 forwarded verbatim to submit/init_beams.sh. Run
@@ -62,7 +62,7 @@ while [[ "$#" -gt 0 ]]; do
     case $1 in
         --models)     IFS=' ' read -r -a MODELS <<< "$2"; shift ;;
         --after-prep) AFTER_PREP="$2"; shift ;;
-        --sbatch)     SBATCH_FLAGS="$2"; shift ;;
+        --sbatch_args)     SBATCH_FLAGS="$2"; shift ;;
         --help|-h)    usage ;;
         *)            FORWARD+=("$1") ;;
     esac
