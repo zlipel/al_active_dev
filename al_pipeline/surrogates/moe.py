@@ -507,6 +507,14 @@ class MoESurrogate(Surrogate):
             threshold=self._threshold,
         )
 
+    #: Chunk size for per-expert posterior calls in ``_per_expert_z_stats``.
+    #: The beam search calls ``predict_design`` on ~10⁴–10⁵ candidates per
+    #: step; a single ``posterior(X_raw)`` call at that scale OOMs cluster
+    #: nodes because gpytorch materializes intermediates whose size scales
+    #: with ``B``. 4096 matches the legacy MODEL_COMPARISON batching that
+    #: ran reliably. Subclasses / callers may override before inference.
+    INFERENCE_BATCH_SIZE: int = 4096
+
     def _per_expert_z_stats(
         self, X_raw: pd.DataFrame,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -516,6 +524,10 @@ class MoESurrogate(Surrogate):
         clipped at zero to match `GPRExpert.predict`. Used by both
         `predict_design` and `predict_design_sampled` to avoid recomputing
         the per-expert posteriors.
+
+        Batches per-expert calls at ``INFERENCE_BATCH_SIZE`` so the beam's
+        large-B usage stays within a cluster rank's memory. The RF gate is
+        cheap and runs in a single pass.
         """
         X_rf, _ = build_rf_features(
             X_raw,
@@ -523,13 +535,27 @@ class MoESurrogate(Surrogate):
             self._bundle.rf_converted_feature_columns,
         )
         p_ps = classifier_p_ps(self._bundle.rf, X_rf).astype(np.float64)
-        post_ps = self._bundle.ps_expert.posterior(X_raw)
-        post_nonps = self._bundle.nonps_expert.posterior(X_raw)
+
+        B = len(X_raw)
+        bs = int(self.INFERENCE_BATCH_SIZE)
+        mu_ps_chunks: list[np.ndarray] = []
+        var_ps_chunks: list[np.ndarray] = []
+        mu_nonps_chunks: list[np.ndarray] = []
+        var_nonps_chunks: list[np.ndarray] = []
         with torch.no_grad():
-            mu_ps = post_ps.mean.detach().cpu().numpy().astype(np.float64)
-            var_ps = post_ps.variance.detach().cpu().numpy().astype(np.float64)
-            mu_nonps = post_nonps.mean.detach().cpu().numpy().astype(np.float64)
-            var_nonps = post_nonps.variance.detach().cpu().numpy().astype(np.float64)
+            for i in range(0, B, bs):
+                X_chunk = X_raw.iloc[i : i + bs]
+                post_ps = self._bundle.ps_expert.posterior(X_chunk)
+                post_nonps = self._bundle.nonps_expert.posterior(X_chunk)
+                mu_ps_chunks.append(post_ps.mean.detach().cpu().numpy())
+                var_ps_chunks.append(post_ps.variance.detach().cpu().numpy())
+                mu_nonps_chunks.append(post_nonps.mean.detach().cpu().numpy())
+                var_nonps_chunks.append(post_nonps.variance.detach().cpu().numpy())
+
+        mu_ps = np.concatenate(mu_ps_chunks, axis=0).astype(np.float64)
+        var_ps = np.concatenate(var_ps_chunks, axis=0).astype(np.float64)
+        mu_nonps = np.concatenate(mu_nonps_chunks, axis=0).astype(np.float64)
+        var_nonps = np.concatenate(var_nonps_chunks, axis=0).astype(np.float64)
         var_ps = np.clip(var_ps, 0.0, None)
         var_nonps = np.clip(var_nonps, 0.0, None)
         return p_ps, mu_ps, var_ps, mu_nonps, var_nonps
