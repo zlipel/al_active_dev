@@ -1,11 +1,13 @@
 import os
 import argparse
+import functools
+import time as _time_mod
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import QuantileTransformer
 from mpi4py import MPI
 from time import time
- 
+
 from cross_paths.model_io import load_all_models
 from cross_paths.beam_search import beam_search_paths
 from beam_search.policy import BeamPolicy
@@ -135,6 +137,80 @@ def handoutWork(start_indices, comm, numProcesses):
         comm.send(-1, dest=idx, tag=DIETAG)
 
 
+# ---------------------------------------------------------------------------
+# --profile timing wrappers.
+#
+# Temporary — used to characterize where beam-step wall time is going
+# (featurize vs GP inference vs bookkeeping) at production batch sizes
+# (~4.9k-90k candidates). Once we've made the CPU/GPU + representation
+# decisions this whole block deletes.
+#
+# Wraps `featurizer.featurize_many_fast` and `surrogate.predict_design` in
+# place once at worker start. Featurizer + surrogate are shared across
+# every per-start policy built from the same bundle, so wrapping once
+# catches all future calls. State lives in a plain dict passed around; no
+# class, no attach ceremony.
+# ---------------------------------------------------------------------------
+
+
+def _install_timers(policy) -> dict:
+    """Wrap featurize + predict_design in place; return shared state dict."""
+    state = {
+        "featurize_ms":      [],
+        "predict_design_ms": [],
+        "batch_sizes":       [],
+    }
+    orig_featurize = policy.featurizer.featurize_many_fast
+    orig_predict_design = policy.surrogate.predict_design
+
+    @functools.wraps(orig_featurize)
+    def _featurize(seqs, *a, **kw):
+        # Batch size recorded at the featurize call — matches the
+        # unique-sequence count fed to predict_candidates one line later.
+        state["batch_sizes"].append(len(seqs))
+        t0 = _time_mod.perf_counter()
+        out = orig_featurize(seqs, *a, **kw)
+        state["featurize_ms"].append((_time_mod.perf_counter() - t0) * 1000.0)
+        return out
+
+    @functools.wraps(orig_predict_design)
+    def _predict_design(X_raw, *a, **kw):
+        t0 = _time_mod.perf_counter()
+        out = orig_predict_design(X_raw, *a, **kw)
+        state["predict_design_ms"].append((_time_mod.perf_counter() - t0) * 1000.0)
+        return out
+
+    policy.featurizer.featurize_many_fast = _featurize
+    policy.surrogate.predict_design = _predict_design
+    return state
+
+
+def _reset_timers(state: dict) -> None:
+    for buf in state.values():
+        buf.clear()
+
+
+def _timing_rows(state: dict, *, start_idx: int, du_req: float,
+                 dv_req: float, walk_ms: float) -> list[dict]:
+    """Snapshot state into per-step rows. Step 0 = start-warmup call (batch=1)."""
+    n = len(state["batch_sizes"])
+    return [
+        {
+            "start_idx":         int(start_idx),
+            "du_req":            float(du_req),
+            "dv_req":            float(dv_req),
+            "step":              k,
+            "n_cand_unique":     int(state["batch_sizes"][k]),
+            "featurize_ms":      float(state["featurize_ms"][k]),
+            "predict_design_ms": float(state["predict_design_ms"][k])
+                                 if k < len(state["predict_design_ms"])
+                                 else float("nan"),
+            "walk_ms":           float(walk_ms),
+        }
+        for k in range(n)
+    ]
+
+
 def _build_policy(bundle, q_rho, q_diff, *, kind, start_regime,
                   hard_threshold, reject_threshold, feat_threads):
     """Construct a `BeamPolicy` for one start.
@@ -161,7 +237,7 @@ def worker(comm, groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
            policy_kind, hard_threshold, reject_threshold,
            resume=False, extend_no_finished=False, extra_steps=0,
            patience=0, min_delta=0.0,
-           profile_rank=-1):
+           profile_rank=-1, profile=False):
     _profiled = False
 
     bundle = bundles[model]
@@ -179,6 +255,14 @@ def worker(comm, groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
         feat_threads=feat_threads,
     )
     _ = warm_policy.predict_candidates(dummy)
+
+    # --profile: wrap featurize + predict_design once. The bundle's
+    # featurizer + surrogate are shared with every per-start policy built
+    # later in doWork, so this catches all future calls without further
+    # attach ceremony. Per-walk resets happen inside doWork.
+    timings = _install_timers(warm_policy) if profile else None
+    if timings is not None:
+        os.makedirs(os.path.join(paths_dir, "step_timings"), exist_ok=True)
     while True:
         stat = MPI.Status()
         start_idx = comm.recv(source=0, tag=MPI.ANY_TAG, status=stat)
@@ -209,6 +293,7 @@ def worker(comm, groups_by_start, paths_dir, bundles, model, q_rho, q_diff,
             extra_steps=extra_steps,
             patience=patience,
             min_delta=min_delta,
+            timings=timings,
         )
         if profile_rank == comm.Get_rank() and not _profiled:
             pr = cProfile.Profile()
@@ -236,7 +321,7 @@ def doWork(start_idx, groups_by_start, paths_dir, bundle, model, q_rho, q_diff,
            quantile_tol, feat_threads, beam_width, max_steps, length_changes,
            policy_kind, hard_threshold, reject_threshold,
            resume=False, extend_no_finished=False, extra_steps=0,
-           patience=0, min_delta=0.0):
+           patience=0, min_delta=0.0, timings=None):
     if int(start_idx) not in groups_by_start:
         print(f"[rank {MPI.COMM_WORLD.Get_rank()}] start_idx={start_idx} not found; skipping", flush=True)
         return
@@ -287,6 +372,9 @@ def doWork(start_idx, groups_by_start, paths_dir, bundle, model, q_rho, q_diff,
         reject_threshold=reject_threshold,
         feat_threads=feat_threads,
     )
+    # Featurizer + surrogate were wrapped once at worker start; every new
+    # per-start policy transparently uses the wrapped attrs (they're the
+    # same shared objects), so no re-attach here.
 
     s_rho, s_diff = policy.label_scalers
     z_rho_start = float(s_rho.transform([[rho_start]])[0, 0])
@@ -340,7 +428,9 @@ def doWork(start_idx, groups_by_start, paths_dir, bundle, model, q_rho, q_diff,
         rho_t = float(q_rho.inverse_transform([[u_t]])[0, 0])
         diff_t = float(q_diff.inverse_transform([[v_t]])[0, 0])
 
-        #_t_ep = time()
+        if timings is not None:
+            _reset_timers(timings)
+        _t_walk = time()
         finished, beam_tail = beam_search_paths(
             policy=policy,
             start_seq=row.start_seq,
@@ -360,9 +450,25 @@ def doWork(start_idx, groups_by_start, paths_dir, bundle, model, q_rho, q_diff,
             patience=patience,
             min_delta=min_delta,
         )
-        #_ep_elapsed = time() - _t_ep
-        #_result = "finished" if finished else ("no_finished" if beam_tail else "no_valid")
-        #print(f"[TIMING endpoint] rank={_rank} start_idx={start_idx} ep={ep_idx+1}/{n_ep} L={len(row.start_seq)} elapsed={_ep_elapsed:.2f}s result={_result}", flush=True)
+        _walk_ms = (time() - _t_walk) * 1000.0
+
+        if timings is not None:
+            rows_out_t = _timing_rows(
+                timings,
+                start_idx=int(start_idx),
+                du_req=float(row.du_req),
+                dv_req=float(row.dv_req),
+                walk_ms=_walk_ms,
+            )
+            timings_path = os.path.join(
+                paths_dir, "step_timings", f"start_{start_idx:04d}.csv"
+            )
+            pd.DataFrame(rows_out_t).to_csv(
+                timings_path,
+                mode="a",
+                header=not os.path.exists(timings_path),
+                index=False,
+            )
 
         if finished:
             best = finished[0]
@@ -476,6 +582,14 @@ def main():
                         help="Minimum improvement in best distance to reset stagnation")
     parser.add_argument("--profile_rank", type=int, default=-1,
                         help="Wrap the first doWork call on this rank with cProfile (use 1 for first worker)")
+    parser.add_argument("--profile", action="store_true",
+                        help="Log per-step featurize / predict_design / predict_candidates "
+                             "wall times to <paths_dir>/step_timings/start_XXXX.csv.")
+    parser.add_argument("--mode", choices=["benchmark", "production"],
+                        default="benchmark",
+                        help="Endpoint set to consume. Reads endpoints from "
+                             "<scratch>/PATHS[_FIXED_LENGTH]/<MODEL>/<MODE>/ "
+                             "and writes results under a further <policy> subdir.")
     # ALPaths construction args — needed to resolve GPR checkpoint with the correct naming
     parser.add_argument("--front",                default="upper",
                         help="Pareto front ('upper' or 'lower')")
@@ -511,13 +625,15 @@ def main():
 
     print(f"[rank {rank}] Starting run_beams_mpi for model={model} policy={args.policy} length_changes={args.length_changes}", flush=True)
 
-    # Endpoint CSVs are policy-agnostic (same start × target grid feeds every
-    # policy); result CSVs are policy-scoped so runs don't cross-contaminate
-    # (§IV.output-layout of the plan).
+    # Endpoint CSVs are policy-agnostic but mode-scoped (benchmark vs
+    # production differ in start selection + target grid, so they get
+    # separate endpoint sets). Result CSVs nest under <MODE>/<policy>/ so
+    # policies don't cross-contaminate at the same mode.
     endpoints_root = os.path.join(
         args.scratch_dir,
         "PATHS" if args.length_changes else "PATHS_FIXED_LENGTH",
         model,
+        args.mode.upper(),
     )
     paths_dir = os.path.join(endpoints_root, args.policy)
     os.makedirs(paths_dir, exist_ok=True)
@@ -590,7 +706,8 @@ def main():
             extra_steps=args.extra_steps,
             patience=args.stagnation_patience,
             min_delta=args.stagnation_delta,
-            profile_rank=args.profile_rank
+            profile_rank=args.profile_rank,
+            profile=args.profile,
         )
 
     comm.Barrier()
