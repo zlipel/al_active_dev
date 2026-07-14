@@ -43,6 +43,12 @@ module purge
 module load "${CONDA_MODULE}"
 conda activate "${CONDA_ENV}"
 
+# Conda ships a newer libstdc++ than Stellar's /lib64/libstdc++.so.6 —
+# numpy 2.x needs GLIBCXX_3.4.29 which the system lib lacks. Prepend
+# conda's libdir so numpy's C extensions load. Must happen AFTER
+# `conda activate` so $CONDA_PREFIX is set.
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
 # prepare_endpoints.py uses `from cross_paths.model_io import ...` (unqualified),
 # so `beam_search/` needs to be on PYTHONPATH. REPO_ROOT itself is also on
 # PYTHONPATH so `from al_pipeline.core.paths import ALPaths` resolves.

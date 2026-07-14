@@ -51,12 +51,19 @@ source "${REPO_ROOT}/config/cluster.env"
 module purge
 module load "${OPENMPI_MODULE}"
 module load "${CONDA_MODULE}"
-# GPU runs: cluster.env may define CUDA_MODULE (e.g. "cudatoolkit/12.4").
-# Load it before conda so torch's CUDA detection picks it up.
+# GPU runs: cluster.env may define CUDA_MODULE (e.g. "cudatoolkit/12.9").
+# Load it before conda so torch's CUDA detection picks it up. Harmless on
+# CPU-only runs — just sets env vars.
 if [[ -n "${CUDA_MODULE:-}" ]]; then
     module load "${CUDA_MODULE}"
 fi
 conda activate "${CONDA_ENV}"
+
+# Conda ships a newer libstdc++ than Stellar's /lib64/libstdc++.so.6 —
+# numpy 2.x needs GLIBCXX_3.4.29 which the system lib lacks. Prepend
+# conda's libdir so numpy's C extensions and torch's bundled CUDA libs
+# resolve cleanly. Must happen AFTER `conda activate` so $CONDA_PREFIX is set.
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 
 # beam_search/ on PYTHONPATH so the runner's `from cross_paths.model_io ...`
 # imports resolve; REPO_ROOT so `from al_pipeline.core.paths ...` resolves.
