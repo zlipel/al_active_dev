@@ -194,11 +194,21 @@ def _reset_timers(state: dict) -> None:
 
 
 def _timing_rows(state: dict, *, start_idx: int, du_req: float,
-                 dv_req: float, walk_ms: float) -> list[dict]:
-    """Snapshot state into per-step rows. Step 0 = start-warmup call (batch=1)."""
+                 dv_req: float, walk_ms: float,
+                 progress: list[dict] | None = None) -> list[dict]:
+    """Snapshot state into per-step rows. Step 0 = start-warmup call (batch=1).
+
+    ``progress`` entries are indexed by beam _step (0, 1, ...); they align to
+    timing row k = _step + 1 because row 0 is the start-warmup predict. Rows
+    without a matching progress entry (i.e. row 0, or a truncated walk) get
+    NaN for the convergence columns.
+    """
     n = len(state["batch_sizes"])
-    return [
-        {
+    prog_by_step = {p["step"]: p for p in (progress or [])}
+    rows = []
+    for k in range(n):
+        p = prog_by_step.get(k - 1)
+        rows.append({
             "start_idx":         int(start_idx),
             "du_req":            float(du_req),
             "dv_req":            float(dv_req),
@@ -209,9 +219,13 @@ def _timing_rows(state: dict, *, start_idx: int, du_req: float,
                                  if k < len(state["predict_design_ms"])
                                  else float("nan"),
             "walk_ms":           float(walk_ms),
-        }
-        for k in range(n)
-    ]
+            "current_best":      float(p["current_best"])     if p else float("nan"),
+            "best_dist_so_far":  float(p["best_dist_so_far"]) if p else float("nan"),
+            "stagnant_steps":    int(p["stagnant_steps"])     if p else -1,
+            "n_finished":        int(p["n_finished"])         if p else -1,
+            "n_beam":            int(p["n_beam"])             if p else -1,
+        })
+    return rows
 
 
 def _build_policy(bundle, q_rho, q_diff, *, kind, start_regime,
@@ -433,6 +447,9 @@ def doWork(start_idx, groups_by_start, paths_dir, bundle, model, q_rho, q_diff,
 
         if timings is not None:
             _reset_timers(timings)
+        # Collect per-step convergence trace only when --profile is on
+        # (we key off `timings` since the two share the same output file).
+        progress_out: list[dict] | None = [] if timings is not None else None
         _t_walk = time()
         finished, beam_tail = beam_search_paths(
             policy=policy,
@@ -452,6 +469,7 @@ def doWork(start_idx, groups_by_start, paths_dir, bundle, model, q_rho, q_diff,
             min_positive=1e-12,
             patience=patience,
             min_delta=min_delta,
+            progress_out=progress_out,
         )
         _walk_ms = (time() - _t_walk) * 1000.0
 
@@ -462,6 +480,7 @@ def doWork(start_idx, groups_by_start, paths_dir, bundle, model, q_rho, q_diff,
                 du_req=float(row.du_req),
                 dv_req=float(row.dv_req),
                 walk_ms=_walk_ms,
+                progress=progress_out,
             )
             timings_path = os.path.join(
                 paths_dir, "step_timings", f"start_{start_idx:04d}.csv"

@@ -183,6 +183,7 @@ def beam_search_paths(
     min_positive: float = 1e-12,
     patience: int = 0,
     min_delta: float = 0.0,
+    progress_out: list | None = None,
 ):
     """Run beam search from ``start_seq`` toward ``uv_target``.
 
@@ -191,6 +192,11 @@ def beam_search_paths(
     ``min_positive`` here is a redundancy safety net; policy already applies
     the same physical-validity check with the same default. Kept as a kernel
     kwarg so callers can still tighten it independently of the policy.
+
+    If ``progress_out`` is a list, one dict per beam step is appended with
+    keys ``step``, ``current_best``, ``best_dist_so_far``, ``stagnant_steps``,
+    ``n_finished``, ``n_beam``. Used to calibrate stagnation_delta / patience
+    empirically without instrumenting the surrogate.
     """
     uv_target = np.asarray(uv_target, dtype=float)
     phys0 = np.asarray(start_phys, dtype=float)
@@ -333,6 +339,16 @@ def beam_search_paths(
             stagnant_steps = 0
         else:
             stagnant_steps += 1
+
+        if progress_out is not None:
+            progress_out.append({
+                "step": int(_step),
+                "current_best":     float(current_best),
+                "best_dist_so_far": float(best_dist_so_far),
+                "stagnant_steps":   int(stagnant_steps),
+                "n_finished":       int(len(finished)),
+                "n_beam":           int(len(beam)),
+            })
 
         if patience > 0 and stagnant_steps >= patience:
             break

@@ -98,10 +98,10 @@ TRANSFORM="yeoj"
 
 BEAM_WIDTH=32
 MAX_STEPS=8
-TOL_U="0.005"
-TOL_V="0.005"
-STAGNATION_PATIENCE=0
-STAGNATION_DELTA="0.0"
+TOL_U="0.003125"
+TOL_V="0.003125"
+STAGNATION_PATIENCE=20
+STAGNATION_DELTA="0.0005"
 
 FEAT_THREADS="${SLURM_CPUS_PER_TASK:-12}"
 TORCH_THREADS="${SLURM_CPUS_PER_TASK:-12}"
@@ -135,12 +135,12 @@ Common options (defaults shown):
   --front {upper,lower}             (default: upper)
   --beam_width N                    (default: 32)
   --max_steps N                     (default: 8)
-  --tol_u F --tol_v F               finish tolerance in quantile space
-                                    (default: 0.005 / 0.005)
+  --tol_u F --tol_v F               finish tolerance in quantile space per axis
+                                    (default: 0.003125 = grid_spacing/4)
   --stagnation_patience N           early-stop after N non-improving beam steps
-                                    (default: 0 → disabled)
-  --stagnation_delta F              minimum improvement to reset stagnation
-                                    (default: 0.0)
+                                    (default: 20)
+  --stagnation_delta F              minimum L2-dist improvement to reset stagnation
+                                    (default: 0.0005 ≈ 10% of L2 tol radius)
   --feat_threads N                  numba threads per rank
                                     (default: SLURM_CPUS_PER_TASK)
   --torch_threads N                 torch threads per rank
