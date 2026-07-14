@@ -51,6 +51,11 @@ source "${REPO_ROOT}/config/cluster.env"
 module purge
 module load "${OPENMPI_MODULE}"
 module load "${CONDA_MODULE}"
+# GPU runs: cluster.env may define CUDA_MODULE (e.g. "cudatoolkit/12.4").
+# Load it before conda so torch's CUDA detection picks it up.
+if [[ -n "${CUDA_MODULE:-}" ]]; then
+    module load "${CUDA_MODULE}"
+fi
 conda activate "${CONDA_ENV}"
 
 # beam_search/ on PYTHONPATH so the runner's `from cross_paths.model_io ...`
@@ -103,6 +108,7 @@ RESUME=false
 EXTEND_NO_FINISHED=false
 EXTRA_STEPS=0
 PROFILE=false
+DEVICE="cpu"
 
 EXTRA_FLAGS=()
 
@@ -144,6 +150,11 @@ Common options (defaults shown):
                                     (default: 0)
   --profile                         Log per-step featurize / predict_design ms
                                     to step_timings/start_XXXX.csv
+  --device D                        Torch device for MoE experts' GP tensors
+                                    (cpu | cuda | cuda:0 ...). Default: cpu.
+                                    GPU needs --gres=gpu:1 in --sbatch_args
+                                    plus the cluster's CUDA module loaded
+                                    inside this script (see block below).
 
 Any other flag is forwarded verbatim to run_beams_mpi.py.
 EOF
@@ -176,6 +187,7 @@ while [[ "$#" -gt 0 ]]; do
         --extend_no_finished) EXTEND_NO_FINISHED=true ;;
         --extra_steps)       EXTRA_STEPS="$2"; shift ;;
         --profile)           PROFILE=true ;;
+        --device)            DEVICE="$2"; shift ;;
         --help|-h)           usage ;;
         --)                  shift; EXTRA_FLAGS+=("$@"); break ;;
         *)                   EXTRA_FLAGS+=("$1") ;;
@@ -218,6 +230,7 @@ CMD=(python -u "${REPO_ROOT}/beam_search/run_beams_mpi.py"
 [[ "$RESUME"             == true ]] && CMD+=(--resume)
 [[ "$EXTEND_NO_FINISHED" == true ]] && CMD+=(--extend_no_finished)
 [[ "$PROFILE"            == true ]] && CMD+=(--profile)
+CMD+=(--device "$DEVICE")
 CMD+=("${EXTRA_FLAGS[@]}")
 
 NTASKS="${SLURM_NTASKS:-1}"

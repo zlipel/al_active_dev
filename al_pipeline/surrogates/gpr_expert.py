@@ -161,7 +161,12 @@ class GPRExpert:
         feats_raw = feats_raw_df[self.feature_columns]
         feat_conv = convert_features(feats_raw)
         feat_norm = apply_feature_normalizer(feat_conv, self.feature_normalizer_stats)
-        return torch.tensor(feat_norm.to_numpy(), dtype=torch.float32)
+        # Place the inference tensor on the same device as the model's
+        # training data so gpytorch's forward runs on GPU when the model
+        # was loaded with device="cuda". The 460 KB round-trip per 4096-row
+        # chunk is negligible (microseconds) vs. the GP kernel matmul.
+        device = self.model.train_inputs[0].device
+        return torch.tensor(feat_norm.to_numpy(), dtype=torch.float32, device=device)
 
     def posterior(self, feats_raw_df: pd.DataFrame) -> gpytorch.distributions.MultitaskMultivariateNormal:
         """
@@ -311,6 +316,8 @@ class GPRExpert:
         ckpt: dict,
         features_train_file: str,
         labels_train_file: str,
+        *,
+        device: "str | torch.device" = "cpu",
     ) -> "GPRExpert":
         """
         Reconstruct a live expert from a checkpoint + training data files.
@@ -324,7 +331,15 @@ class GPRExpert:
              labels_csv, re-apply this expert's own normalizer / scalers /
              transform. Guarantees the loaded expert sees the same training
              data the saved expert was fit on.
+
+        ``device`` places the reconstructed model + train tensors on the
+        requested torch device (``"cpu"`` default; ``"cuda"`` / ``"cuda:0"``
+        on GPU nodes). The checkpoint itself is deserialized on CPU first
+        (via ``torch.load(..., map_location=device)`` in the caller) and
+        then the tensors reconstructed here inherit the requested device.
         """
+        torch_device = torch.device(device)
+
         label_columns = list(ckpt["label_columns"])
         transform = ckpt["transform"]
         scaler1 = ckpt["label_scaler1"]
@@ -335,8 +350,8 @@ class GPRExpert:
 
         if "train_x_direct" in ckpt and "train_y_direct" in ckpt:
             # Temp checkpoint (augmented): direct tensors are the source of truth.
-            train_x = ckpt["train_x_direct"].float()
-            train_y = ckpt["train_y_direct"].float()
+            train_x = ckpt["train_x_direct"].float().to(torch_device)
+            train_y = ckpt["train_y_direct"].float().to(torch_device)
         else:
             # Base checkpoint: reconstruct from CSV + original_indices.
             labels_all = pd.read_csv(labels_train_file)
@@ -346,16 +361,18 @@ class GPRExpert:
 
             feat_conv = convert_features(features_raw[feature_columns])
             feat_norm = apply_feature_normalizer(feat_conv, ckpt["feature_normalizer_stats"])
-            train_x = torch.tensor(feat_norm.to_numpy(), dtype=torch.float32)
+            train_x = torch.tensor(
+                feat_norm.to_numpy(), dtype=torch.float32, device=torch_device,
+            )
 
             lab_prepared = _prepare_label_array(labels_raw, label_columns, transform)
             lab_scaled = lab_prepared.copy()
             lab_scaled[:, 0] = scaler1.transform(lab_prepared[:, [0]]).ravel()
             lab_scaled[:, 1] = scaler2.transform(lab_prepared[:, [1]]).ravel()
-            train_y = torch.tensor(lab_scaled, dtype=torch.float32)
+            train_y = torch.tensor(lab_scaled, dtype=torch.float32, device=torch_device)
 
-        likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=2)
-        model = MultitaskGPRegressionModel(train_x, train_y, likelihood, num_tasks=2)
+        likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=2).to(torch_device)
+        model = MultitaskGPRegressionModel(train_x, train_y, likelihood, num_tasks=2).to(torch_device)
         model.load_state_dict(ckpt["model_state_dict"])
         likelihood.load_state_dict(ckpt["likelihood_state_dict"])
         model.eval()

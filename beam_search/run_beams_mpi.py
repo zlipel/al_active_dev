@@ -618,6 +618,11 @@ def main():
     parser.add_argument("--reject_threshold", type=float, default=0.5,
                         help="Gate threshold for --policy anchored_reject "
                              "(candidates confidently opposite-regime are rejected)")
+    parser.add_argument("--device", default="cpu",
+                        help="Torch device for the MoE experts' GP tensors "
+                             "(cpu | cuda | cuda:0 ...). GPU nodes need the "
+                             "corresponding SLURM allocation (--gres=gpu:1) "
+                             "and CUDA module loaded in the submit script.")
     args = parser.parse_args()
 
     comm = MPI.COMM_WORLD
@@ -682,7 +687,11 @@ def main():
         transform=args.transform,
         mc_ehvi=args.mc_ehvi,
     )
-    bundles = load_all_models(al_paths, db_dir=os.path.join(args.db_root, "databases"))
+    bundles = load_all_models(
+        al_paths,
+        db_dir=os.path.join(args.db_root, "databases"),
+        device=args.device,
+    )
     bundle = bundles[model]
     rho = bundle.labels_exp_density
     diff = bundle.labels_diff
