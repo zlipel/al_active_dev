@@ -1,6 +1,7 @@
 import os
 import argparse
 import functools
+import shutil
 import time as _time_mod
 from pathlib import Path
 
@@ -644,6 +645,20 @@ def main():
     )
     paths_dir = os.path.join(endpoints_root, args.policy)
     os.makedirs(paths_dir, exist_ok=True)
+
+    # Clean slate for RESULTS/ and step_timings/ on every fresh run so
+    # per-endpoint CSVs and per-start timing rows reflect only this run's
+    # walks. `--resume` opts out — that's the codepath that intentionally
+    # picks up where a previous run left off. SLURM stdout/err lands under
+    # `logs/` (via the sbatch script's post-run move) and is preserved.
+    if rank == 0 and not args.resume:
+        for sub in ("RESULTS", "step_timings"):
+            p = os.path.join(paths_dir, sub)
+            if os.path.exists(p):
+                shutil.rmtree(p)
+                print(f"[rank 0] Cleared {p}", flush=True)
+    # Ensure workers don't start inspecting paths_dir before rank 0 finishes.
+    comm.Barrier()
 
     if rank == 0:
         endpoints_csv = os.path.join(endpoints_root, f"endpoints_{args.model}.csv")
