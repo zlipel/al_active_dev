@@ -33,6 +33,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -342,6 +343,13 @@ def main():
     parser.add_argument("--seed", type=int, default=0,
                         help="RNG seed for within-bin picks + QT construction")
 
+    parser.add_argument("--clear", action="store_true",
+                        help="Wipe the target <MODE> folder before writing new "
+                             "starts / endpoints / config. Safety: prevents "
+                             "stale RESULTS/ or step_timings/ from a previous "
+                             "prep+beam run being carried alongside a "
+                             "regenerated endpoints CSV.")
+
     # ---- ALPaths ----
     parser.add_argument("--front",                default="upper")
     parser.add_argument("--ehvi_variant",         default="epsilon")
@@ -532,6 +540,17 @@ def main():
         args.model,
         args.mode.upper(),
     )
+    # --clear: wipe the whole mode folder before writing. Explicit reset
+    # so a re-prep with different flags doesn't leave stale RESULTS/ or
+    # step_timings/ subdirs (still keyed to the previous endpoints CSV)
+    # sitting next to the new starts/endpoints. The runner already does
+    # its own RESULTS/step_timings cleanup on fresh runs, but that's
+    # keyed to (mode, policy) — a re-prep that changes the endpoints
+    # underneath a *previous* runner's cleanup would still leave
+    # mismatched artifacts. --clear handles that up front.
+    if args.clear and os.path.exists(out_dir):
+        print(f"[--clear] wiping {out_dir}", flush=True)
+        shutil.rmtree(out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     endpoints_path = os.path.join(out_dir, f"endpoints_{args.model}.csv")

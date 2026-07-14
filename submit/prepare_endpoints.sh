@@ -89,6 +89,7 @@ FRAC_NONPS="0.75"
 SEED=0
 LENGTH_CHANGES=false
 MC_EHVI=false
+CLEAR=false
 
 EXTRA_FLAGS=()
 
@@ -115,6 +116,9 @@ Common options (defaults shown):
   --seed N                          RNG seed (default: 0)
   --length_changes                  Enable length-changing edits
   --mc_ehvi                         MC-EHVI checkpoint naming
+  --clear                           Wipe the target <MODE> folder before writing
+                                    (removes stale RESULTS/step_timings from a
+                                    previous prep+beam cycle).
 
 Any other flag is forwarded verbatim to prepare_endpoints.py.
 EOF
@@ -144,6 +148,7 @@ while [[ "$#" -gt 0 ]]; do
         --seed)              SEED="$2"; shift ;;
         --length_changes)    LENGTH_CHANGES=true ;;
         --mc_ehvi)           MC_EHVI=true ;;
+        --clear)             CLEAR=true ;;
         --help|-h)           usage ;;
         --)                  shift; EXTRA_FLAGS+=("$@"); break ;;
         *)                   EXTRA_FLAGS+=("$1") ;;
@@ -186,6 +191,7 @@ fi
 
 [[ "$LENGTH_CHANGES" == true ]] && CMD+=(--length_changes)
 [[ "$MC_EHVI"        == true ]] && CMD+=(--mc_ehvi)
+[[ "$CLEAR"          == true ]] && CMD+=(--clear)
 CMD+=("${EXTRA_FLAGS[@]}")
 
 echo "Running: ${CMD[*]}"
