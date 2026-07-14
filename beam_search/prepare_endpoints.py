@@ -49,6 +49,44 @@ from al_pipeline.core.paths import ALPaths
 # ---------------------------------------------------------------------------
 
 
+def filter_reachable_starts(
+    pool_idx: np.ndarray,
+    uv: np.ndarray,
+    hull,
+    delta: float,
+) -> np.ndarray:
+    """Return the subset of ``pool_idx`` whose 4 diagonal targets at
+    ``(u ± delta, v ± delta)`` all lie inside ``hull``.
+
+    Benchmark mode uses this to avoid picking starts at the extreme corner
+    of property space. Those starts push most of their diagonals against
+    the labeled hull; the runner then marks 3 of 4 endpoints
+    ``outside_hull`` and only one diagonal actually gets a beam walk.
+    Filtering pre-empts that budget waste — a strong-PS or strong-nonPS
+    sequence one step in from each hull edge is still "strong" and has
+    all 4 diagonals in-hull.
+
+    Clipping matches the endpoints-CSV writer: ``u_target`` and
+    ``v_target`` are clipped to ``[0, 1]`` before the hull check.
+    """
+    if len(pool_idx) == 0:
+        return pool_idx
+    directions = [(+delta, +delta), (+delta, -delta),
+                  (-delta, +delta), (-delta, -delta)]
+    keep: list[int] = []
+    for idx in pool_idx:
+        u0, v0 = float(uv[int(idx), 0]), float(uv[int(idx), 1])
+        if all(
+            hull.covers(Point(
+                float(np.clip(u0 + du, 0.0, 1.0)),
+                float(np.clip(v0 + dv, 0.0, 1.0)),
+            ))
+            for du, dv in directions
+        ):
+            keep.append(int(idx))
+    return np.asarray(keep, dtype=int)
+
+
 def stratify_pool_by_grid(
     uv: np.ndarray,
     pool_idx: np.ndarray,
@@ -374,6 +412,32 @@ def main():
     ps_pool_idx = np.flatnonzero(ps_mask)
     nonps_pool_idx = np.flatnonzero(nonps_mask)
 
+    # Track pre-filter pool sizes for config.json.
+    ps_pool_size_pre = int(ps_pool_idx.size)
+    nonps_pool_size_pre = int(nonps_pool_idx.size)
+
+    # --- benchmark-mode reachability filter ---
+    # Drop starts whose 4 diagonals at ±benchmark_delta clip against the
+    # hull. Extreme-corner PS starts (u≈1, v≈0) push 3 of 4 diagonals
+    # outside the labeled distribution and burn the sim budget on
+    # outside_hull cells. Production mode intentionally uses the full
+    # 64-cell grid and expects some cells outside the hull.
+    if args.mode == "benchmark":
+        ps_pool_idx = filter_reachable_starts(
+            ps_pool_idx, uv, hull, args.benchmark_delta,
+        )
+        nonps_pool_idx = filter_reachable_starts(
+            nonps_pool_idx, uv, hull, args.benchmark_delta,
+        )
+        n_ps_dropped = ps_pool_size_pre - int(ps_pool_idx.size)
+        n_nonps_dropped = nonps_pool_size_pre - int(nonps_pool_idx.size)
+        print(
+            f"[benchmark] reachability filter @ ±{args.benchmark_delta}: "
+            f"dropped {n_ps_dropped}/{ps_pool_size_pre} PS + "
+            f"{n_nonps_dropped}/{nonps_pool_size_pre} nonPS starts "
+            f"(diagonals would clip hull)."
+        )
+
     # --- bin each pool by (u, v) ---
     ps_bins = stratify_pool_by_grid(uv, ps_pool_idx, args.ps_bins)
     nonps_bins = stratify_pool_by_grid(uv, nonps_pool_idx, args.nonps_bins)
@@ -490,8 +554,14 @@ def main():
         "stratification": {
             "ps_bins":         args.ps_bins,
             "nonps_bins":      args.nonps_bins,
-            "ps_pool_size":    int(ps_pool_idx.size),
-            "nonps_pool_size": int(nonps_pool_idx.size),
+            # Pool sizes AFTER the reachability filter (benchmark) or the
+            # threshold cut (production). ``*_pre_filter`` records the size
+            # before the reachability filter so the filter's drop rate is
+            # visible in the config log.
+            "ps_pool_size":            int(ps_pool_idx.size),
+            "nonps_pool_size":         int(nonps_pool_idx.size),
+            "ps_pool_size_pre_filter":    ps_pool_size_pre,
+            "nonps_pool_size_pre_filter": nonps_pool_size_pre,
             "ps_bins_used":    len(ps_bins),
             "nonps_bins_used": len(nonps_bins),
             "n_ps_selected":    sum(1 for r, *_ in unique_picks if r == "ps"),

@@ -27,6 +27,7 @@ if str(_BEAM_DIR) not in sys.path:
 
 from prepare_endpoints import (  # noqa: E402
     farthest_point_bin_sample,
+    filter_reachable_starts,
     make_target_deltas,
     select_benchmark_starts,
     select_production_starts,
@@ -254,3 +255,64 @@ def test_make_target_deltas_production_step_larger_than_bound_raises():
     with pytest.raises(ValueError, match="no cells"):
         make_target_deltas("production", grid_spacing=0.1, largest_delta=0.05,
                           benchmark_delta=0.02)
+
+
+# ---------------------------------------------------------------------------
+# filter_reachable_starts — benchmark-mode reachability pre-filter
+# ---------------------------------------------------------------------------
+
+from shapely.geometry import MultiPoint  # noqa: E402
+
+
+def _unit_square_hull():
+    """Convex hull of the unit square — every (u, v) ∈ [0, 1]² is inside."""
+    return MultiPoint([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]).convex_hull
+
+
+def test_reachable_filter_keeps_interior_points():
+    """A start with room to move ±delta on both axes without leaving the
+    hull survives the filter."""
+    hull = _unit_square_hull()
+    # Interior points at least delta from all four hull edges.
+    uv = np.array([[0.5, 0.5], [0.3, 0.7], [0.7, 0.3]], dtype=float)
+    pool = np.arange(3)
+    kept = filter_reachable_starts(pool, uv, hull, delta=0.1)
+    assert sorted(kept.tolist()) == [0, 1, 2]
+
+
+def test_reachable_filter_drops_corner_points():
+    """Extreme-corner starts push at least one diagonal past the hull
+    edge (via clipping) and are dropped."""
+    hull = _unit_square_hull()
+    # Add a labeled cluster in the middle so hull is smaller than [0, 1]²
+    # for a more realistic test.
+    inner_hull = MultiPoint([(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)]).convex_hull
+    uv = np.array([
+        [0.5, 0.5],   # deep interior — reachable
+        [0.9, 0.1],   # corner-adjacent — 3 of 4 diagonals push outside
+        [0.15, 0.5],  # near left edge — (-, ±) diagonals clip
+    ], dtype=float)
+    pool = np.arange(3)
+    kept = filter_reachable_starts(pool, uv, inner_hull, delta=0.1)
+    assert 0 in kept.tolist()
+    assert 1 not in kept.tolist()
+    assert 2 not in kept.tolist()
+
+
+def test_reachable_filter_empty_pool():
+    hull = _unit_square_hull()
+    kept = filter_reachable_starts(np.array([], dtype=int), np.zeros((0, 2)), hull, delta=0.1)
+    assert kept.tolist() == []
+
+
+def test_reachable_filter_respects_delta():
+    """Same starts, tighter delta → more survive. Loose delta → more dropped."""
+    hull = _unit_square_hull()
+    uv = np.array([[0.05, 0.5], [0.5, 0.5], [0.95, 0.5]], dtype=float)
+    pool = np.arange(3)
+    # Δ=0.02: all three interior enough to stay in-hull after clipping.
+    kept_small = filter_reachable_starts(pool, uv, hull, delta=0.02)
+    # Δ=0.1: the two near-edge starts clip.
+    kept_big = filter_reachable_starts(pool, uv, hull, delta=0.1)
+    assert len(kept_small) >= len(kept_big)
+    assert 1 in kept_big.tolist()  # centre point always survives
