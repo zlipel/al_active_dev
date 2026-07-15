@@ -96,10 +96,10 @@ EHVI_VARIANT="epsilon"
 EXPLORATION_STRATEGY="kriging_believer"
 TRANSFORM="yeoj"
 
-BEAM_WIDTH=32
+BEAM_WIDTH=64
 MAX_STEPS=8
-TOL_U="0.003125"
-TOL_V="0.003125"
+TOL_U="0.00625"
+TOL_V="0.00625"
 STAGNATION_PATIENCE=20
 STAGNATION_DELTA="0.0005"
 
@@ -133,10 +133,10 @@ Common options (defaults shown):
   --policy P                        (default: expert_tied)
   --final_iter N                    (default: 10)
   --front {upper,lower}             (default: upper)
-  --beam_width N                    (default: 32)
+  --beam_width N                    (default: 64)
   --max_steps N                     (default: 8)
   --tol_u F --tol_v F               finish tolerance in quantile space per axis
-                                    (default: 0.003125 = grid_spacing/4)
+                                    (default: 0.00625 = grid_spacing/2)
   --stagnation_patience N           early-stop after N non-improving beam steps
                                     (default: 20)
   --stagnation_delta F              minimum L2-dist improvement to reset stagnation
