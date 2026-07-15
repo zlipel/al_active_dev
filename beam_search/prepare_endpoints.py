@@ -350,6 +350,15 @@ def main():
                              "prep+beam run being carried alongside a "
                              "regenerated endpoints CSV.")
 
+    parser.add_argument("--exclude_starts", type=str, default="",
+                        help="Comma-separated seq indices to drop from both "
+                             "PS + nonPS pools before stratification. Use to "
+                             "replace a start that a previous beam run showed "
+                             "was stuck in a bad sequence-space pocket (all "
+                             "targets no_finished with large final_bdsf). The "
+                             "picker will select a different member of the "
+                             "same (u, v) bin.")
+
     # ---- ALPaths ----
     parser.add_argument("--front",                default="upper")
     parser.add_argument("--ehvi_variant",         default="epsilon")
@@ -419,6 +428,23 @@ def main():
     nonps_mask = (~start_regime) & (p_ps_all <= args.thresh_lower)
     ps_pool_idx = np.flatnonzero(ps_mask)
     nonps_pool_idx = np.flatnonzero(nonps_mask)
+
+    # --- user-requested start exclusion ---
+    # Drop known-bad starts (typically ones a previous beam run showed were
+    # stuck in a sequence-space pocket). Applied before stratification so the
+    # picker naturally chooses a different member of the same (u, v) bin.
+    excluded_starts = set()
+    if args.exclude_starts.strip():
+        excluded_starts = {int(x) for x in args.exclude_starts.split(",") if x.strip()}
+        ps_dropped = np.isin(ps_pool_idx, list(excluded_starts))
+        nonps_dropped = np.isin(nonps_pool_idx, list(excluded_starts))
+        ps_pool_idx = ps_pool_idx[~ps_dropped]
+        nonps_pool_idx = nonps_pool_idx[~nonps_dropped]
+        print(
+            f"[exclude_starts] dropped {int(ps_dropped.sum())} PS + "
+            f"{int(nonps_dropped.sum())} nonPS starts from pools "
+            f"(seq_idx in {sorted(excluded_starts)})."
+        )
 
     # Track pre-filter pool sizes for config.json.
     ps_pool_size_pre = int(ps_pool_idx.size)
@@ -570,6 +596,7 @@ def main():
             "lower":  args.thresh_lower,
             "higher": args.thresh_higher,
         },
+        "excluded_starts": sorted(excluded_starts),
         "stratification": {
             "ps_bins":         args.ps_bins,
             "nonps_bins":      args.nonps_bins,

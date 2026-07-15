@@ -90,6 +90,7 @@ SEED=0
 LENGTH_CHANGES=false
 MC_EHVI=false
 CLEAR=false
+EXCLUDE_STARTS=""
 
 EXTRA_FLAGS=()
 
@@ -119,6 +120,11 @@ Common options (defaults shown):
   --clear                           Wipe the target <MODE> folder before writing
                                     (removes stale RESULTS/step_timings from a
                                     previous prep+beam cycle).
+  --exclude_starts LIST             Comma-separated seq indices to drop from
+                                    both pools before stratification. Use to
+                                    replace a stuck start (all targets
+                                    no_finished) with a different member of
+                                    the same (u, v) bin.
 
 Any other flag is forwarded verbatim to prepare_endpoints.py.
 EOF
@@ -149,6 +155,7 @@ while [[ "$#" -gt 0 ]]; do
         --length_changes)    LENGTH_CHANGES=true ;;
         --mc_ehvi)           MC_EHVI=true ;;
         --clear)             CLEAR=true ;;
+        --exclude_starts)    EXCLUDE_STARTS="$2"; shift ;;
         --help|-h)           usage ;;
         --)                  shift; EXTRA_FLAGS+=("$@"); break ;;
         *)                   EXTRA_FLAGS+=("$1") ;;
@@ -192,6 +199,7 @@ fi
 [[ "$LENGTH_CHANGES" == true ]] && CMD+=(--length_changes)
 [[ "$MC_EHVI"        == true ]] && CMD+=(--mc_ehvi)
 [[ "$CLEAR"          == true ]] && CMD+=(--clear)
+[[ -n "$EXCLUDE_STARTS" ]]      && CMD+=(--exclude_starts "$EXCLUDE_STARTS")
 CMD+=("${EXTRA_FLAGS[@]}")
 
 echo "Running: ${CMD[*]}"
