@@ -172,9 +172,14 @@ def convergence_summary(paths: pd.DataFrame, timings: pd.DataFrame, tol_axis: fl
     if nf.empty:
         return
 
+    # Order matters: if the walk ran the full max_steps budget, that's the
+    # actual termination reason regardless of what final_stagn happens to be.
+    # Only walks that stopped short of max_steps can attribute to patience.
+    # (Patience may or may not have been enabled — we can't tell from the CSV
+    # data alone, but n_steps >= MAX_STEPS_HINT is unambiguous.)
     nf["stopped_by"] = np.where(
-        nf["final_stagn"] >= STAGNANT_PATIENCE, "patience",
-        np.where(nf["n_steps"] >= MAX_STEPS_HINT, "max_steps", "other")
+        nf["n_steps"] >= MAX_STEPS_HINT, "max_steps",
+        np.where(nf["final_stagn"] >= STAGNANT_PATIENCE, "patience", "other")
     )
     print(f"\n--- no_finished stopped_by ({len(nf)} targets) ---")
     print(nf["stopped_by"].value_counts().to_string())
