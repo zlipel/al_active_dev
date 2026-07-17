@@ -34,17 +34,35 @@ conda activate "${CONDA_ENV}"
 
 MODEL=""
 ITER=""
-RHO_i=""
-RHO_f=""
-DRHO=""
+DENSITY_START=""
+DENSITY_END=""
+DENSITY_STEP=""
 INIT=false
-CHECK_RHO=false
+VALIDATION=""
+CHECK_DENSITIES=false
 CHECK_FINISHED=false
 CPUS_PER_SIM=""
 MAX_CORES=""
 
 usage() {
-    echo "Usage: $0 [--init] --model MODEL --iter ITER --rho_i RHO_i --rho_f RHO_f --drho DRHO [--check_rho] [--check_finished] [--cpus_per_sim N] [--max_cores N]"
+    cat <<EOF
+Usage: $0 --model MODEL --density_start F --density_end F --density_step F [SCOPE] [check flags]
+
+Scope (exactly one of):
+  --init                            Initial-condition seed sims
+                                    (reads \$SCRATCH_AL/<MODEL>/SIMULATIONS/EOS/seq_init.txt)
+  --iter N                          AL iteration N sims
+                                    (reads \$SCRATCH_AL/<MODEL>/GENERATIONS/iteration_N/SIMULATIONS/EOS/)
+  --validation SCOPE                Post-hoc validation sims (e.g. --validation BENCHMARK)
+                                    (reads \$SCRATCH_AL/<MODEL>/VALIDATION/SCOPE/SIMULATIONS/EOS/seq_<scope-lower>.txt
+                                     — populate first with gen_validation_sequences.py)
+
+Optional:
+  --check_densities                 Sanity-check requested density range
+  --check_finished                  Skip already-completed sims
+  --cpus_per_sim N                  CPUs per sim partition (default: make_eos.py = 12)
+  --max_cores N                     Total core ceiling (default: make_eos.py = 1500)
+EOF
     exit 1
 }
 
@@ -52,11 +70,12 @@ while [[ "$#" -gt 0 ]]; do
     case $1 in
         --init) INIT=true ;;
         --iter) ITER="$2"; shift ;;
+        --validation) VALIDATION="$2"; shift ;;
         --model) MODEL="$2"; shift ;;
-        --rho_i) RHO_i="$2"; shift ;;
-        --rho_f) RHO_f="$2"; shift ;;
-        --drho) DRHO="$2"; shift ;;
-        --check_rho) CHECK_RHO=true ;;
+        --density_start) DENSITY_START="$2"; shift ;;
+        --density_end)   DENSITY_END="$2";   shift ;;
+        --density_step)  DENSITY_STEP="$2";  shift ;;
+        --check_densities) CHECK_DENSITIES=true ;;
         --check_finished) CHECK_FINISHED=true ;;
         --cpus_per_sim) CPUS_PER_SIM="$2"; shift ;;
         --max_cores) MAX_CORES="$2"; shift ;;
@@ -65,7 +84,7 @@ while [[ "$#" -gt 0 ]]; do
     shift
 done
 
-if [[ -z "$MODEL" || -z "$RHO_i" || -z "$RHO_f" || -z "$DRHO" ]]; then
+if [[ -z "$MODEL" || -z "$DENSITY_START" || -z "$DENSITY_END" || -z "$DENSITY_STEP" ]]; then
     echo "Error: Missing required arguments"
     usage
 fi
@@ -74,9 +93,21 @@ if [[ "$INIT" == true ]]; then
     SEQS="${SCRATCH_AL}/$MODEL/SIMULATIONS/EOS/seq_init.txt"
     PAR_DIR="${SCRATCH_AL}/$MODEL/SIMULATIONS/EOS/"
     LOG_TAG="init"
+elif [[ -n "$VALIDATION" ]]; then
+    SCOPE_LOWER="${VALIDATION,,}"
+    PAR_DIR="${SCRATCH_AL}/$MODEL/VALIDATION/$VALIDATION/SIMULATIONS/EOS"
+    SEQS="$PAR_DIR/seq_${SCOPE_LOWER}.txt"
+    LOG_TAG="validation_${SCOPE_LOWER}"
+    if [[ ! -f "$SEQS" ]]; then
+        echo "Error: sequence file not found at $SEQS" >&2
+        echo "  Populate first via:" >&2
+        echo "    python \"${REPO_ROOT}/beam_search/tools/gen_validation_sequences.py\" \\" >&2
+        echo "        --scratch_dir \"\$SCRATCH_AL\" --length_changes --scope $VALIDATION" >&2
+        exit 1
+    fi
 else
     if [[ -z "$ITER" ]]; then
-        echo "Error: --iter is required when --init is not set"
+        echo "Error: exactly one of --init / --iter / --validation is required"
         usage
     fi
     PAR_DIR="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS"
@@ -109,9 +140,9 @@ mkdir -p "$LOGS"
 cd "$PAR_DIR"   # polymerize / gendata drop temp files into cwd
 
 CMD="python \"${REPO_ROOT}/simulation/make_eos.py\" --model \"$MODEL\" --num_polymers 100 \
-    --density_start \"$RHO_i\" --density_end \"$RHO_f\" --density_step \"$DRHO\" \
+    --density_start \"$DENSITY_START\" --density_end \"$DENSITY_END\" --density_step \"$DENSITY_STEP\" \
     --sequence_file \"$SEQS\" --parent_dir \"$PAR_DIR\""
-[[ "$CHECK_RHO" == true ]] && CMD+=" --check_densities"
+[[ "$CHECK_DENSITIES" == true ]] && CMD+=" --check_densities"
 [[ "$CHECK_FINISHED" == true ]] && CMD+=" --check_finished"
 [[ -n "$CPUS_PER_SIM" ]] && CMD+=" --cpus_per_sim $CPUS_PER_SIM"
 [[ -n "$MAX_CORES" ]] && CMD+=" --max_cores $MAX_CORES"

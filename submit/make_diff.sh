@@ -36,21 +36,32 @@ MODEL=""
 ITER=""
 NSIM="5"
 INIT=false
+VALIDATION=""
 CHECK_FIN=false
 QUICK=""
 CPUS_PER_SIM=""
 MAX_CORES=""
 
 usage() {
-    echo "Usage: $0 --model MODEL [--iter ITER] [--init] [--nsim NSIM] [--check_finished] [--quick N] [--cpus_per_sim N] [--max_cores N]"
-    echo "  --model MODEL        : Name of model used (e.g., hps_urry, mpipi)"
-    echo "  --iter ITER          : Active learning iteration (if not init)"
-    echo "  --init               : Whether these are initial sequences"
-    echo "  --nsim NSIM          : Number of independent production simulations (default: 5)"
-    echo "  --check_finished     : Check if simulations are all done"
-    echo "  --quick N            : Quick mode (use fixed init density without EOS lookup)"
-    echo "  --cpus_per_sim N     : CPUs per simulation partition (default: 16)"
-    echo "  --max_cores N        : Total core ceiling for this submission (default: 480)"
+    cat <<EOF
+Usage: $0 --model MODEL [SCOPE] [--nsim N] [--check_finished] [--quick N] [--cpus_per_sim N] [--max_cores N]
+
+Scope (exactly one of):
+  --init                            Initial-condition seed sims
+                                    (reads \$SCRATCH_AL/<MODEL>/SIMULATIONS/DIFF/seq_init.txt)
+  --iter N                          AL iteration N sims
+                                    (reads \$SCRATCH_AL/<MODEL>/GENERATIONS/iteration_N/SIMULATIONS/DIFF/)
+  --validation SCOPE                Post-hoc validation sims (e.g. --validation BENCHMARK)
+                                    (reads \$SCRATCH_AL/<MODEL>/VALIDATION/SCOPE/SIMULATIONS/DIFF/seq_<scope-lower>.txt
+                                     — populate first with gen_validation_sequences.py)
+
+Optional:
+  --nsim NSIM                       Independent production runs (default: 5)
+  --check_finished                  Skip already-completed sims
+  --quick N                         Fixed init density without EOS lookup
+  --cpus_per_sim N                  CPUs per sim partition (default: make_diff.py = 16)
+  --max_cores N                     Total core ceiling (default: make_diff.py = 480)
+EOF
     exit 1
 }
 
@@ -58,6 +69,7 @@ while [[ "$#" -gt 0 ]]; do
     case $1 in
         --init) INIT=true ;;
         --iter) ITER="$2"; shift ;;
+        --validation) VALIDATION="$2"; shift ;;
         --model) MODEL="$2"; shift ;;
         --nsim) NSIM="$2"; shift ;;
         --check_finished) CHECK_FIN=true ;;
@@ -78,9 +90,21 @@ if [[ "$INIT" == true ]]; then
     SEQS="${SCRATCH_AL}/$MODEL/SIMULATIONS/DIFF/seq_init.txt"
     PAR_DIR="${SCRATCH_AL}/$MODEL/SIMULATIONS/DIFF/"
     LOG_TAG="init"
+elif [[ -n "$VALIDATION" ]]; then
+    SCOPE_LOWER="${VALIDATION,,}"
+    PAR_DIR="${SCRATCH_AL}/$MODEL/VALIDATION/$VALIDATION/SIMULATIONS/DIFF"
+    SEQS="$PAR_DIR/seq_${SCOPE_LOWER}.txt"
+    LOG_TAG="validation_${SCOPE_LOWER}"
+    if [[ ! -f "$SEQS" ]]; then
+        echo "Error: sequence file not found at $SEQS" >&2
+        echo "  Populate first via:" >&2
+        echo "    python \"${REPO_ROOT}/beam_search/tools/gen_validation_sequences.py\" \\" >&2
+        echo "        --scratch_dir \"\$SCRATCH_AL\" --length_changes --scope $VALIDATION" >&2
+        exit 1
+    fi
 else
     if [[ -z "$ITER" ]]; then
-        echo "Error: --iter is required when --init is not set"
+        echo "Error: exactly one of --init / --iter / --validation is required"
         usage
     fi
     cp "${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS/seq_gen$ITER.txt" \
