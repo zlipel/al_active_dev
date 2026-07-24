@@ -9,7 +9,25 @@ from enum import Enum
 from joblib import Parallel, delayed
 import ray
 import sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+
+# Add the repo root to sys.path so `analysis` and `external` (siblings of
+# `simulation/`) are importable when run as a script. The pathlib chain is
+# equivalent to os.path.dirname(os.path.abspath(__file__)) + '/..', just
+# resolved to an absolute path once so downstream logic can reason about it.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+# Ray workers spawn as fresh subprocesses and do NOT inherit the driver's
+# sys.path modifications — they only see PYTHONPATH from the environment.
+# Without this, `@ray.remote def _calc_exp_density` fails to import
+# `analysis.process_eos_sims` on the worker with ModuleNotFoundError, even
+# though the driver import above works fine.
+_existing_pp = os.environ.get("PYTHONPATH", "")
+if _REPO_ROOT not in _existing_pp.split(os.pathsep):
+    os.environ["PYTHONPATH"] = (
+        f"{_REPO_ROOT}{os.pathsep}{_existing_pp}" if _existing_pp else _REPO_ROOT
+    )
 from external.core import (
     calculate_mass,
     calc_box_length,

@@ -191,7 +191,9 @@ class GlobalGPRSurrogate(Surrogate):
             post2 = models[self._obj2](X_tensor)
         return _SingletaskPoolPosterior(post1, post2)
 
-    def predict_design(self, X_raw: pd.DataFrame) -> DesignPrediction:
+    def predict_design(
+        self, X_raw: pd.DataFrame, *, regime: str | None = None,
+    ) -> DesignPrediction:
         """Beam-facing prediction for the global GPR baseline.
 
         Returns z-space mean + std; ``phys_mean`` is left as ``None`` because
@@ -203,7 +205,11 @@ class GlobalGPRSurrogate(Surrogate):
         branch will add scaler persistence to `kfold_training`; until then,
         MoE surrogates are the only path with a fully-specified physical
         inversion (persisted in `GPRExpert` checkpoints).
+
+        The ``regime`` kwarg is accepted for signature compatibility with the
+        ABC but ignored — this surrogate has no per-regime experts to skip.
         """
+        del regime  # single-expert surrogate; nothing to skip.
         pool = self.predict_pool(X_raw)
         z_mean = np.asarray(pool.means, dtype=np.float64)
         z_std = np.asarray(pool.stds, dtype=np.float64)

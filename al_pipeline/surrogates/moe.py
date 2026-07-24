@@ -254,6 +254,7 @@ class MoEBundle:
         expected_label_scaler_scope: str | None = None,
         expected_model_name: str | None = None,
         expected_iter: int | None = None,
+        device: "str | torch.device" = "cpu",
     ) -> "MoEBundle":
         """
         Load an RF bundle + PS + nonPS expert checkpoints into a live MoE.
@@ -266,6 +267,9 @@ class MoEBundle:
         Optional `expected_*` kwargs let callers (e.g. the AL CLI) assert that
         the loaded bundle matches the expected iter / transform / scope,
         catching stale checkpoints early.
+
+        ``device`` places both expert GPs on the requested torch device.
+        The RF gate stays on CPU (it's sklearn, cheap, and small).
         """
         for pth in (rf_pkl, ps_gpr_ckpt, nonps_gpr_ckpt, features_train_file, labels_train_file):
             if not os.path.exists(pth):
@@ -276,8 +280,12 @@ class MoEBundle:
         # that travel with each expert checkpoint. Same affordance MCSC needed.
         ps_ckpt = torch.load(ps_gpr_ckpt, map_location="cpu", weights_only=False)
         nps_ckpt = torch.load(nonps_gpr_ckpt, map_location="cpu", weights_only=False)
-        ps_expert = GPRExpert.from_checkpoint(ps_ckpt, features_train_file, labels_train_file)
-        nps_expert = GPRExpert.from_checkpoint(nps_ckpt, features_train_file, labels_train_file)
+        ps_expert = GPRExpert.from_checkpoint(
+            ps_ckpt, features_train_file, labels_train_file, device=device,
+        )
+        nps_expert = GPRExpert.from_checkpoint(
+            nps_ckpt, features_train_file, labels_train_file, device=device,
+        )
 
         # Run the standard validator over scope / transform / iter / model_name.
         bundle = cls.from_components(rf_bundle, ps_expert, nps_expert)
@@ -507,8 +515,16 @@ class MoESurrogate(Surrogate):
             threshold=self._threshold,
         )
 
+    #: Chunk size for per-expert posterior calls in ``_per_expert_z_stats``.
+    #: The beam search calls ``predict_design`` on ~10⁴–10⁵ candidates per
+    #: step; a single ``posterior(X_raw)`` call at that scale OOMs cluster
+    #: nodes because gpytorch materializes intermediates whose size scales
+    #: with ``B``. 4096 matches the legacy MODEL_COMPARISON batching that
+    #: ran reliably. Subclasses / callers may override before inference.
+    INFERENCE_BATCH_SIZE: int = 4096
+
     def _per_expert_z_stats(
-        self, X_raw: pd.DataFrame,
+        self, X_raw: pd.DataFrame, *, regime: str | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Return ``(p_ps, mu_z_ps, var_z_ps, mu_z_nonps, var_z_nonps)``.
 
@@ -516,25 +532,70 @@ class MoESurrogate(Surrogate):
         clipped at zero to match `GPRExpert.predict`. Used by both
         `predict_design` and `predict_design_sampled` to avoid recomputing
         the per-expert posteriors.
+
+        Batches per-expert calls at ``INFERENCE_BATCH_SIZE`` so the beam's
+        large-B usage stays within a cluster rank's memory. The RF gate is
+        cheap and runs in a single pass.
+
+        ``regime`` selects which expert(s) to actually compute:
+          * ``None``  — both experts (default; needed by soft / hard policies).
+          * ``"ps"``  — PS expert only; nonPS arrays returned as NaN sentinels.
+          * ``"nonps"`` — mirror.
+
+        Skipping is a beam-search optimization: ``expert_tied`` /
+        ``anchored_reject`` only read ``per_expert[start_regime]``, so
+        computing the other expert per step is pure overhead.
         """
+        if regime is not None and regime not in ("ps", "nonps"):
+            raise ValueError(
+                f"regime must be 'ps', 'nonps', or None; got {regime!r}"
+            )
         X_rf, _ = build_rf_features(
             X_raw,
             self._bundle.rf_raw_feature_columns,
             self._bundle.rf_converted_feature_columns,
         )
         p_ps = classifier_p_ps(self._bundle.rf, X_rf).astype(np.float64)
-        post_ps = self._bundle.ps_expert.posterior(X_raw)
-        post_nonps = self._bundle.nonps_expert.posterior(X_raw)
+
+        B = len(X_raw)
+        bs = int(self.INFERENCE_BATCH_SIZE)
+        need_ps = regime in (None, "ps")
+        need_nonps = regime in (None, "nonps")
+        mu_ps_chunks: list[np.ndarray] = []
+        var_ps_chunks: list[np.ndarray] = []
+        mu_nonps_chunks: list[np.ndarray] = []
+        var_nonps_chunks: list[np.ndarray] = []
         with torch.no_grad():
-            mu_ps = post_ps.mean.detach().cpu().numpy().astype(np.float64)
-            var_ps = post_ps.variance.detach().cpu().numpy().astype(np.float64)
-            mu_nonps = post_nonps.mean.detach().cpu().numpy().astype(np.float64)
-            var_nonps = post_nonps.variance.detach().cpu().numpy().astype(np.float64)
-        var_ps = np.clip(var_ps, 0.0, None)
-        var_nonps = np.clip(var_nonps, 0.0, None)
+            for i in range(0, B, bs):
+                X_chunk = X_raw.iloc[i : i + bs]
+                if need_ps:
+                    post_ps = self._bundle.ps_expert.posterior(X_chunk)
+                    mu_ps_chunks.append(post_ps.mean.detach().cpu().numpy())
+                    var_ps_chunks.append(post_ps.variance.detach().cpu().numpy())
+                if need_nonps:
+                    post_nonps = self._bundle.nonps_expert.posterior(X_chunk)
+                    mu_nonps_chunks.append(post_nonps.mean.detach().cpu().numpy())
+                    var_nonps_chunks.append(post_nonps.variance.detach().cpu().numpy())
+
+        if need_ps:
+            mu_ps = np.concatenate(mu_ps_chunks, axis=0).astype(np.float64)
+            var_ps = np.concatenate(var_ps_chunks, axis=0).astype(np.float64)
+            var_ps = np.clip(var_ps, 0.0, None)
+        else:
+            mu_ps = np.full((B, 2), np.nan, dtype=np.float64)
+            var_ps = np.full((B, 2), np.nan, dtype=np.float64)
+        if need_nonps:
+            mu_nonps = np.concatenate(mu_nonps_chunks, axis=0).astype(np.float64)
+            var_nonps = np.concatenate(var_nonps_chunks, axis=0).astype(np.float64)
+            var_nonps = np.clip(var_nonps, 0.0, None)
+        else:
+            mu_nonps = np.full((B, 2), np.nan, dtype=np.float64)
+            var_nonps = np.full((B, 2), np.nan, dtype=np.float64)
         return p_ps, mu_ps, var_ps, mu_nonps, var_nonps
 
-    def predict_design(self, X_raw: pd.DataFrame) -> DesignPrediction:
+    def predict_design(
+        self, X_raw: pd.DataFrame, *, regime: str | None = None,
+    ) -> DesignPrediction:
         """Beam-facing prediction across both experts + the gate.
 
         Returns a `DesignPrediction` where ``z_mean`` / ``z_std`` / ``sigma_z``
@@ -551,34 +612,60 @@ class MoESurrogate(Surrogate):
         ``s⁻¹(p·μ_PS_z + (1-p)·μ_nonPS_z)`` computed once. This is the point
         estimate ``s⁻¹(E[Z])`` — for the unbiased ``E[Y]`` used at validation
         endpoints, use `predict_design_sampled`.
+
+        ``regime`` scopes the computation to a single expert:
+
+          * ``None`` — both experts (default). Required for soft / hard
+            blending on the top-level ``z_mean`` / ``phys_mean`` fields.
+          * ``"ps"`` — only the PS expert; top-level fields equal
+            ``per_expert["ps"]``; ``per_expert["nonps"]`` is a NaN sentinel.
+          * ``"nonps"`` — mirror.
+
+        The beam engine passes ``regime=start_regime`` under ``expert_tied``
+        and ``anchored_reject`` because those policies read only the picked
+        expert; skipping the other expert saves ~30–75% of the GP work per
+        step depending on the training-set split.
         """
-        p_ps, mu_ps, var_ps, mu_nonps, var_nonps = self._per_expert_z_stats(X_raw)
+        p_ps, mu_ps, var_ps, mu_nonps, var_nonps = self._per_expert_z_stats(
+            X_raw, regime=regime,
+        )
         std_ps = np.sqrt(var_ps)
         std_nonps = np.sqrt(var_nonps)
 
-        # Per-expert physical means. Under `label_scaler_scope='all'` both
-        # experts hold the same scaler instances, but call each explicitly so
-        # a future per-regime scaler variant (mentioned in the `MoESurrogate`
-        # docstring as a beam-only future consumer) drops in without a rewrite.
-        phys_ps = self._bundle.ps_expert.inverse_scale_z(mu_ps)
-        phys_nonps = self._bundle.nonps_expert.inverse_scale_z(mu_nonps)
+        # Per-expert physical means. Only inverse-scale the expert(s) actually
+        # computed; the skipped expert's z_mean is already NaN so calling
+        # inverse_scale_z on it would waste sklearn work and emit YJ warnings.
+        if regime in (None, "ps"):
+            phys_ps = self._bundle.ps_expert.inverse_scale_z(mu_ps)
+        else:
+            phys_ps = np.full_like(mu_ps, np.nan)
+        if regime in (None, "nonps"):
+            phys_nonps = self._bundle.nonps_expert.inverse_scale_z(mu_nonps)
+        else:
+            phys_nonps = np.full_like(mu_nonps, np.nan)
 
-        if self._policy == "soft":
-            p = p_ps[:, None]                                        # (B, 1) broadcast
-            mu_z = p * mu_ps + (1.0 - p) * mu_nonps                  # (B, 2)
-            var_z = np.column_stack([
-                soft_mixture_variance(
-                    p_ps, mu_ps[:, i], var_ps[:, i], mu_nonps[:, i], var_nonps[:, i],
-                )
-                for i in range(mu_ps.shape[1])
-            ])
-            std_z = np.sqrt(np.clip(var_z, 0.0, None))
-            phys_mean = self._bundle.ps_expert.inverse_scale_z(mu_z)
-        else:  # hard
-            use_ps = (p_ps >= self._threshold)[:, None]              # (B, 1)
-            mu_z = np.where(use_ps, mu_ps, mu_nonps)
-            std_z = np.where(use_ps, std_ps, std_nonps)
-            phys_mean = np.where(use_ps, phys_ps, phys_nonps)
+        if regime is None:
+            # Full blend (soft / hard).
+            if self._policy == "soft":
+                p = p_ps[:, None]
+                mu_z = p * mu_ps + (1.0 - p) * mu_nonps
+                var_z = np.column_stack([
+                    soft_mixture_variance(
+                        p_ps, mu_ps[:, i], var_ps[:, i], mu_nonps[:, i], var_nonps[:, i],
+                    )
+                    for i in range(mu_ps.shape[1])
+                ])
+                std_z = np.sqrt(np.clip(var_z, 0.0, None))
+                phys_mean = self._bundle.ps_expert.inverse_scale_z(mu_z)
+            else:  # hard
+                use_ps = (p_ps >= self._threshold)[:, None]
+                mu_z = np.where(use_ps, mu_ps, mu_nonps)
+                std_z = np.where(use_ps, std_ps, std_nonps)
+                phys_mean = np.where(use_ps, phys_ps, phys_nonps)
+        elif regime == "ps":
+            mu_z, std_z, phys_mean = mu_ps, std_ps, phys_ps
+        else:  # regime == "nonps"
+            mu_z, std_z, phys_mean = mu_nonps, std_nonps, phys_nonps
 
         per_expert = {
             "ps":    {"z_mean": mu_ps,    "z_std": std_ps,    "phys_mean": phys_ps},

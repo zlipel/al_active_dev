@@ -86,7 +86,12 @@ def load_models(cfg: ALConfig, *, temp: bool, device: str | torch.device = "cpu"
     raise ValueError(f"Unknown train_model_type={t}")
 
 
-def load_moe_bundle(cfg: ALConfig, *, temp: bool = False):
+def load_moe_bundle(
+    cfg: ALConfig,
+    *,
+    temp: bool = False,
+    device: str | torch.device = "cpu",
+):
     """
     Load the per-iter MoE artifacts written by `train_moe_from_config`.
 
@@ -97,6 +102,9 @@ def load_moe_bundle(cfg: ALConfig, *, temp: bool = False):
         True  -> the augmented checkpoints written by kriging-believer during
                  batch generation (accumulate synthesized children across
                  seq_ids in the current batch).
+    device : str or torch.device
+        Torch device for the expert GPs. Default "cpu" covers AL / EHVI;
+        beam-search callers may override to "cuda" on GPU nodes.
 
     Returns
     -------
@@ -118,6 +126,7 @@ def load_moe_bundle(cfg: ALConfig, *, temp: bool = False):
         expected_label_scaler_scope="all",
         expected_model_name=cfg.model,
         expected_iter=cfg.iteration,
+        device=device,
     )
 
 

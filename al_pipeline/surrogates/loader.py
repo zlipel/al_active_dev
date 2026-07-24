@@ -68,7 +68,7 @@ def load_surrogate(
     """
     t = cfg.train_model_type
     if t == "moe":
-        moe_bundle: "MoEBundle" = load_moe_bundle(cfg, temp=temp)
+        moe_bundle: "MoEBundle" = load_moe_bundle(cfg, temp=temp, device=device)
         return make_surrogate(
             cfg,
             moe_bundle=moe_bundle,

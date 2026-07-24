@@ -194,7 +194,9 @@ class Surrogate(ABC):
         """
 
     @abstractmethod
-    def predict_design(self, X_raw: pd.DataFrame) -> DesignPrediction:
+    def predict_design(
+        self, X_raw: pd.DataFrame, *, regime: str | None = None,
+    ) -> DesignPrediction:
         """
         Beam-search-facing prediction surface.
 
@@ -204,6 +206,15 @@ class Surrogate(ABC):
         physical mean to feed a quantile transform for distance ranking; the
         gate + per-expert values feed the anchored / hard / expert-tied
         policies without reaching around the surrogate into the bundle.
+
+        ``regime`` scopes computation to a single expert (MoE only):
+          * ``None``  — compute both experts (default).
+          * ``"ps"`` / ``"nonps"`` — MoE only computes the picked expert;
+            the other expert's ``per_expert[...]`` entry is a NaN sentinel.
+            Beam ``expert_tied`` / ``anchored_reject`` policies pass this
+            to save the ~30–75% GP cost per step of the unused expert.
+        Single-expert surrogates (e.g. `GlobalGPRSurrogate`) accept and
+        ignore ``regime``.
         """
 
     def predict_design_sampled(

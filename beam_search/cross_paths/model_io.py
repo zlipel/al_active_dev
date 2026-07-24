@@ -163,10 +163,12 @@ def load_beam_bundle(
         Fully-populated. Provides features_csv, labels_csv, seq_gen_txt.
     db_dir : str or Path
         Directory containing ``ff_db.py`` and the model parameter files.
-    device : torch.device
-        Passed to `load_surrogate`. Beam runs CPU-only by default.
+    device : torch.device or str
+        Torch device for the surrogate's GP tensors. Default ``"cpu"``.
+        Pass ``"cuda"`` (or ``"cuda:0"``) on GPU nodes to run predict_design
+        on GPU; the CPU↔GPU round-trip happens once per predict_design call
+        (small, microseconds).
     """
-    del device  # load_surrogate handles device internally; beam is CPU-only
     db_dir = Path(db_dir)
     cfg = _cfg_from_paths(paths, db_path=db_dir)
 
@@ -182,7 +184,7 @@ def load_beam_bundle(
         if not Path(p).exists():
             raise FileNotFoundError(f"[{paths.model}] Missing {name}: {p}")
 
-    surrogate = load_surrogate(cfg, temp=False)
+    surrogate = load_surrogate(cfg, temp=False, device=device)
 
     # Load features + all three physical label columns in one shot. Load
     # `density` alongside `exp_density` and `diff` per III.8 — the regime
@@ -243,14 +245,20 @@ def load_beam_bundle(
     )
 
 
-def load_all_models(paths: ALPaths, db_dir: str | Path) -> Dict[str, BeamBundle]:
+def load_all_models(
+    paths: ALPaths,
+    db_dir: str | Path,
+    *,
+    device: torch.device | str = "cpu",
+) -> Dict[str, BeamBundle]:
     """API-compat wrapper: one-model bundle keyed by ``paths.model``.
 
     Beam callers that predate the surrogate refactor still iterate
     ``bundles[model_name]``. Multi-model dispatch is not currently a beam
-    concern; the caller loops over models separately.
+    concern; the caller loops over models separately. ``device`` forwards
+    to `load_beam_bundle` for GPU-enabled beam runs.
     """
-    return {paths.model: load_beam_bundle(paths, db_dir)}
+    return {paths.model: load_beam_bundle(paths, db_dir, device=device)}
 
 
 # ---------------------------------------------------------------------------

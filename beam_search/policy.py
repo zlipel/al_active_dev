@@ -171,7 +171,15 @@ class BeamPolicy:
         X: pd.DataFrame = self.featurizer.featurize_many_fast(
             seqs, feat_threads_eff, as_df=True,
         )
-        pred = self.surrogate.predict_design(X)
+        # expert_tied / anchored_reject only read `per_expert[start_regime]`
+        # for their z/phys channels, so pass the hint down and skip the
+        # unused expert's ~30-75% GP cost per step. soft / hard require both
+        # experts for the blended top-level fields, so no hint.
+        regime_hint = (
+            self.start_regime if self.kind in ("expert_tied", "anchored_reject")
+            else None
+        )
+        pred = self.surrogate.predict_design(X, regime=regime_hint)
 
         z_mean, z_std, phys = self._select_channel(pred)
         p_ps = pred.p_ps

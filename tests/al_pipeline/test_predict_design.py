@@ -228,3 +228,124 @@ def test_gpr_expert_inverse_scale_z_rejects_wrong_shape():
         exp.inverse_scale_z(np.zeros((4, 3)))
     with pytest.raises(ValueError, match=r"shape \(B, 2\)"):
         exp.inverse_scale_z(np.zeros((4,)))
+
+
+# ---------------------------------------------------------------------------
+# predict_design — regime skip (expert_tied / anchored_reject optimization)
+# ---------------------------------------------------------------------------
+
+
+def test_predict_design_regime_ps_skips_nonps_expert():
+    """When ``regime='ps'``, the PS expert's per_expert entry matches the
+    full-computation baseline; the nonPS entry is a NaN sentinel."""
+    bundle = _build_moe_bundle(seed=11)
+    surr = MoESurrogate(bundle=bundle, policy="soft")
+    X = _make_raw_features_df(5, seed=42)
+
+    baseline = surr.predict_design(X)
+    ps_only = surr.predict_design(X, regime="ps")
+
+    # PS expert matches the baseline exactly.
+    np.testing.assert_allclose(
+        ps_only.per_expert["ps"]["z_mean"], baseline.per_expert["ps"]["z_mean"],
+        rtol=1e-12, atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        ps_only.per_expert["ps"]["phys_mean"], baseline.per_expert["ps"]["phys_mean"],
+        rtol=1e-12, atol=1e-12,
+    )
+    # nonPS is skipped → NaN sentinel.
+    assert np.all(np.isnan(ps_only.per_expert["nonps"]["z_mean"]))
+    assert np.all(np.isnan(ps_only.per_expert["nonps"]["z_std"]))
+    assert np.all(np.isnan(ps_only.per_expert["nonps"]["phys_mean"]))
+    # Top-level fields equal the PS expert channel.
+    np.testing.assert_allclose(
+        ps_only.z_mean, ps_only.per_expert["ps"]["z_mean"], rtol=1e-12, atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        ps_only.phys_mean, ps_only.per_expert["ps"]["phys_mean"],
+        rtol=1e-12, atol=1e-12,
+    )
+
+
+def test_predict_design_regime_nonps_skips_ps_expert():
+    bundle = _build_moe_bundle(seed=12)
+    surr = MoESurrogate(bundle=bundle, policy="hard")
+    X = _make_raw_features_df(7, seed=43)
+
+    baseline = surr.predict_design(X)
+    nonps_only = surr.predict_design(X, regime="nonps")
+
+    np.testing.assert_allclose(
+        nonps_only.per_expert["nonps"]["z_mean"],
+        baseline.per_expert["nonps"]["z_mean"],
+        rtol=1e-12, atol=1e-12,
+    )
+    assert np.all(np.isnan(nonps_only.per_expert["ps"]["z_mean"]))
+    assert np.all(np.isnan(nonps_only.per_expert["ps"]["phys_mean"]))
+    np.testing.assert_allclose(
+        nonps_only.z_mean, nonps_only.per_expert["nonps"]["z_mean"],
+        rtol=1e-12, atol=1e-12,
+    )
+
+
+def test_predict_design_regime_none_matches_baseline():
+    """Passing ``regime=None`` (the default) returns the full both-experts
+    result — no regression on soft / hard blending."""
+    bundle = _build_moe_bundle(seed=13)
+    surr = MoESurrogate(bundle=bundle, policy="soft")
+    X = _make_raw_features_df(4, seed=44)
+
+    pred_default = surr.predict_design(X)
+    pred_none = surr.predict_design(X, regime=None)
+
+    for key in ("z_mean", "z_std", "phys_mean", "p_ps"):
+        np.testing.assert_allclose(
+            getattr(pred_default, key), getattr(pred_none, key),
+            rtol=1e-12, atol=1e-12,
+        )
+
+
+def test_predict_design_regime_gate_still_computed():
+    """The RF gate is cheap and always computed regardless of ``regime`` —
+    ``expert_tied`` records p_ps as a drift diagnostic."""
+    bundle = _build_moe_bundle(seed=14)
+    surr = MoESurrogate(bundle=bundle, policy="soft")
+    X = _make_raw_features_df(3, seed=45)
+
+    baseline_p_ps = surr.predict_design(X).p_ps
+    for r in ("ps", "nonps"):
+        p_ps_skipped = surr.predict_design(X, regime=r).p_ps
+        np.testing.assert_allclose(p_ps_skipped, baseline_p_ps, rtol=1e-12, atol=1e-12)
+
+
+def test_predict_design_regime_bad_value_raises():
+    bundle = _build_moe_bundle(seed=15)
+    surr = MoESurrogate(bundle=bundle, policy="soft")
+    X = _make_raw_features_df(3, seed=46)
+    with pytest.raises(ValueError, match="regime must be"):
+        surr.predict_design(X, regime="junk")
+
+
+def test_global_predict_design_accepts_regime_and_ignores_it():
+    """Signature-compat check: `GlobalGPRSurrogate.predict_design` accepts
+    ``regime`` for ABC compliance but has no per-regime experts to skip."""
+    from al_pipeline.surrogates import make_surrogate
+    from tests.al_pipeline.test_surrogate_gpr_global import (
+        _fake_cfg,
+        _toy_multitask,
+    )
+    bundle, stats, raw_test_df = _toy_multitask(seed=16)
+    surr = make_surrogate(
+        _fake_cfg("gpr_multitask"),
+        model_bundle=bundle,
+        normalization_stats=stats,
+    )
+
+    pred_default = surr.predict_design(raw_test_df)
+    pred_ps      = surr.predict_design(raw_test_df, regime="ps")
+    pred_nonps   = surr.predict_design(raw_test_df, regime="nonps")
+
+    for other in (pred_ps, pred_nonps):
+        np.testing.assert_allclose(other.z_mean, pred_default.z_mean, rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(other.z_std,  pred_default.z_std,  rtol=1e-12, atol=1e-12)
