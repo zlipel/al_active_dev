@@ -63,3 +63,6 @@ file_inventory.txt
 *.md
 # ...then unignore any README.md anywhere in the tree
 !**/README.md
+
+# ── Presentations and related documents ─────────────────────────────
+presentations/
