@@ -30,15 +30,25 @@ module load "${INTEL_MODULE}" "${INTEL_MPI_MODULE}"
 conda activate "${CONDA_ENV}"
 
 MODEL=$1
-ITER=$2
+# Second arg is the scope selector: an integer iteration (0 = init) or the
+# token "validation:SCOPE" from diff_calc.sh --validation SCOPE. Test the
+# validation case first — [[ ... -eq 0 ]] is arithmetic and would (mis)evaluate
+# a "validation:*" string to 0.
+SCOPE_SPEC=$2
 INNER_JOBS=${3:-4}
 OMP_THREADS=${4:-4}
 NSEQ_JOBS=${5:-6}
 
-if [[ $ITER -eq 0 ]]; then
+if [[ "$SCOPE_SPEC" == validation:* ]]; then
+    SCOPE="${SCOPE_SPEC#validation:}"
+    SCOPE_LOWER="${SCOPE,,}"
+    PAR_DIR="${SCRATCH_AL}/$MODEL/VALIDATION/$SCOPE/SIMULATIONS/DIFF"
+    SEQS="$PAR_DIR/seq_${SCOPE_LOWER}.txt"
+elif [[ $SCOPE_SPEC -eq 0 ]]; then
     SEQS="${SCRATCH_AL}/$MODEL/SIMULATIONS/DIFF/seq_init.txt"
     PAR_DIR="${SCRATCH_AL}/$MODEL/SIMULATIONS/DIFF"
 else
+    ITER="$SCOPE_SPEC"
     SEQS="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF/seq_gen$ITER.txt"
     PAR_DIR="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF"
 fi

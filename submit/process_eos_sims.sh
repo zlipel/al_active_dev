@@ -31,13 +31,24 @@ conda activate "${CONDA_ENV}"
 
 MODEL=$1
 NBOOT=$2
-ITER=$3
+# Third arg is the scope selector: an integer iteration (0 = init) or the
+# token "validation:SCOPE" emitted by eos_calc.sh --validation SCOPE. The
+# validation case must be tested first — [[ ... -eq 0 ]] is arithmetic and
+# would (mis)evaluate a "validation:*" string to 0.
+SCOPE_SPEC=$3
 
-if [[ $ITER -eq 0 ]]; then
+if [[ "$SCOPE_SPEC" == validation:* ]]; then
+    SCOPE="${SCOPE_SPEC#validation:}"
+    SCOPE_LOWER="${SCOPE,,}"
+    PAR_DIR="${SCRATCH_AL}/$MODEL/VALIDATION/$SCOPE/SIMULATIONS/EOS"
+    OUTPUT_DIR="${SCRATCH_AL}/$MODEL/VALIDATION/$SCOPE/SIMULATIONS/DIFF"
+    SEQS="$PAR_DIR/seq_${SCOPE_LOWER}.txt"
+elif [[ $SCOPE_SPEC -eq 0 ]]; then
     SEQS="${SCRATCH_AL}/$MODEL/SIMULATIONS/EOS/seq_init.txt"
     PAR_DIR="${SCRATCH_AL}/$MODEL/SIMULATIONS/EOS"
     OUTPUT_DIR="${SCRATCH_AL}/$MODEL/SIMULATIONS/DIFF"
 else
+    ITER="$SCOPE_SPEC"
     SEQS="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS/seq_gen$ITER.txt"
     PAR_DIR="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS"
     OUTPUT_DIR="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF"
@@ -49,5 +60,11 @@ python "${REPO_ROOT}/analysis/process_eos_sims.py" \
     -sequence_file "$SEQS" \
     -num_bootstrap "$NBOOT"
 
+# make_diff.py reads eos_results.csv from its parent_dir (the DIFF dir), so
+# hand the EOS results across to the sibling DIFF tree.
 cp "$PAR_DIR/eos_results.csv" "$OUTPUT_DIR/eos_results.csv"
-cp "$SEQS" "$OUTPUT_DIR/seq_gen$ITER.txt"
+if [[ "$SCOPE_SPEC" == validation:* ]]; then
+    cp "$SEQS" "$OUTPUT_DIR/seq_${SCOPE_LOWER}.txt"
+else
+    cp "$SEQS" "$OUTPUT_DIR/seq_gen$SCOPE_SPEC.txt"
+fi

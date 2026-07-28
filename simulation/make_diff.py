@@ -292,16 +292,21 @@ if __name__ == "__main__":
             density = eos_results['density'].values
             exp_rhos = eos_results['exp_density'].values
 
+            # Exactly one seed density per sequence. `psp` flags phase separation:
+            #   psp == 0 (non-PS): dilute seed (0.25), unless the sequence had no
+            #     measurable expenditure density (exp_density == 0) -> dense seed.
+            #   psp != 0 (PS): seed at the coexistence density, unless the
+            #     dense/dilute gap is large (exp_density - density >= 1) -> dense seed.
+            # The dense-seed cases are overrides, not extra entries: the earlier
+            # two-branch form appended twice for those, misaligning rho_init with
+            # the sequence list so every later sequence got the wrong density.
             rho_init = []
-            for i, psp in enumerate(psp):
-                if psp == 0:
-                    rho_init.append(0.25)
-                elif psp != 0:
-                    rho_init.append(float(density[i]))
-                if exp_rhos[i] == 0.0 and psp == 0:
-                    rho_init.append(1.2)
-                elif exp_rhos[i] - density[i] >= 1.0 and psp != 0:
-                    rho_init.append(float(1.2))
+            for i in range(len(psp)):
+                if psp[i] == 0:
+                    rho = 1.2 if exp_rhos[i] == 0.0 else 0.25
+                else:
+                    rho = 1.2 if (exp_rhos[i] - density[i]) >= 1.0 else float(density[i])
+                rho_init.append(float(rho))
         else:
             with open(args.sequence_file, 'r') as f:
                 sequences = [line.strip() for line in f.readlines()]

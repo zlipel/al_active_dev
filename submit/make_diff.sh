@@ -102,6 +102,19 @@ elif [[ -n "$VALIDATION" ]]; then
         echo "        --scratch_dir \"\$SCRATCH_AL\" --length_changes --scope $VALIDATION" >&2
         exit 1
     fi
+    # make_diff.py seeds rho_init from eos_results.csv unless --quick is set.
+    # For validation that file is copied into the DIFF dir by the EOS analysis
+    # step (process_eos_sims.sh via eos_calc.sh --validation). Fail early with
+    # an actionable message rather than a bare pandas FileNotFoundError.
+    if [[ "${QUICK:-0}" == "0" && ! -f "$PAR_DIR/eos_results.csv" ]]; then
+        echo "Error: eos_results.csv not found at $PAR_DIR/eos_results.csv" >&2
+        echo "  Run the validation EOS sims + analysis first (copies eos_results.csv here):" >&2
+        echo "    sbatch \"${REPO_ROOT}/submit/make_eos.sh\" --model $MODEL --validation $VALIDATION ..." >&2
+        echo "    # submit the generated EOS universe jobs, then:" >&2
+        echo "    \"${REPO_ROOT}/submit/eos_calc.sh\" $MODEL <NBOOT> --validation $VALIDATION" >&2
+        echo "  Or pass --quick 1 to seed every sequence at a fixed density instead." >&2
+        exit 1
+    fi
 else
     if [[ -z "$ITER" ]]; then
         echo "Error: exactly one of --init / --iter / --validation is required"
