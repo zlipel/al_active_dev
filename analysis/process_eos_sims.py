@@ -139,8 +139,11 @@ def get_EOS(pth, frac=0.5, bootstrap=False):
     rho = []
     err = []
     
-    for density in sorted(os.listdir(pth)):
-        subpath = os.path.join(pth,f"{density}")
+    # Per-density subdirs are named `rho{p}` (e.g. rho0.05, rho0.1); the
+    # actual density value used for the EoS is read from thermo.avg, so the
+    # subdir name is only used for iteration order.
+    for rho_dir in sorted(os.listdir(pth)):
+        subpath = os.path.join(pth, rho_dir)
         try:
 
             file = os.path.join(subpath, f"thermo.avg")
@@ -469,11 +472,10 @@ def bootstrap_exp_dens_from_path(pth, frac, num_bootstrap=200, work=15, confiden
     rho = []
     err = []
     
-    for density in sorted(os.listdir(pth)):
-        subpath = os.path.join(pth, f'{density}')
+    for rho_dir in sorted(os.listdir(pth)):
+        subpath = os.path.join(pth, rho_dir)
         try:
 
-            #file = path + f'/{density}/thermo.avg'
             file = os.path.join(subpath, f"thermo.avg")
             if os.path.exists(file):
                 data = pd.read_csv(file,delimiter=' ',header=None,names=labels,skiprows=2)
