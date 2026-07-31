@@ -108,6 +108,9 @@ def main(
             lmp_name='in.diff'
         )
 
+        print(f"CHECKING VALID PATHS: {[paths]}", flush = True)
+        print(f"CHECKING VALID PAR DIR: {str(config.parent_dir)}", flush = True)
+
         write_universe(
             str(config.parent_dir),
             paths,
