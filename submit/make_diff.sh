@@ -34,7 +34,7 @@ conda activate "${CONDA_ENV}"
 
 MODEL=""
 ITER=""
-NSIM="5"
+NSIM="6"
 INIT=false
 VALIDATION=""
 CHECK_FIN=false
