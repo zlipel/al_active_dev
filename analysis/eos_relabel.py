@@ -13,15 +13,24 @@ within-run and across-replicate variation, settling low).
 
 Method (per polymer, where sim data exists)
 -------------------------------------------
-1. EoS reliability: pressure at the largest simulated rho, averaged over the
-   later half of thermo.avg with its block std error. "Reliable" (loop closed)
-   == P(rho_max) - Z*SE > 0. Negative / not-significantly-positive => suspect.
-2. Diff readout: mean production density (col `density`) over the late-time
-   window of each replicate log, aggregated across replicates, with within-run
-   and across-replicate spreads.
-3. Classify: FALSE_NEG (label non-PS but diff condensed), FALSE_POS (label PS
-   but diff not condensed), plus OK / FLAG variants. Report-first -- nothing is
-   written to labels until the report is reviewed.
+The closed EoS van der Waals loop is the phase-separation authority; the diff
+density (NPT at 1 atm) only supplies / validates the condensed-density *value*
+for a confirmed condenser -- it can't decide PS on its own, since at 1 atm even
+a non-condenser reaches ~0.3 g/mL.
+
+1. EoS loop: over all densities, mean +- block SE (later half of each
+   thermo.avg). `has_neg_loop` = some density with P + Z*SE < 0 (attractive
+   region); `branch_reached` = P(rho_max) - Z*SE > 0 (repulsive branch, i.e.
+   grid long enough). `loop_closed` = both => true PS.
+2. Diff readout: late-time production density (col `density`) per replicate,
+   aggregated across replicates, with across-replicate spread.
+3. Classify (report-first, nothing written until reviewed):
+   - label non-PS + loop_closed -> FALSE_NEG (caller missed the loop);
+   - label non-PS + branch_reached + no loop -> OK_nonPS (real non-PS);
+   - label non-PS + EoS truncated (no branch) -> use diff only if clearly dense
+     & stable, else FLAG_EOS_INCOMPLETE;
+   - label PS + branch but no loop -> FALSE_POS;
+   - label PS + loop -> OK_PS, or FLAG_MISMATCH if diff disagrees on the value.
 
 Data availability / paths (as of this campaign)
 -----------------------------------------------
@@ -68,18 +77,22 @@ from joblib import Parallel, delayed
 
 REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, os.path.abspath(REPO))
-from analysis.process_eos_sims import split_error  # noqa: E402
+from analysis.process_eos_sims import get_EOS  # noqa: E402
 
 GEN0_N = 120       # seed sequences (rows 0..119)
 GEN_N = 48         # sequences per AL iteration
 WEBB_DEFAULT = "/projects/WEBB/from_zach/MODEL_COMPARISON"
 MODELS = ["CALVADOS", "MPIPI", "HPS_URRY"]
 
-# --- reliability / condensation thresholds (first-pass, advisory, tunable) ---
-Z_SIG = 2.0        # P(rho_max) - Z_SIG*SE > 0  => EoS loop reliably closed
+# --- thresholds (first-pass, advisory, tunable) ---
+# The EoS loop is the phase-separation authority. The diff density only enters
+# the verdict for grid-TRUNCATED EoS sweeps (where the loop can't be seen), and
+# then only as a coarse dense/not-dense fallback -- because at 1 atm even a
+# non-condenser reaches ~0.3 g/mL, so a value has to be clearly above that.
+Z_SIG = 2.0            # significance multiplier on the per-density block SE
 DIFF_TAIL_FRAC = 0.5   # fraction of each production run used for the density readout
-MAG_FLOOR = 0.5    # diff density below this is treated as "not condensed"
-CV_MAX = 0.15      # within-run or across-replicate CV above this => unstable
+STABLE_STD = 0.03      # across-replicate std ceiling for a "stable" diff density
+DENSE_FLOOR = 0.6      # truncated-EoS fallback: diff must exceed this to imply PS
 
 
 # ---------------------------------------------------------------------------
@@ -96,28 +109,36 @@ def row_of(gen, local):
     return local if gen == 0 else GEN0_N + (gen - 1) * GEN_N + local
 
 
-def gen_dir(scratch, webb, model, gen):
-    """iteration_<gen> dir, preferring SCRATCH then the WEBB archive."""
-    for base in (scratch, webb):
-        if not base:
-            continue
-        d = os.path.join(base, model, "GENERATIONS", f"iteration_{gen}")
-        if os.path.isdir(d):
-            return d
-    return None
+def _has_content(d, kind):
+    """A poly dir counts as populated only if it holds the expected children:
+    rho* subdirs for EOS, numeric run subdirs for DIFF. Empty skeleton dirs
+    (e.g. moved to the WEBB archive) return False so they don't shadow the
+    real copy."""
+    if not d or not os.path.isdir(d):
+        return False
+    pat = "rho*" if kind == "EOS" else "[0-9]*"
+    return bool(glob.glob(os.path.join(d, pat)))
+
+
+def _bases(scratch, webb):
+    return [b for b in (scratch, webb) if b]
 
 
 def sim_dir(scratch, webb, model, row, kind):
-    """EoS/DIFF sim dir for a global row, or None if absent. kind in {EOS,DIFF}."""
+    """EoS/DIFF poly dir for a global row, resolved to whichever of SCRATCH /
+    WEBB actually holds the data. None if neither is populated."""
     gen, local = row_scope(row)
-    if gen == 0:
-        d = os.path.join(scratch, model, "SIMULATIONS", kind, f"poly{local}")
-        return d if os.path.isdir(d) else None
-    gd = gen_dir(scratch, webb, model, gen)
-    if gd is None:
-        return None
-    d = os.path.join(gd, "SIMULATIONS", kind, f"poly{local}")
-    return d if os.path.isdir(d) else None
+    cands = []
+    for base in _bases(scratch, webb):
+        if gen == 0:
+            cands.append(os.path.join(base, model, "SIMULATIONS", kind, f"poly{local}"))
+        else:
+            cands.append(os.path.join(
+                base, model, "GENERATIONS", f"iteration_{gen}", "SIMULATIONS", kind, f"poly{local}"))
+    for c in cands:
+        if _has_content(c, kind):
+            return c
+    return None
 
 
 def labels_file(scratch, webb, model):
@@ -146,38 +167,38 @@ def scratch_default():
 
 
 # ---------------------------------------------------------------------------
-# EoS reliability (fast: only the largest-rho thermo.avg)
+# EoS loop evaluation (the true phase-separation signal)
 # ---------------------------------------------------------------------------
-_THERMO_LABELS = ["TimeStep", "temp", "etot", "pe", "ke", "ent", "P", "rho"]
-
-
-def eos_tail_pressure(eos_dir, frac=0.5, z=Z_SIG):
-    """Pressure at the largest simulated density: mean +- block SE over the
-    later `frac` of that density's thermo.avg. sig_positive == loop closed."""
-    subs = []
-    for name in os.listdir(eos_dir):
-        m = re.match(r"rho([0-9.]+)$", name)
-        if m and os.path.exists(os.path.join(eos_dir, name, "thermo.avg")):
-            subs.append((float(m.group(1)), name))
-    if not subs:
-        return None
-    _, name = max(subs)
-    f = os.path.join(eos_dir, name, "thermo.avg")
+# The NPT diff sims run at 1 atm, so every sequence reaches *some* finite
+# density -- that alone is NOT phase separation. A closed van der Waals loop
+# (a significantly-negative pressure region AND a positive repulsive branch at
+# high rho) is the real PS signal. We read all simulated densities, mean +-
+# block SE over the later half of each thermo.avg, and test both conditions.
+def eos_loop_eval(eos_dir, z=Z_SIG):
+    """Return the loop diagnostics for one EoS sweep, or None if unreadable."""
     try:
-        data = pd.read_csv(f, delimiter=" ", header=None, names=_THERMO_LABELS, skiprows=2).dropna()
+        P, err, rho = get_EOS(eos_dir, frac=0.5, bootstrap=True)
     except Exception:
         return None
-    if len(data) < 10:
+    if not rho:
         return None
-    N = int((1 - frac) * len(data))
-    pvals = data["P"][N:].values
-    se, _ = split_error(pvals, 5)
-    p_mean = float(np.mean(pvals))
+    rho = np.asarray(rho, float)
+    order = np.argsort(rho)
+    rho = rho[order]
+    Pm = np.array([float(np.mean(P[i])) for i in order])
+    er = np.array([float(err[i]) for i in order])
+    imax = len(rho) - 1
+    branch_reached = bool((Pm[imax] - z * er[imax]) > 0)   # repulsive branch captured
+    has_neg = bool(((Pm + z * er) < 0).any())              # significant attractive region
     return dict(
-        rho_max=float(data["rho"].values[-1]),
-        P=p_mean,
-        P_err=float(se),
-        sig_positive=bool((p_mean - z * se) > 0),
+        rho_max=float(rho[imax]),
+        P=float(Pm[imax]),
+        P_err=float(er[imax]),
+        min_P=float(Pm.min()),
+        n_pos=int((Pm > 0).sum()),
+        branch_reached=branch_reached,
+        has_neg_loop=has_neg,
+        loop_closed=bool(has_neg and branch_reached),      # true PS signal
     )
 
 
@@ -235,45 +256,41 @@ def diff_density(diff_dir, tail_frac=DIFF_TAIL_FRAC):
     )
 
 
-def diff_is_condensed(diff):
-    """Advisory: substantial magnitude + tight within-run and across-replicate
-    spread. Returns True/False, or None if no diff data."""
-    if diff is None:
-        return None
-    return bool(
-        diff["density"] >= MAG_FLOOR
-        and (np.isnan(diff["cv_within"]) or diff["cv_within"] <= CV_MAX)
-        and (np.isnan(diff["cv_across"]) or diff["cv_across"] <= CV_MAX)
-    )
-
-
 # ---------------------------------------------------------------------------
-# classification
+# classification -- the closed EoS loop is the phase-separation authority; the
+# diff density only supplies / validates the condensed-density *value*.
 # ---------------------------------------------------------------------------
 def classify(label_density, eos, diff):
     """Return (verdict, suggested_density, note)."""
-    dcond = diff_is_condensed(diff)
-    eos_ok = eos["sig_positive"] if eos else None  # loop closed?
-    label_ps = (label_density is not None) and (label_density > 0)
-
     if label_density is None:
         return "NO_LABEL", np.nan, ""
+    if eos is None:
+        return "NO_EOS", np.nan, "no EoS sweep"
 
-    if not label_ps:  # labelled non-PS (density == 0)
-        if dcond is True:
-            return "FALSE_NEG", diff["density"], f"diff condensed ~{diff['density']:.2f}"
-        if eos_ok is False:
-            return ("FLAG_EOS_INCOMPLETE", np.nan,
-                    "P(rho_max) not sig>0; diff " + ("absent" if diff is None else "inconclusive"))
-        return "OK_nonPS", 0.0, ""
+    loop = eos["loop_closed"]            # significant negative region AND positive branch
+    branch = eos["branch_reached"]       # repulsive branch captured (grid long enough)
+    ddens = diff["density"] if diff else np.nan
+    stable = (diff is not None) and (diff["across_std"] <= STABLE_STD)
+    label_ps = label_density > 0
 
-    # labelled PS (density > 0)
-    if dcond is False:
-        return "FALSE_POS", np.nan, (
-            f"diff not condensed (rho~{diff['density']:.2f}, cv_w~{diff['cv_within']:.2f})"
-        )
-    if dcond is True and abs(diff["density"] - label_density) > max(0.2, 0.3 * label_density):
-        return "FLAG_MISMATCH", diff["density"], f"diff {diff['density']:.2f} vs label {label_density:.2f}"
+    if not label_ps:  # campaign called non-PS (density == 0)
+        if loop:
+            # EoS shows a closed loop -> genuine PS the campaign caller missed
+            return "FALSE_NEG", ddens, f"EoS loop closed; diff {ddens:.2f}"
+        if not branch:
+            # grid truncated -> EoS can't decide; only a clearly dense, stable
+            # diff (well above the ~0.3 the 1-atm box gives non-condensers)
+            # confirms PS.
+            if stable and ddens >= DENSE_FLOOR:
+                return "FALSE_NEG", ddens, f"EoS truncated (P<0 at rho_max); diff dense {ddens:.2f}"
+            return "FLAG_EOS_INCOMPLETE", np.nan, "EoS truncated (P<0 at rho_max); diff not clearly dense"
+        return "OK_nonPS", 0.0, ""   # branch reached, no attractive loop -> real non-PS
+
+    # campaign called PS (density > 0)
+    if not loop and branch:
+        return "FALSE_POS", np.nan, "no EoS loop but labelled PS"
+    if diff is not None and abs(ddens - label_density) > max(0.15, 0.3 * label_density):
+        return "FLAG_MISMATCH", ddens, f"diff {ddens:.2f} vs label {label_density:.2f}"
     return "OK_PS", label_density, ""
 
 
@@ -281,34 +298,34 @@ def classify(label_density, eos, diff):
 # report
 # ---------------------------------------------------------------------------
 def available_rows(scratch, webb, model):
-    """Yield global rows that have an EoS sim dir (seed + iterations)."""
-    seed = os.path.join(scratch, model, "SIMULATIONS", "EOS")
-    for d in glob.glob(os.path.join(seed, "poly*")):
-        m = re.search(r"poly(\d+)$", d)
-        if m and int(m.group(1)) < GEN0_N:
-            yield int(m.group(1))
+    """Global rows with a *populated* EoS sweep in SCRATCH or WEBB (seed +
+    iterations). Empty skeleton dirs are excluded."""
+    seen = set()
+    for base in _bases(scratch, webb):
+        for d in glob.glob(os.path.join(base, model, "SIMULATIONS", "EOS", "poly*")):
+            m = re.search(r"poly(\d+)$", d)
+            if m and int(m.group(1)) < GEN0_N and _has_content(d, "EOS"):
+                seen.add(int(m.group(1)))
     gens = set()
-    for base in (scratch, webb):
-        if not base:
-            continue
+    for base in _bases(scratch, webb):
         for gd in glob.glob(os.path.join(base, model, "GENERATIONS", "iteration_*")):
             gm = re.search(r"iteration_(\d+)$", gd)
             if gm and int(gm.group(1)) >= 1:
                 gens.add(int(gm.group(1)))
     for g in sorted(gens):
-        gd = gen_dir(scratch, webb, model, g)
-        if not gd:
-            continue
-        for d in glob.glob(os.path.join(gd, "SIMULATIONS", "EOS", "poly*")):
-            m = re.search(r"poly(\d+)$", d)
-            if m:
-                yield row_of(g, int(m.group(1)))
+        for base in _bases(scratch, webb):
+            for d in glob.glob(os.path.join(
+                    base, model, "GENERATIONS", f"iteration_{g}", "SIMULATIONS", "EOS", "poly*")):
+                m = re.search(r"poly(\d+)$", d)
+                if m and _has_content(d, "EOS"):
+                    seen.add(row_of(g, int(m.group(1))))
+    return sorted(seen)
 
 
 def audit_one(model, row, scratch, webb, label_density, label_exp):
     """Audit a single polymer. Module-level so joblib can pickle it."""
     gen, local = row_scope(row)
-    eos = eos_tail_pressure(sim_dir(scratch, webb, model, row, "EOS") or "")
+    eos = eos_loop_eval(sim_dir(scratch, webb, model, row, "EOS") or "")
     dd = sim_dir(scratch, webb, model, row, "DIFF")
     diff = diff_density(dd) if dd else None
     verdict, suggested, note = classify(label_density, eos, diff)
@@ -317,8 +334,10 @@ def audit_one(model, row, scratch, webb, label_density, label_exp):
         label_density=label_density, label_exp_density=label_exp,
         eos_rho_max=round(eos["rho_max"], 3) if eos else np.nan,
         eos_P_rhomax=round(eos["P"], 3) if eos else np.nan,
-        eos_P_err=round(eos["P_err"], 3) if eos else np.nan,
-        eos_loop_closed=eos["sig_positive"] if eos else np.nan,
+        eos_min_P=round(eos["min_P"], 3) if eos else np.nan,
+        eos_branch_reached=eos["branch_reached"] if eos else np.nan,
+        eos_has_neg_loop=eos["has_neg_loop"] if eos else np.nan,
+        eos_loop_closed=eos["loop_closed"] if eos else np.nan,
         diff_n_runs=diff["n_runs"] if diff else 0,
         diff_density=round(diff["density"], 3) if diff else np.nan,
         diff_within_std=round(diff["within_std"], 4) if diff else np.nan,
@@ -368,8 +387,8 @@ def cmd_report(args):
         print(f"[{model}] " + "  ".join(f"{k}={v}" for k, v in counts.items()))
     interesting = df[df["verdict"].isin(["FALSE_NEG", "FALSE_POS", "FLAG_EOS_INCOMPLETE", "FLAG_MISMATCH"])]
     cols = ["model", "gen", "poly_local", "row", "label_density", "label_exp_density",
-            "eos_P_rhomax", "eos_loop_closed", "diff_n_runs", "diff_density",
-            "diff_across_std", "verdict", "suggested_density", "note"]
+            "eos_min_P", "eos_has_neg_loop", "eos_branch_reached", "eos_loop_closed",
+            "diff_n_runs", "diff_density", "diff_across_std", "verdict", "suggested_density", "note"]
     print(f"\n{len(interesting)} rows need attention:")
     print(interesting[cols].to_string(index=False) if len(interesting) else "  (none)")
 
