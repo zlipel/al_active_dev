@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from external.core import calculate_mass
 #from scipy.integrate import quad
 import scipy
+import scipy.stats
 from scipy.interpolate import CubicSpline
 from scipy.optimize import root_scalar
 import pickle as pkl
@@ -202,7 +203,7 @@ def split_error(a, n):
 
 
 
-def bootstrap_eos_analysis(rho_values, P_matrix, nboot=500, work=15, threshold_fraction=0.5):
+def bootstrap_eos_analysis(rho_values, P_matrix, nboot=500, work=15, confidence=0.01):
     """
     Bootstraps the EOS to compute both condensed-phase density (ρ*) and expenditure density (W/m),
     ensuring statistical significance of negative pressures is checked **before** bootstrapping.
@@ -217,13 +218,13 @@ def bootstrap_eos_analysis(rho_values, P_matrix, nboot=500, work=15, threshold_f
         Number of bootstrap resamples (default is 1000).
     work : float, optional
         The target integral value for expenditure density (default is 15).
-    threshold_fraction : float, optional
-        Fraction of bootstrap samples that must show significant phase separation for ρ* to be computed (default is 0.5).
+    confidence : float, optional
+        Significance level for the per-density negative-pressure t-test (default is 0.01).
 
     Returns:
     --------
     rho_star_mean : float
-        Mean of bootstrapped condensed-phase density (ρ*). Returns 0 if threshold not met.
+        Mean of bootstrapped condensed-phase density (ρ*). Returns 0 if not significant.
     rho_star_std : float
         Standard deviation of ρ* (uncertainty estimate). Returns 0 if threshold not met.
     exp_density_mean : float
@@ -231,63 +232,52 @@ def bootstrap_eos_analysis(rho_values, P_matrix, nboot=500, work=15, threshold_f
     exp_density_std : float   """
 
     exp_density_values = []
-    
     cond_rho_values    = []
-    
 
     rhos = np.insert(rho_values, 0, 0)  # Include zero density
     xs = np.linspace(0.05, max(rhos)+0.2, 2000)
 
-    Pb = []
-    splines = []
+    # Phase-separation significance: one-sample t-test per density on the block
+    # pressures (df = n_blocks - 1). PS iff some density is significantly negative.
+    sig_neg = False
+    for blocks in P_matrix:
+        blocks = np.asarray(blocks, dtype=float)
+        m = blocks.mean()
+        if m < 0 and len(blocks) > 1:
+            se = blocks.std(ddof=1) / np.sqrt(len(blocks))
+            if se > 0 and scipy.stats.t.cdf(m / se, len(blocks) - 1) <= confidence:
+                sig_neg = True
+                break
 
+    splines = []
     for _ in range(nboot):
-   
         P_boot = np.array([np.mean(np.random.choice(P_vals, size=len(P_vals), replace=True)) for P_vals in P_matrix])
         P_boot = np.insert(P_boot, 0, 0)  # Include zero
-
         P_spline = CubicSpline(rhos, P_boot, bc_type=((1, 0.0), (2, 0.0)))
-
         splines.append(P_spline)
-        Pb.append(P_spline(xs))
         exp_density_values.append(calc_exp_density(P_spline, np.min(rho_values), np.max(rhos), work=work))
 
+    if sig_neg:
+        for S in splines:
+            vals = S(xs)
+            roots = []
+            for a, b2, fa, fb in zip(xs[:-1], xs[1:], vals[:-1], vals[1:]):
+                if fa == 0:
+                    roots.append(a)
+                elif fa*fb < 0:
+                    try:
+                        roots.append(root_scalar(S, bracket=[a, b2], method='brentq').root)
+                    except:
+                        pass
+            rr = [r for r in roots if r > np.min(rho_values)]
+            if rr:
+                rstar = max(rr)
+                if np.isfinite(rstar):
+                    cond_rho_values.append(rstar)
 
-        # next check if at least one pressure is negative 
-    try:
-        Pb = np.array(Pb, dtype=np.float64) # shape: nboot x len(xs)
-        sd = Pb.std(axis=0)
-        eps = 1.96*sd  # 95% confidence interval
-
-        near_flags = (Pb <= eps).any(axis=1) # shape: nboot
-    except Exception as e:
-        print(f"Error in processing bootstrapped pressures: {e}")
-        return 0, 0, -1, -1
-
-    for b, S in enumerate(splines):
-        vals = S(xs)
-        roots = []
-
-        for a, b2, fa, fb in zip(xs[:-1], xs[1:], vals[:-1], vals[1:]):
-            if fa == 0:
-                roots.append(a)
-            elif fa*fb < 0:
-                try:
-                    root = root_scalar(S, bracket=[a, b2], method='brentq').root
-                    roots.append(root)
-                except:
-                    pass
-        if roots and near_flags[b]:
-            rstar = max(r for r in roots if r > np.min(rho_values))
-            if np.isfinite(rstar):
-                cond_rho_values.append(rstar)
-        
-    sep_frac = float(near_flags.mean())
-    print(f"Fraction of phase-separating curves: {sep_frac*100:.2f}%")
-
-    if sep_frac >= threshold_fraction:
+    if sig_neg and cond_rho_values:
         rho_star_mean = np.mean(cond_rho_values)
-        rho_star_std = np.std(cond_rho_values, ddof=1)
+        rho_star_std = np.std(cond_rho_values, ddof=1) if len(cond_rho_values) > 1 else 0.0
     else:
         rho_star_mean = 0
         rho_star_std = 0
