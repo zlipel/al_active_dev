@@ -89,6 +89,13 @@ class ALConfig:
 
     acq_test: bool = False
 
+    #### Forward-run isolation knobs ####
+    # run_tag: suffix on ALPaths.tag (+ front-only paths); isolates parallel
+    # surrogate policies. "" ⇒ production naming unchanged.
+    run_tag: str = ""
+    # skip_data_prep: skip generate_features/labels; train on seeded gen-{N} CSVs.
+    skip_data_prep: bool = False
+
     #### MoE surrogate (used only when train_model_type == 'moe') ####
     # 'soft' — gate-weighted blend of PS + nonPS posteriors (combine_soft +
     #          soft_mixture_variance for means/vars; per-draw Bernoulli routing
@@ -113,7 +120,7 @@ class ALConfig:
             raise ValueError("Number of candidates must be positive.")    
         if self.obj1 == self.obj2:
             raise ValueError("Objectives must be different.")
-        if self.iteration > 0:
+        if self.iteration > 0 and not self.skip_data_prep:
             p = self.paths
             if not p.prev_features_csv.exists():
                 raise FileNotFoundError(f"Missing {p.prev_features_csv}")
@@ -142,7 +149,8 @@ class ALConfig:
             ehvi_variant=self.ehvi_variant,
             exploration_strategy=self.exploration_strategy,
             transform=self.transform,
-            mc_ehvi=self.mc_ehvi
+            mc_ehvi=self.mc_ehvi,
+            run_tag=self.run_tag,
         )
     
     

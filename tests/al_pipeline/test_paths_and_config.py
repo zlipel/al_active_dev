@@ -77,6 +77,49 @@ def test_alpaths_tag_property_matches_tag_function(tmp_path):
     assert p.tag == _tag(p.ehvi_variant, p.exploration_strategy, p.transform, p.front, p.mc_ehvi)
 
 
+# ---------- run_tag isolation (forward-convergence test) ----------
+
+def test_run_tag_empty_reproduces_bare_tag(tmp_path):
+    """Default run_tag='' must leave tag (and thus every _{tag} path) unchanged."""
+    p = _paths(tmp_path)
+    assert p.run_tag == ""
+    assert p.tag == "epsilon_kriging_believer_yeoj_upper"
+
+
+def test_run_tag_appends_to_tag(tmp_path):
+    p = ALPaths(base_path=tmp_path / "home", scratch_path=tmp_path / "scratch",
+                iteration=10, front="upper", model="hps_urry", run_tag="soft")
+    assert p.tag == "epsilon_kriging_believer_yeoj_upper_soft"
+
+
+def test_run_tag_threads_into_front_only_paths(tmp_path):
+    """The two paths not keyed by tag (candidates file, logs dir) must also carry
+    run_tag so policies don't collide there; empty run_tag matches production."""
+    bare = _paths(tmp_path, iteration=10, front="upper")
+    tagged = ALPaths(base_path=tmp_path / "home", scratch_path=tmp_path / "scratch",
+                     iteration=10, front="upper", model="hps_urry", run_tag="hard")
+    assert bare.next_iter_candidates_file.name == "simulation_candidates_gen11_upper.txt"
+    assert tagged.next_iter_candidates_file.name == "simulation_candidates_gen11_upper_hard.txt"
+    assert bare.logs_dir.name == "iteration_upper_10"
+    assert tagged.logs_dir.name == "iteration_upper_10_hard"
+
+
+def test_config_threads_run_tag_into_paths():
+    cfg = ALConfig(model="hps_urry", iteration=10, front="upper", run_tag="soft")
+    assert cfg.paths.run_tag == "soft"
+    assert cfg.paths.tag.endswith("_soft")
+
+
+def test_skip_data_prep_relaxes_prev_file_check():
+    """With skip_data_prep the iteration>0 prev-CSV existence check is bypassed,
+    so a seeded run doesn't require iteration_{N-1} data on disk."""
+    cfg_seeded = ALConfig(model="hps_urry", iteration=10, front="upper", skip_data_prep=True)
+    cfg_seeded.validate()  # must not raise even though prev CSVs don't exist
+    cfg_normal = ALConfig(model="hps_urry", iteration=10, front="upper")
+    with pytest.raises(FileNotFoundError):
+        cfg_normal.validate()
+
+
 # ---------- ALConfig objective contract ----------
 
 def test_default_obj1_obj2_match_analysis_csv_columns():

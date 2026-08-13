@@ -49,10 +49,12 @@ class ALPaths:
     exploration_strategy: str  = 'kriging_believer' # default is epsilon
     transform:            str  = 'yeoj' # default is Yeo-Johnson Transform
     mc_ehvi:              bool = False # default is analytic
+    run_tag:              str  = ""   # suffix on tag (+ front-only paths); isolates parallel policies
 
     @property
     def tag(self) -> str:
-        return _tag(self.ehvi_variant, self.exploration_strategy, self.transform, self.front, self.mc_ehvi)
+        base = _tag(self.ehvi_variant, self.exploration_strategy, self.transform, self.front, self.mc_ehvi)
+        return f"{base}_{self.run_tag}" if self.run_tag else base
     
     #### model directories ####
     @property
@@ -100,7 +102,10 @@ class ALPaths:
     
     @property
     def logs_dir(self) -> Path:
-        return self.model_home_dir / "logs" / f"iteration_{self.front}_{self.iteration}"
+        name = f"iteration_{self.front}_{self.iteration}"
+        if self.run_tag:
+            name += f"_{self.run_tag}"
+        return self.model_home_dir / "logs" / name
     
     #### data files####
     @property
@@ -230,7 +235,10 @@ class ALPaths:
     @property
     def next_iter_candidates_file(self) -> Path:
         nxt = self.iteration + 1
-        return self.next_iter_scratch_sim_dir / f"simulation_candidates_gen{nxt}_{self.front}.txt"
+        name = f"simulation_candidates_gen{nxt}_{self.front}"
+        if self.run_tag:
+            name += f"_{self.run_tag}"
+        return self.next_iter_scratch_sim_dir / f"{name}.txt"
     
     @property
     def next_iter_eos_dir(self) -> Path:

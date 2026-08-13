@@ -297,6 +297,7 @@ Every script:
 | `submit/run_acq_sweep.sh` | Convenience wrapper to submit acq-test runs per `(model, ehvi, explore)` tuple |
 | `submit/moe_diagnostic.sh` | MoE retrospective HV diagnostic (per (model, front, start_iter)) |
 | `submit/moe_forward_diagnostic.sh` | MoE forward (generation-forward) predictive-accuracy diagnostic |
+| `submit/forward_round.sh` | Forward-convergence round: re-run the next AL acquisition under one surrogate mode in an isolated tree |
 
 ### AL master examples
 
@@ -366,6 +367,24 @@ sbatch submit/moe_forward_diagnostic.sh --model HPS_URRY --start_iter 5
 Four CSVs (`forward_predictions_*`, `forward_metrics_*`, `forward_classifier_*`,
 `forward_ranking_*`) plus one plot per run. `forward_ranking_*` is the
 publication-ready summary, sorted by macro-mean z-space RMSE.
+
+### Forward-convergence round
+
+Re-runs the next AL acquisition round (`--iter 10` → gen-11 candidates) under a
+single surrogate mode, in an isolated scratch+base tree seeded with the curated
+gen-10 CSVs (production untouched). `--run_tag <mode>` keeps the modes from
+colliding; `--skip_data_prep` trains on the seeded labels instead of re-deriving
+them. One mode per job — run the three sequentially:
+
+```bash
+for MODE in global soft hard; do
+  sbatch --wait submit/forward_round.sh --model MPIPI --front upper --mode "$MODE" --ngen 8
+done
+```
+
+`--mode` is `global` (gpr_multitask) | `soft` (moe soft) | `hard` (moe hard);
+`--seed_dir` defaults to production scratch's `iteration_{iter}`. Outputs (EHVI
+per pick, proposed batch) are analyzed by `analysis/forward_convergence.py`.
 
 ---
 

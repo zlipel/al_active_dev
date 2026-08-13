@@ -31,14 +31,17 @@ def main() -> None:
     log.info("MASTER start")
 
     #### Generate features and labels from simulations ####
-    try:
-        log.info("Phase : Data preparation .... initiation")
-        generate_features(cfg, log=log)
-        generate_labels(cfg, log=log)  
-        log.info("Phase : Data preparation .... completed")
-    except Exception as e:
-        log.exception(f"Data preparation failed: {e}")
-        raise 
+    if cfg.skip_data_prep:
+        log.info("Phase : Data preparation .... SKIPPED (--skip_data_prep); using seeded features/labels")
+    else:
+        try:
+            log.info("Phase : Data preparation .... initiation")
+            generate_features(cfg, log=log)
+            generate_labels(cfg, log=log)
+            log.info("Phase : Data preparation .... completed")
+        except Exception as e:
+            log.exception(f"Data preparation failed: {e}")
+            raise
 
 
     #### Train the ML Surrogate models ####
@@ -54,7 +57,7 @@ def main() -> None:
     # ensure base normalized data exists after training
     assert p.features_norm_csv.exists(), f"Missing {p.features_norm_csv}"
 
-    if cfg.train_model_type == "gpr_multitask":
+    if cfg.train_model_type in ("gpr_multitask", "moe"):
         assert p.labels_norm_csv.exists(), f"Missing {p.labels_norm_csv}"
     elif cfg.train_model_type == "gpr_singletask":
         for obj in (cfg.obj1, cfg.obj2):
