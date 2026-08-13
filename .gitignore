@@ -66,3 +66,22 @@ file_inventory.txt
 
 # ── Presentations and related documents ─────────────────────────────
 presentations/
+
+# ── Local Claude state ────────────────────────────────────────────────────
+.claude/
+
+# ── Anomaly / label-curation exploration (kept local for provenance) ──────
+# One-off diagnostics + relabeling that produced the curated gen-10 labels.
+# Not part of the standing AL pipeline; untracked so they stay off main.
+analysis/_anomaly_step3/
+analysis/anomaly_pofrho_drilldown.py
+analysis/loop_drilldown.py
+analysis/eos_relabel.py
+analysis/correct_condensed_density_labels.py
+analysis/apply_final_labels.py
+analysis/correct_labels_ttest.py
+analysis/drilldown_x28.py
+analysis/plot_diff_vs_eos_density.py
+analysis/plot_expdensity_vs_diff.py
+analysis/relabel_extended.py
+submit/eos_relabel.sh
