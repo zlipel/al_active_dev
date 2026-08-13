@@ -136,7 +136,14 @@ class ALPaths:
     @property
     def norm_stats(self) -> Path:
         return self.iter_scratch_dir / f"normalization_stats.json"
-    
+
+    @property
+    def epsilon_shift_json(self) -> Path:
+        # Frozen epsilon shift for the batch: {"eps": [e0, e1], "n_base": N}.
+        # Computed once pre-loop (ga_utils.compute_and_store_shift); consumed by
+        # the temp-stage get_parents to shift the real front rows before Pareto.
+        return self.iter_scratch_dir / f"epsilon_shift_{self.tag}.json"
+
     @property
     def prev_iter_scratch_dir(self) -> Path:
         if self.iteration <= 0:

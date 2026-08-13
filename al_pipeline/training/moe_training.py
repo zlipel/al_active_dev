@@ -321,16 +321,18 @@ def train_moe_from_config(cfg: ALConfig, log=None) -> dict[str, Any]:
     if missing:
         raise KeyError(f"Required columns missing from {p.labels_csv}: {missing}")
     clean_idx = labels_df.dropna(subset=needed).index
+    n_dropped = len(labels_df) - len(clean_idx)
     features_df = features_df.loc[clean_idx].reset_index(drop=True)
     labels_df = labels_df.loc[clean_idx].reset_index(drop=True)
 
-    # Save the cleaned frames back under the same paths so the loader reads
-    # exactly the rows training saw. If the original frame had NaN rows that
-    # got dropped here, the on-disk file would have different row offsets than
-    # what `original_indices` references. Rewrite the CSVs as the cleaned
-    # source of truth.
-    features_df.to_csv(p.features_csv, index=False)
-    labels_df.to_csv(p.labels_csv, index=False)
+    # Only when NaN rows were actually dropped, rewrite the cleaned frames back
+    # so the loader reads exactly the rows training saw (original_indices are
+    # positions in the cleaned frame). Skip the rewrite otherwise: it would be a
+    # no-op that needlessly clobbers — and races — the un-tagged base CSVs that
+    # concurrent same-model (upper/lower) runs share.
+    if n_dropped > 0:
+        features_df.to_csv(p.features_csv, index=False)
+        labels_df.to_csv(p.labels_csv, index=False)
 
     is_ps = (labels_df[ps_col] > 0).to_numpy().astype(int)
     ps_indices = np.flatnonzero(is_ps == 1).tolist()

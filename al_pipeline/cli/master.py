@@ -12,8 +12,9 @@ from al_pipeline.core.logging import get_master_logger, get_child_logger, get_lo
 from al_pipeline.data_prep.features              import generate_features
 from al_pipeline.data_prep.labels                import generate_labels
 from al_pipeline.data_prep.parents               import get_parents
-from al_pipeline.data_prep.simulation_candidates import generate_simulation_candidates  
+from al_pipeline.data_prep.simulation_candidates import generate_simulation_candidates
 
+from al_pipeline.ga import ga_utils
 from al_pipeline.training.kfold_training import train_from_config
 
 
@@ -79,6 +80,15 @@ def main() -> None:
     assert p.parent_seqs_txt.exists(), f"Missing {p.parent_seqs_txt}"
     assert p.parent_features_norm_csv.exists(), f"Missing {p.parent_features_norm_csv}"
     assert p.parent_labels_norm_csv.exists(), f"Missing {p.parent_labels_norm_csv}"
+
+    #### Freeze the epsilon shift for the batch (once, from the base front) ####
+    try:
+        log.info("Phase : Epsilon shift .... initiation")
+        ga_utils.compute_and_store_shift(cfg, log=log)
+        log.info("Phase : Epsilon shift .... completed")
+    except Exception as e:
+        log.exception(f"Epsilon shift computation failed: {e}")
+        raise
 
     #### Launch child processes for GA candidate evaluations ####
     log.info("Launching child processes for GA candidates")

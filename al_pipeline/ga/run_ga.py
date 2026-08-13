@@ -223,7 +223,7 @@ def run_one_candidate(
             normalization_stats=normalization_stats,
         )
 
-    pareto_front, pareto_feats_raw_df, parent_seqs = ga_utils.load_front(cfg=cfg, seq_id=seq_id)
+    pareto_front, parent_seqs = ga_utils.load_front(cfg=cfg, seq_id=seq_id)
 
     # init population from parent sequences
     init_pop = _init_pop(parent_seqs)
@@ -238,15 +238,12 @@ def run_one_candidate(
     else:
         propseq_arr = np.empty((0, 0), dtype=np.float32)
 
-    # epsilon-shift (if enabled) and front augmentation. Routes through the
-    # surrogate — uniform path for global GPR and MoE.
-    pareto_input, eps = ga_utils.make_epsilon_shifted_front(
-        cfg=cfg,
-        pareto_front=pareto_front,
-        pareto_feats_raw_df=pareto_feats_raw_df,
-        surrogate=surrogate,
-    )
-    
+    # The reference front is already the epsilon-shifted real front unioned with
+    # the (unshifted) kriging-believer fantasy rows — the shift is frozen once
+    # pre-loop (ga_utils.compute_and_store_shift) and baked into the reference by
+    # get_parents. Feed it straight into front augmentation.
+    pareto_input = pareto_front
+
 
     # choose fitness function variant
     if cfg.mc_ehvi:

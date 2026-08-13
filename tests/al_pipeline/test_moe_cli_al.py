@@ -7,9 +7,9 @@ Covers the end-to-end chain:
     -> writes PS expert + nonPS expert + RF bundle + norm_stats.json
        + features_norm_csv + labels_norm_csv
     -> ga_utils.load_moe_bundle returns a validated MoEBundle
-    -> ga_utils.load_front returns raw parent features DataFrame (new signature)
-    -> ga_utils.make_epsilon_shifted_front routes through the surrogate ABC
-       (uniform for global GPR and MoE)
+    -> ga_utils.load_front returns (reference front, parent sequences)
+    -> ga_utils.compute_and_store_shift freezes eps once from the base front and
+       bakes it into the reference (loop needs no raw parent features)
     -> make_surrogate(cfg, moe_bundle=...) returns an MoESurrogate that
        wires cfg.moe_policy + cfg.moe_threshold
 
@@ -196,8 +196,9 @@ def test_make_surrogate_for_moe_uses_cfg_policy_and_threshold(trained_moe):
 
 # ---------- get_parents + load_front + epsilon-shift ----------
 
-def test_get_parents_writes_raw_and_normalized_parent_files(trained_moe):
-    """parents.py must write both parent_features_csv (raw, new) and parent_features_norm_csv."""
+def test_get_parents_base_writes_raw_and_normalized_parent_files(trained_moe):
+    """Base-stage get_parents writes the raw parent_features_csv (the one-time eps
+    input) plus the normalized parent files."""
     cfg = trained_moe
     # get_parents needs labels_norm_csv from training (which MoE training now writes).
     get_parents(cfg, stage="base")
@@ -208,53 +209,105 @@ def test_get_parents_writes_raw_and_normalized_parent_files(trained_moe):
     assert p.parent_seqs_txt.exists()
 
 
-def test_load_front_returns_raw_feats_dataframe(trained_moe):
-    """The new load_front contract: pareto_feats_raw_df is a DataFrame with the 29 columns."""
+def test_load_front_returns_front_and_seqs(trained_moe):
+    """load_front's contract: (reference front (N,2), aligned parent sequences)."""
     cfg = trained_moe
     get_parents(cfg, stage="base")   # idempotent
-    pareto_front, feats_raw_df, parent_seqs = ga_utils.load_front(cfg, seq_id=1)
-    assert isinstance(feats_raw_df, pd.DataFrame)
-    assert list(feats_raw_df.columns) == FEATURE_COLUMNS
-    assert pareto_front.shape == (len(feats_raw_df), 2)
-    assert len(parent_seqs) == len(feats_raw_df)
+    pareto_front, parent_seqs = ga_utils.load_front(cfg, seq_id=1)
+    assert pareto_front.ndim == 2 and pareto_front.shape[1] == 2
+    assert len(parent_seqs) == pareto_front.shape[0]
 
 
-def test_epsilon_shifted_front_routes_through_surrogate(trained_moe):
-    """The refactored make_epsilon_shifted_front takes a surrogate + raw DataFrame and
-    works uniformly for global and MoE. Verifies it returns a shifted front + eps tuple."""
+def test_compute_and_store_shift_freezes_and_bakes(trained_moe):
+    """compute_and_store_shift freezes eps from the base front + surrogate, writes
+    epsilon_shift_json (eps + n_base), and bakes the shift into the base reference."""
     cfg = trained_moe
     get_parents(cfg, stage="base")
-    pareto_front, feats_raw_df, _ = ga_utils.load_front(cfg, seq_id=1)
-    bundle = ga_utils.load_moe_bundle(cfg)
-    sur = make_surrogate(cfg, moe_bundle=bundle, moe_policy="soft", moe_threshold=0.5)
+    p = cfg.paths
+    before = pd.read_csv(p.parent_labels_norm_csv)[[cfg.obj1, cfg.obj2]].to_numpy().copy()
+    n_base_expected = len(pd.read_csv(p.labels_norm_csv))
 
-    shifted, eps = ga_utils.make_epsilon_shifted_front(
-        cfg=cfg, pareto_front=pareto_front, pareto_feats_raw_df=feats_raw_df, surrogate=sur,
+    ga_utils.compute_and_store_shift(cfg)
+
+    assert p.epsilon_shift_json.exists()
+    shift = json.loads(p.epsilon_shift_json.read_text())
+    assert shift["n_base"] == n_base_expected
+    assert len(shift["eps"]) == 2 and np.isfinite(shift["eps"]).all()
+    # Base front is all-real -> every row shifted by the same frozen eps.
+    after = pd.read_csv(p.parent_labels_norm_csv)[[cfg.obj1, cfg.obj2]].to_numpy()
+    np.testing.assert_allclose(
+        after - before, np.tile(shift["eps"], (len(before), 1)), atol=1e-6,
     )
-    # cfg.ehvi_variant='epsilon' so we got a real shift, not the no-op early return.
-    assert eps is not None and len(eps) == 2
-    assert np.isfinite(eps).all()
-    assert shifted.shape == pareto_front.shape
-    # Shifted front should differ from the original on at least one objective.
-    assert not np.allclose(shifted, pareto_front)
 
 
-def test_epsilon_shifted_front_no_op_when_variant_is_standard(trained_moe):
-    """ehvi_variant != 'epsilon' should short-circuit and return the front unchanged."""
-    cfg = trained_moe
-    # Build a cfg with ehvi_variant='standard' but reuse the trained artifacts.
-    # We can't modify the frozen cfg in-place — construct a sibling.
-    from dataclasses import replace
-    cfg_std = replace(cfg, ehvi_variant="standard")
-    get_parents(cfg, stage="base")
-    pareto_front, feats_raw_df, _ = ga_utils.load_front(cfg, seq_id=1)
-    bundle = ga_utils.load_moe_bundle(cfg)
-    sur = make_surrogate(cfg, moe_bundle=bundle, moe_policy="soft", moe_threshold=0.5)
-    shifted, eps = ga_utils.make_epsilon_shifted_front(
-        cfg=cfg_std, pareto_front=pareto_front, pareto_feats_raw_df=feats_raw_df, surrogate=sur,
+def test_compute_and_store_shift_noop_when_standard(tmp_path: Path):
+    """ehvi_variant != 'epsilon' -> eps=[0,0], no surrogate touched, front unchanged."""
+    base = tmp_path / "home"; scratch = tmp_path / "scratch"; db = tmp_path / "db"
+    for d in (base, scratch, db):
+        d.mkdir(parents=True, exist_ok=True)
+    cfg = ALConfig(
+        model="TEST", iteration=0, front="upper",
+        base_path=base, scratch_path=scratch, db_path=db,
+        train_model_type="moe", ehvi_variant="standard",
     )
-    assert eps is None
-    np.testing.assert_array_equal(shifted, pareto_front)
+    p = cfg.ensure()
+    labels = pd.DataFrame({cfg.obj1: [0.1, 0.5], cfg.obj2: [0.5, 0.1]})
+    labels.to_csv(p.labels_norm_csv, index=False)
+    labels.to_csv(p.parent_labels_norm_csv, index=False)
+
+    ga_utils.compute_and_store_shift(cfg)
+
+    shift = json.loads(p.epsilon_shift_json.read_text())
+    assert shift["eps"] == [0.0, 0.0]
+    assert shift["n_base"] == 2
+    np.testing.assert_array_equal(
+        pd.read_csv(p.parent_labels_norm_csv).to_numpy(), labels.to_numpy(),
+    )
+
+
+def test_get_parents_temp_stage_handles_grown_fantasy_rows(tmp_path: Path):
+    """Regression: at 'temp' the normalized/sequence files have grown with KB fantasy
+    rows while the base features_csv has not. get_parents must shift the real rows
+    (< n_base) by the frozen eps, union the unshifted fantasy rows, and Pareto — with
+    no IndexError and aligned reference outputs. CSV-only (no featurizer/DB)."""
+    base = tmp_path / "home"; scratch = tmp_path / "scratch"; db = tmp_path / "db"
+    for d in (base, scratch, db):
+        d.mkdir(parents=True, exist_ok=True)
+    cfg = ALConfig(
+        model="TEST", iteration=0, front="upper",
+        base_path=base, scratch_path=scratch, db_path=db,
+        train_model_type="moe", ehvi_variant="epsilon",
+    )
+    p = cfg.ensure()
+    obj1, obj2 = cfg.obj1, cfg.obj2
+
+    n_base = 4
+    # 4 real rows on an upper (max-max) front + 1 non-dominated fantasy row.
+    real = pd.DataFrame({obj1: [0.1, 0.4, 0.7, 0.9], obj2: [0.9, 0.7, 0.4, 0.1]})
+    fantasy = pd.DataFrame({obj1: [0.8], obj2: [0.8]})
+    labels = pd.concat([real, fantasy], ignore_index=True)
+    labels.to_csv(p.labels_norm_csv, index=False)
+    # features_norm: same row count, 29 cols (values irrelevant to the front math).
+    pd.DataFrame(
+        np.zeros((len(labels), len(FEATURE_COLUMNS))), columns=FEATURE_COLUMNS,
+    ).to_csv(p.features_norm_csv, index=False)
+    seqs = [f"SEQ{i}" for i in range(len(labels))]
+    p.seq_gen_temp_txt.write_text("\n".join(seqs) + "\n")
+    eps = [0.05, 0.05]
+    p.epsilon_shift_json.write_text(json.dumps({"eps": eps, "n_base": n_base}))
+
+    get_parents(cfg, stage="temp")   # must not raise (the original bug was IndexError)
+
+    ref = pd.read_csv(p.parent_labels_norm_csv)
+    ref_seqs = p.parent_seqs_temp_txt.read_text().split()
+    ref_pts = ref[[obj1, obj2]].to_numpy()
+    assert len(ref) == len(ref_seqs) >= 1
+    # Fantasy point joins the reference UNSHIFTED.
+    assert any(np.allclose(row, [0.8, 0.8]) for row in ref_pts)
+    # A real front member appears SHIFTED by eps (e.g. the extreme (0.1, 0.9)+eps).
+    assert any(np.allclose(row, [0.15, 0.95]) for row in ref_pts)
+    # temp stage must not re-write the raw base parent features file.
+    assert not p.parent_features_csv.exists()
 
 
 # ---------- ALConfig validation ----------

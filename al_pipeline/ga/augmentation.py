@@ -467,12 +467,13 @@ def augment(cfg: ALConfig, *, seq_id: int, pessimism: bool, log=None) -> None:
         assigned = bundle.ps_expert if is_ps else bundle.nonps_expert
         regime = "ps" if is_ps else "nonps"
 
-        # The child's z-space labels for the expert: use the *no-pessimism*
-        # mean row. Pessimism is an acquisition-side penalty, not a training
-        # label — same convention as the global kriging-believer path,
-        # which trains on `mu` (via labels_total.iloc[-1]) not `preds`.
+        # The child's z-space label for the expert: use `preds[-1]` — the
+        # pessimism-adjusted believed label when `--pessimism` is on (seq_id>1),
+        # else the plain posterior mean. Matches the global kriging-believer path,
+        # which retrains on `labels_total` (grown with `preds`), so both surrogate
+        # types condition on the same believed value.
         train_x_new, train_y_new = _reindex_expert(
-            assigned, raw_feats_df, mu[-1], lr=cfg.learning_rate,
+            assigned, raw_feats_df, preds[-1], lr=cfg.learning_rate,
         )
         _save_moe_temp(cfg, bundle, regime, train_x_new, train_y_new)
         if log:
