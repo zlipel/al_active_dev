@@ -412,7 +412,19 @@ def augment(cfg: ALConfig, *, seq_id: int, pessimism: bool, log=None) -> None:
     if "kriging_believer" in cfg.exploration_strategy:
         preds, S, sig = predict_for_augmentation(surrogate, raw_feats_df, return_std=True)
         if pessimism and seq_id > 1:
-            prev_feats_raw_df = feats_new.iloc[-seq_id:-1]   # earlier children in this batch
+            # Earlier children in this batch, RAW-featurized. features_norm_csv
+            # holds GLOBALLY-NORMALIZED rows, but the surrogate expects RAW
+            # features (it normalizes internally — per-regime for the MoE experts,
+            # and the RF gate re-derives its own convert_features matrix). Feeding
+            # normalized rows as "raw" pushes convert_features' log/ratio terms to
+            # inf and sklearn rejects the RF input. Re-featurize from the picked
+            # sequences instead, matching the current child's raw path.
+            prev_seqs = []
+            for i in range(1, seq_id):
+                with open(p.ga_children_dir / f"seq_child_{i}.txt", "r") as cf:
+                    prev_seqs.append(cf.readline().strip())
+            prev_raw_arr = np.asarray([featurizer.featurize(s) for s in prev_seqs])
+            prev_feats_raw_df = pd.DataFrame(prev_raw_arr, columns=column_names)
             mu_cands, S_cands = predict_for_augmentation(surrogate, prev_feats_raw_df, return_std=False)
             sign = -1.0 if cfg.front == "upper" else +1.0
             penalty = sign * overlap_batch(preds.copy(), S, mu_cands, S_cands)

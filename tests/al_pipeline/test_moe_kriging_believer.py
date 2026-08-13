@@ -637,3 +637,43 @@ def test_augment_kb_moe_freezes_and_reuses_normalization_on_fantasy(_moe_iter_di
     np.testing.assert_allclose(
         grew_after.model.train_inputs[0][-1].detach().numpy(), expected_x, rtol=1e-5, atol=1e-6,
     )
+
+
+def test_augment_kb_moe_pessimism_feeds_raw_prev_children(_moe_iter_dir, monkeypatch):
+    """Regression: the pessimism overlap must RE-FEATURIZE prior children (RAW),
+    not reuse the globally-normalized rows from features_norm_csv. Feeding
+    normalized rows as "raw" sends the MoE RF gate's convert_features to inf
+    ('Input X contains infinity ...'). Spy the surrogate calls and assert the
+    prior-children frame carries RAW features, not the normalized ones."""
+    monkeypatch.setattr(augmentation.sf, "SequenceFeaturizer", _DetFeaturizer)
+    cfg = replace(_moe_iter_dir, pessimism=True)
+    p = cfg.paths
+
+    calls: list[pd.DataFrame] = []
+    orig = augmentation.predict_for_augmentation
+
+    def _spy(surrogate, features_raw_df, return_std=False):
+        calls.append(features_raw_df.copy())
+        return orig(surrogate, features_raw_df, return_std=return_std)
+
+    monkeypatch.setattr(augmentation, "predict_for_augmentation", _spy)
+
+    augmentation.augment(cfg, seq_id=1, pessimism=True)   # seeds child_1
+    child2 = "MKKLVAGGGWLYNTRQPPRDDEELLSKGG"
+    (p.ga_children_dir / "seq_child_2.txt").write_text(child2 + "\n")
+    calls.clear()
+    augmentation.augment(cfg, seq_id=2, pessimism=True)   # would crash under the bug
+
+    # Two predict calls at seq_id=2: [current child, prior children].
+    assert len(calls) == 2
+    prev_df = calls[1]
+    assert len(prev_df) == 1                              # one prior child (child_1)
+    assert np.isfinite(prev_df.to_numpy()).all()          # not inf/over-range
+
+    # The prior-children row is the RAW featurization of child_1, NOT its
+    # normalized row in features_norm_csv (which is what the bug fed).
+    child1 = (p.ga_children_dir / "seq_child_1.txt").read_text().strip()
+    expected_raw = np.asarray(_DetFeaturizer().featurize(child1), dtype=float)
+    np.testing.assert_allclose(prev_df.iloc[0].to_numpy(), expected_raw, rtol=1e-6, atol=1e-6)
+    norm_row = pd.read_csv(p.features_norm_csv).iloc[-2].to_numpy()   # child_1's normalized row
+    assert not np.allclose(prev_df.iloc[0].to_numpy(), norm_row)
