@@ -151,6 +151,9 @@ def breakdown(df: pd.DataFrame, min_corr: float, per_model: bool) -> pd.DataFram
 def parity_plot(df: pd.DataFrame, axis: str, title: str, out_png: Path) -> None:
     markers = {"MPIPI": "o", "HPS_URRY": "s", "CALVADOS": "^", "MARTINI": "D", "HPS_KR": "v"}
     colors = {"ps": "#c0392b", "nonps": "#2c7fb8"}
+    # diff spans ~2 orders of magnitude (PS ~0.1 -> nonPS ~40); log scale keeps
+    # the low-diff PS points legible instead of crushing them into the corner.
+    log = axis == "diff"
     fig, ax = plt.subplots(figsize=(6.2, 6.2))
     for m in sorted(df["model"].unique()):
         for reg in ["ps", "nonps"]:
@@ -160,9 +163,15 @@ def parity_plot(df: pd.DataFrame, axis: str, title: str, out_png: Path) -> None:
             ax.scatter(s["sim"], s["pred"], marker=markers.get(m, "o"),
                        c=colors[reg], s=55, edgecolor="k", linewidth=0.4,
                        alpha=0.85, label=f"{m} / {reg}")
-    hi = max(df["sim"].max(), df["pred"].max())
-    lo = min(0.0, df["sim"].min(), df["pred"].min())
-    span = [lo, hi + 0.08 * abs(hi - lo)]
+    if log:
+        pos = np.concatenate([df["sim"].values, df["pred"].values])
+        pos = pos[pos > 0]
+        span = [pos.min() * 0.7, pos.max() * 1.4]
+        ax.set_xscale("log"); ax.set_yscale("log")
+    else:
+        hi = max(df["sim"].max(), df["pred"].max())
+        lo = min(0.0, df["sim"].min(), df["pred"].min())
+        span = [lo, hi + 0.08 * abs(hi - lo)]
     ax.plot(span, span, "k--", lw=1, label="y = x")
     ax.set_xlim(span); ax.set_ylim(span)
     ax.set_xlabel(f"simulated {AXES[axis]['sim_col']}")
