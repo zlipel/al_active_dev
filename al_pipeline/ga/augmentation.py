@@ -276,17 +276,15 @@ def _reindex_expert(assigned, new_child_raw_df: pd.DataFrame,
     return train_x_new, train_y_new
 
 
-def _save_moe_temp(cfg: ALConfig, moe_bundle, assigned_regime: str,
-                    assigned_train_x, assigned_train_y):
+def _save_moe_temp(cfg: ALConfig, moe_bundle):
     """
     Persist MoE temp checkpoints for the next seq_id.
 
-    The assigned expert stores its expanded train tensors directly (temp
-    checkpoints don't need to be re-derivable from CSVs — the batch throws
-    them away once real labels come in). The other expert re-uses whatever
-    train tensors it's currently holding (either the base tensors from
-    original_indices, or the expanded tensors from an earlier seq_id).
-    The RF bundle is saved verbatim (frozen during batch generation).
+    Both experts are reconditioned in place (kriging-believer conditions the
+    whole mixture, not just the gated expert), so each stores its own expanded
+    train tensors directly — temp checkpoints don't need to be re-derivable from
+    CSVs, the batch throws them away once real labels come in. The RF bundle is
+    saved verbatim (frozen during batch generation).
     """
     p = cfg.paths
     common = {
@@ -295,31 +293,20 @@ def _save_moe_temp(cfg: ALConfig, moe_bundle, assigned_regime: str,
         "label_scaler_scope": "all",
     }
 
-    # PS expert
-    ps_train_x = (assigned_train_x if assigned_regime == "ps"
-                  else moe_bundle.ps_expert.model.train_inputs[0])
-    ps_train_y = (assigned_train_y if assigned_regime == "ps"
-                  else moe_bundle.ps_expert.model.train_targets)
     moe_bundle.ps_expert.save_checkpoint(
         str(p.moe_ps_chkpt(temp=True)),
         regime="ps",
         original_indices=[],   # ignored when direct tensors are present
-        train_x_direct=ps_train_x,
-        train_y_direct=ps_train_y,
+        train_x_direct=moe_bundle.ps_expert.model.train_inputs[0],
+        train_y_direct=moe_bundle.ps_expert.model.train_targets,
         **common,
     )
-
-    # nonPS expert
-    nps_train_x = (assigned_train_x if assigned_regime == "nonps"
-                   else moe_bundle.nonps_expert.model.train_inputs[0])
-    nps_train_y = (assigned_train_y if assigned_regime == "nonps"
-                   else moe_bundle.nonps_expert.model.train_targets)
     moe_bundle.nonps_expert.save_checkpoint(
         str(p.moe_nonps_chkpt(temp=True)),
         regime="nonps",
         original_indices=[],
-        train_x_direct=nps_train_x,
-        train_y_direct=nps_train_y,
+        train_x_direct=moe_bundle.nonps_expert.model.train_inputs[0],
+        train_y_direct=moe_bundle.nonps_expert.model.train_targets,
         **common,
     )
 
@@ -467,31 +454,32 @@ def augment(cfg: ALConfig, *, seq_id: int, pessimism: bool, log=None) -> None:
 
     # Retrain / re-condition
     if cfg.train_model_type == "moe":
-        # Hard-gate assignment on the new child (design memo:
-        # project_moe_kriging_believer). RF is frozen during the batch, so
-        # p_ps here uses whatever RF was loaded (base for seq_id=1, temp
-        # otherwise — both are copies of the same base RF).
+        # Kriging-believer for the soft mixture: recondition BOTH experts on the
+        # SAME believed label so they agree at the fantasy point x*. The EHVI is
+        # taken over the moment-matched mixture whose variance carries a
+        # between-expert disagreement term p(1-p)(mu_PS - mu_nonPS)^2. Conditioning
+        # only the gated expert leaves that term (and the other expert's variance)
+        # intact, so the mixture EHVI barely moves at x* and the batch re-picks the
+        # same optimum. Driving mu_PS(x*) and mu_nonPS(x*) to the same believed
+        # value collapses the disagreement term (and both within-variances) at x*,
+        # so the mixture EHVI actually drops and the batch diversifies.
+        #
+        # Believed label = preds[-1]: pessimism-adjusted when --pessimism (seq_id>1),
+        # else the plain posterior mean — the same value written to labels_norm_csv.
+        # The RF gate stays frozen; its routing is logged for provenance only.
         X_rf, _ = build_rf_features(
             raw_feats_df, bundle.rf_raw_feature_columns, bundle.rf_converted_feature_columns,
         )
         p_ps_child = float(classifier_p_ps(bundle.rf, X_rf)[0])
-        is_ps = p_ps_child >= cfg.moe_threshold
-        assigned = bundle.ps_expert if is_ps else bundle.nonps_expert
-        regime = "ps" if is_ps else "nonps"
+        regime = "ps" if p_ps_child >= cfg.moe_threshold else "nonps"
 
-        # The child's z-space label for the expert: use `preds[-1]` — the
-        # pessimism-adjusted believed label when `--pessimism` is on (seq_id>1),
-        # else the plain posterior mean. Matches the global kriging-believer path,
-        # which retrains on `labels_total` (grown with `preds`), so both surrogate
-        # types condition on the same believed value.
-        train_x_new, train_y_new = _reindex_expert(
-            assigned, raw_feats_df, preds[-1], lr=cfg.learning_rate,
-        )
-        _save_moe_temp(cfg, bundle, regime, train_x_new, train_y_new)
+        _reindex_expert(bundle.ps_expert, raw_feats_df, preds[-1], lr=cfg.learning_rate)
+        _reindex_expert(bundle.nonps_expert, raw_feats_df, preds[-1], lr=cfg.learning_rate)
+        _save_moe_temp(cfg, bundle)
         if log:
             log.info(
-                f"MoE seq_id={seq_id}: hard-gated to {regime!r} "
-                f"(p_ps={p_ps_child:.3f} >= {cfg.moe_threshold}); "
+                f"MoE seq_id={seq_id}: reconditioned BOTH experts on the believed "
+                f"label (gate routed x* to {regime!r}, p_ps={p_ps_child:.3f}); "
                 f"temp checkpoints saved."
             )
     else:

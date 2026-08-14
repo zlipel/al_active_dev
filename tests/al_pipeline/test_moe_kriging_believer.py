@@ -422,14 +422,13 @@ def test_augment_kriging_believer_moe_writes_temp_artifacts(_moe_iter_dir):
     # seq_gen_temp updated too.
     assert p.seq_gen_temp_txt.exists()
 
-    # Reloaded temp bundle: assigned expert grew by 1, other unchanged.
+    # Reloaded temp bundle: BOTH experts grew by 1 (kriging-believer conditions
+    # the whole mixture, not just the gated expert).
     bundle_temp = load_moe_bundle(cfg, temp=True)
     ps_n_after = bundle_temp.ps_expert.model.train_inputs[0].shape[0]
     nps_n_after = bundle_temp.nonps_expert.model.train_inputs[0].shape[0]
-    grew_ps = (ps_n_after == ps_n_before + 1) and (nps_n_after == nps_n_before)
-    grew_nps = (nps_n_after == nps_n_before + 1) and (ps_n_after == ps_n_before)
-    assert grew_ps or grew_nps, (
-        f"Expected exactly one expert to grow by 1: ps {ps_n_before}->{ps_n_after}, "
+    assert ps_n_after == ps_n_before + 1 and nps_n_after == nps_n_before + 1, (
+        f"Expected BOTH experts to grow by 1: ps {ps_n_before}->{ps_n_after}, "
         f"nonps {nps_n_before}->{nps_n_after}"
     )
 
@@ -510,21 +509,31 @@ def _expert_sizes(bundle) -> tuple[int, int]:
     )
 
 
-@pytest.mark.parametrize("threshold,expect_regime", [(0.0, "ps"), (1.0 + 1e-9, "nonps")])
-def test_augment_kb_moe_routes_child_to_gated_expert(_moe_iter_dir, threshold, expect_regime):
-    """(req 2) In KB mode the child (fantasy point) is hard-gated by the RF and
-    reconditioned into that expert only. Force the gate with an extreme threshold
-    (0 -> always PS, >1 -> always nonPS) and assert exactly the gated expert grew."""
+@pytest.mark.parametrize("threshold", [0.0, 0.5, 1.0 + 1e-9])
+def test_augment_kb_moe_reconditions_both_experts_on_shared_label(_moe_iter_dir, threshold):
+    """Kriging-believer conditions the whole mixture: BOTH experts are
+    reconditioned on the SAME believed label so they agree at x* (this is what
+    collapses the between-expert disagreement term of the mixture variance).
+    Independent of the gate threshold, both experts grow by exactly one row and
+    that appended row is the same z-space believed label in each."""
     cfg = replace(_moe_iter_dir, moe_threshold=threshold)
     ps_before, nps_before = _expert_sizes(load_moe_bundle(cfg, temp=False))
 
     augmentation.augment(cfg, seq_id=1, pessimism=False)
 
-    ps_after, nps_after = _expert_sizes(load_moe_bundle(cfg, temp=True))
-    if expect_regime == "ps":
-        assert ps_after == ps_before + 1 and nps_after == nps_before
-    else:
-        assert nps_after == nps_before + 1 and ps_after == ps_before
+    bundle = load_moe_bundle(cfg, temp=True)
+    ps_after, nps_after = _expert_sizes(bundle)
+    # Regardless of routing, BOTH experts grew by exactly one.
+    assert ps_after == ps_before + 1 and nps_after == nps_before + 1
+
+    # The believed label written to disk this step (== labels_norm_csv tail).
+    believed = pd.read_csv(cfg.paths.labels_norm_csv).iloc[-1][[cfg.obj1, cfg.obj2]].to_numpy()
+    ps_y = bundle.ps_expert.model.train_targets[-1].detach().numpy()
+    nps_y = bundle.nonps_expert.model.train_targets[-1].detach().numpy()
+    # Both experts were conditioned on the identical believed label.
+    np.testing.assert_allclose(ps_y, believed, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(nps_y, believed, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(ps_y, nps_y, rtol=1e-6, atol=1e-8)
 
 
 def test_augment_kb_moe_loop_consumes_and_grows_temp_norm_files(_moe_iter_dir):
@@ -555,10 +564,11 @@ def test_augment_kb_moe_loop_consumes_and_grows_temp_norm_files(_moe_iter_dir):
     assert len(pd.read_csv(p.features_norm_csv)) == n_feat0 + 2
     assert len(p.seq_gen_temp_txt.read_text().split()) == n_seq0 + 2
 
-    # Combined expert train set grew by exactly 2 -> seq_id=2 loaded the temp
-    # bundle from seq_id=1 (base+1) and chained (+1). Base reload would give +1.
+    # Both experts grow by 1 each per augment, so two augments add 4 combined ->
+    # seq_id=2 loaded the temp bundle from seq_id=1 (base+1 each) and chained
+    # (+1 each). A base reload at seq_id=2 would give only +2 combined.
     ps2, nps2 = _expert_sizes(load_moe_bundle(cfg, temp=True))
-    assert (ps2 + nps2) == (ps0 + nps0) + 2
+    assert (ps2 + nps2) == (ps0 + nps0) + 4
 
 
 def test_augment_kb_moe_pessimism_conservative_and_reconditions_on_believed_label(
@@ -574,7 +584,6 @@ def test_augment_kb_moe_pessimism_conservative_and_reconditions_on_believed_labe
     p = cfg.paths
 
     augmentation.augment(cfg, seq_id=1, pessimism=True)   # seeds; no penalty at seq_id=1
-    sizes_after1 = _expert_sizes(load_moe_bundle(cfg, temp=True))
 
     child2 = "MKKLVAGGGWLYNTRQPPRDDEELLSKGG"
     (p.ga_children_dir / "seq_child_2.txt").write_text(child2 + "\n")
@@ -588,14 +597,13 @@ def test_augment_kb_moe_pessimism_conservative_and_reconditions_on_believed_labe
     assert not np.allclose(believed, optimistic)
     assert np.all(believed <= optimistic + 1e-8)
 
-    # The reconditioned expert's newly appended target is the PESSIMISTIC label
+    # BOTH reconditioned experts' newly appended target is the PESSIMISTIC label
     # (== labels_norm_csv tail), NOT the optimistic mean (labels_no_pessimism).
     bundle2 = load_moe_bundle(cfg, temp=True)
-    ps2, nps2 = _expert_sizes(bundle2)
-    grew = bundle2.ps_expert if ps2 == sizes_after1[0] + 1 else bundle2.nonps_expert
-    recond_y = grew.model.train_targets[-1].detach().numpy()
-    np.testing.assert_allclose(recond_y, believed, rtol=1e-5, atol=1e-6)
-    assert not np.allclose(recond_y, optimistic)
+    for expert in (bundle2.ps_expert, bundle2.nonps_expert):
+        recond_y = expert.model.train_targets[-1].detach().numpy()
+        np.testing.assert_allclose(recond_y, believed, rtol=1e-5, atol=1e-6)
+        assert not np.allclose(recond_y, optimistic)
 
 
 def test_augment_kb_moe_freezes_and_reuses_normalization_on_fantasy(_moe_iter_dir):
