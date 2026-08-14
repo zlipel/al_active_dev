@@ -1,9 +1,9 @@
 """
-MoE training-time fit plots.
+Training-time surrogate fit plots (MoE + global multitask).
 
-Two parity plots per objective, both collapsing the PS / nonPS experts with the
-surrogate POLICY (the same combine the AL acquisition uses) into one aggregate
-prediction:
+For the MoE, two parity plots per objective, both collapsing the PS / nonPS
+experts with the surrogate POLICY (the same combine the AL acquisition uses)
+into one aggregate prediction:
 
   * FIT     — in-sample: the just-trained deployed MoE predicts every training
               row. The MoE analog of the multitask GPR parity plot in
@@ -19,8 +19,12 @@ Everything lives in shared z-space (the space the experts predict into under
 the mixture variance (law of total variance) so the panels reflect calibration,
 not just point accuracy — the same statistic the epsilon shift / pessimism read.
 
+`plot_global_holdout_fit` applies the *same* HELDOUT protocol to the global
+multitask GPR (a single GP fit on the 80% train, no gate), so global vs MoE
+generalization is directly comparable on an identical split.
+
 Diagnostic only: nothing here mutates the deployed checkpoints. The FIT plot
-reuses the just-trained experts; the HELDOUT plot trains throwaway experts on a
+reuses the just-trained experts; the HELDOUT plots train throwaway models on a
 subset. The caller wraps these in ``try/except`` so a plotting failure never
 breaks training.
 """
@@ -69,9 +73,13 @@ def _parity_panels(
     series: list[dict[str, Any]],
     label_columns: list[str],
     kind: str,
+    model_label: str,
     log=None,
 ) -> dict[str, dict[str, float]]:
     """One z-space parity panel per objective, overlaying every series.
+
+    ``model_label`` (e.g. ``"MoE soft"`` / ``"GPR multitask"``) names the plot
+    title and the file prefix (spaces -> underscores).
 
     Each ``series`` entry is a dict::
 
@@ -110,7 +118,7 @@ def _parity_panels(
             pooled.append(y[finite]); pooled.append(yhat[finite])
             headline = {"r2": float(r2), "nll_z": float(nll), "n": float(n)}
             if log:
-                log.info(f"[moe {kind.lower()} plot] {label} [{s['name']}]: "
+                log.info(f"[{model_label} {kind.lower()}] {label} [{s['name']}]: "
                          f"R2={r2:.4f} NLPD_z={nll:.4f} (n={n})")
 
         cat = (np.concatenate([a for a in pooled if a.size])
@@ -119,16 +127,17 @@ def _parity_panels(
         ax.plot([lo, hi], [lo, hi], "r--", lw=0.8)
         ax.set_xlabel(f"True {label} (z)", fontsize=6)
         ax.set_ylabel(f"Predicted {label} (z)", fontsize=6)
-        ax.set_title(f"MoE {cfg.moe_policy} {kind} — {label}", fontsize=6)
+        ax.set_title(f"{model_label} {kind} — {label}", fontsize=6)
         ax.tick_params(axis="both", which="both", labelsize=4, direction="in")
         ax.legend(fontsize=4.5, loc="best")
         fig.tight_layout()
-        fig_path = p.models_dir / f"MoE_{cfg.moe_policy}_iter{cfg.iteration}_{p.tag}_{kind}_{label}.png"
+        prefix = model_label.replace(" ", "_")
+        fig_path = p.models_dir / f"{prefix}_iter{cfg.iteration}_{p.tag}_{kind}_{label}.png"
         fig.savefig(str(fig_path), dpi=300, bbox_inches="tight")
         plt.close(fig)
 
         if log:
-            log.info(f"[moe {kind.lower()} plot] {label}: wrote {fig_path.name}")
+            log.info(f"[{model_label} {kind.lower()}] {label}: wrote {fig_path.name}")
         out[label] = headline
     return out
 
@@ -192,7 +201,7 @@ def plot_moe_insample_fit(
         "name": "all data", "true_z": true_z, "pred_zm": zm, "pred_zv": zv,
         "color": "orange", "alpha": 0.3, "size": 10,
     }]
-    return _parity_panels(cfg, series, [obj1, obj2], "FIT", log=log)
+    return _parity_panels(cfg, series, [obj1, obj2], "FIT", f"MoE {cfg.moe_policy}", log=log)
 
 
 def _agglomerative_labels(D: np.ndarray, n_clusters: int) -> np.ndarray:
@@ -337,4 +346,65 @@ def plot_moe_holdout_fit(
         {"name": "test (20%)", "true_z": te_true, "pred_zm": te_zm, "pred_zv": te_zv,
          "color": "orange", "alpha": 0.6, "size": 16},
     ]
-    return _parity_panels(cfg, series, [obj1, obj2], "HELDOUT", log=log)
+    return _parity_panels(cfg, series, [obj1, obj2], "HELDOUT", f"MoE {cfg.moe_policy}", log=log)
+
+
+def plot_global_holdout_fit(
+    cfg: ALConfig,
+    features_df: pd.DataFrame,
+    labels_df: pd.DataFrame,
+    is_ps: np.ndarray,
+    *,
+    log=None,
+    test_frac: float = 0.2,
+    seed: int = 0,
+) -> dict[str, dict[str, float]]:
+    """Similarity-cluster-holdout parity plot for the GLOBAL multitask GPR.
+
+    Same protocol as `plot_moe_holdout_fit` (regime-stratified similarity split,
+    train-only scalers, train+test overlay, z-space R²+NLPD), but with a single
+    multitask GP fit on the 80% train (both regimes) instead of the mixture — so
+    global vs MoE held-out numbers are directly comparable (identical split for a
+    given seed). Writes `GPR_multitask_iter{N}_{tag}_HELDOUT_{label}.png`.
+    """
+    import copy
+    from al_pipeline.diagnostic.al_regime_oof import _true_labels_to_z  # deferred
+    from al_pipeline.surrogates.gpr_expert import GPRExpert             # deferred
+    from al_pipeline.training.moe_training import FEATURE_COLUMNS, _fit_label_scalers
+
+    obj1, obj2 = cfg.obj1, cfg.obj2
+    is_ps_arr = np.asarray(is_ps).astype(bool)
+
+    tr_idx, te_idx = similarity_cluster_holdout(
+        features_df, is_ps_arr, test_frac=test_frac, seed=seed,
+    )
+    if len(te_idx) < 2 or len(tr_idx) < 2:
+        if log:
+            log.warning(f"[GPR multitask heldout] split too small "
+                        f"(train={len(tr_idx)} test={len(te_idx)}); skipping.")
+        return {}
+
+    scaler1, scaler2 = _fit_label_scalers(labels_df.iloc[tr_idx], [obj1, obj2], cfg.transform)
+    expert = GPRExpert.train(
+        features_df.iloc[tr_idx].reset_index(drop=True),
+        labels_df.iloc[tr_idx].reset_index(drop=True),
+        [obj1, obj2], cfg.transform,
+        copy.deepcopy(scaler1), copy.deepcopy(scaler2),
+        FEATURE_COLUMNS, lr=cfg.learning_rate, epochs=cfg.epochs, patience=cfg.patience,
+    )
+
+    def _series(idx, name, color, alpha, size):
+        feats = features_df.iloc[idx].reset_index(drop=True)
+        labs = labels_df.iloc[idx].reset_index(drop=True)
+        out = expert.predict(feats)
+        zm = np.column_stack([out[f"{obj1}_z_mean"], out[f"{obj2}_z_mean"]])
+        zv = np.column_stack([out[f"{obj1}_z_var"], out[f"{obj2}_z_var"]])
+        tz = _true_labels_to_z(labs, obj1, obj2, cfg.transform, scaler1, scaler2)
+        return {"name": name, "true_z": tz, "pred_zm": zm, "pred_zv": zv,
+                "color": color, "alpha": alpha, "size": size}
+
+    series = [
+        _series(tr_idx, "train (80%)", "steelblue", 0.25, 8),
+        _series(te_idx, "test (20%)", "orange", 0.6, 16),
+    ]
+    return _parity_panels(cfg, series, [obj1, obj2], "HELDOUT", "GPR multitask", log=log)

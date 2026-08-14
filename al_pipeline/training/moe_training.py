@@ -452,7 +452,7 @@ def train_moe_from_config(cfg: ALConfig, log=None) -> dict[str, Any]:
             cfg, features_df, labels_df, is_ps,
             ps_expert, nonps_expert, rf, conv_cols, scaler1, scaler2, log=log,
         )
-        if getattr(cfg, "moe_holdout_plot", True):
+        if getattr(cfg, "holdout_plot", True):
             plot_moe_holdout_fit(cfg, features_df, labels_df, is_ps, log=log)
     except Exception as e:   # noqa: BLE001 — diagnostics must not break training
         if log:

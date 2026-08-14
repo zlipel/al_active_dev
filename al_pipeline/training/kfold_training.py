@@ -275,6 +275,21 @@ def _kfold_gpr_multitask_from_config(cfg: ALConfig, log=None):
 
     print("Final model saved with training on the entire dataset")
 
+    # Held-out similarity-split parity plot (diagnostic) — same 80-20 protocol as
+    # the MoE holdout so global vs MoE generalization is directly comparable.
+    # Deployed checkpoint above is untouched; a plotting failure must not break
+    # training. Gated by cfg.holdout_plot (the extra 80% re-fit costs ~one fit).
+    if getattr(cfg, "holdout_plot", True):
+        try:
+            from al_pipeline.diagnostic.moe_fit_plots import plot_global_holdout_fit
+            feats_df = pd.read_csv(cfg.paths.features_csv)
+            labels_df = pd.read_csv(cfg.paths.labels_csv)
+            is_ps = (labels_df[cfg.aux1_obj1] > 0).to_numpy().astype(int)
+            plot_global_holdout_fit(cfg, feats_df, labels_df, is_ps, log=log)
+        except Exception as e:   # noqa: BLE001 — diagnostics must not break training
+            if log:
+                log.warning(f"[gpr multitask] holdout plot skipped ({type(e).__name__}: {e})")
+
 
 def _kfold_gpr_single_from_config(cfg: ALConfig, label_column: str, log=None) -> None:
     """

@@ -22,7 +22,8 @@ import torch
 
 from al_pipeline.core.config import ALConfig
 from al_pipeline.diagnostic.moe_fit_plots import (
-    plot_moe_holdout_fit, plot_moe_insample_fit, similarity_cluster_holdout,
+    plot_global_holdout_fit, plot_moe_holdout_fit, plot_moe_insample_fit,
+    similarity_cluster_holdout,
 )
 
 
@@ -169,4 +170,25 @@ def test_plot_moe_holdout_fit_writes_and_returns(tmp_path, synth):
         assert fig.exists()
         assert np.isfinite(out[label]["r2"]) and np.isfinite(out[label]["nll_z"])
         # Held-out test is a strict subset of the data.
+        assert 1 <= out[label]["n"] < len(feats)
+
+
+# ---------- (4) global multitask held-out fit plot ----------
+
+def test_plot_global_holdout_fit_writes_and_returns(tmp_path, synth):
+    """Same 80-20 similarity holdout applied to the global multitask GPR: writes
+    GPR_multitask_..._HELDOUT_{obj}.png and returns finite R²/NLPD on the test."""
+    feats, labels, is_ps = synth
+    cfg = _make_cfg(tmp_path, policy="soft")
+    obj1, obj2 = cfg.obj1, cfg.obj2
+
+    torch.manual_seed(0); np.random.seed(0)
+    out = plot_global_holdout_fit(cfg, feats, labels, is_ps)
+
+    assert out, "global holdout returned empty (split should support both regimes)"
+    p = cfg.paths
+    for label in (obj1, obj2):
+        fig = p.models_dir / f"GPR_multitask_iter0_{p.tag}_HELDOUT_{label}.png"
+        assert fig.exists()
+        assert np.isfinite(out[label]["r2"]) and np.isfinite(out[label]["nll_z"])
         assert 1 <= out[label]["n"] < len(feats)
