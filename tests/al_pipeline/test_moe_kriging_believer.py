@@ -181,6 +181,28 @@ def test_moe_hard_covariance_is_the_assigned_expert_cov(_bench_moe_bundle):
     np.testing.assert_allclose(pool_nps.covariance, cov_nps_only, rtol=1e-6, atol=1e-6)
 
 
+def test_moe_soft_stds_consistent_with_covariance(_bench_moe_bundle):
+    """
+    The acquisition uses two views of the same mixture uncertainty: the epsilon
+    shift + pessimism *scaling* read `pool.stds`, while the pessimism *overlap*
+    reads `pool.covariance` (full law of total covariance). They must stay the
+    same statistic: `stds**2 == diag(covariance)`. Locks `soft_mixture_variance`
+    (the per-objective law of total variance) to the diagonal of the (2, 2)
+    law-of-total-covariance so a refactor can't silently desync shift/scaling
+    from the overlap. Checked under soft AND the hard-gate switch.
+    """
+    bundle = _bench_moe_bundle
+    feats = _make_raw_features_df(5, seed=7)
+
+    for sur in (
+        MoESurrogate(bundle, policy="soft"),
+        MoESurrogate(bundle, policy="hard", threshold=0.5),
+    ):
+        pool = sur.predict_pool(feats)
+        diag = np.diagonal(pool.covariance, axis1=1, axis2=2)   # (B, 2)
+        np.testing.assert_allclose(pool.stds ** 2, diag, rtol=1e-6, atol=1e-8)
+
+
 # ---------- (2) _MultitaskPoolPosterior.covariance behavior-preserving ----------
 
 def test_multitask_covariance_matches_get_cand_stats():

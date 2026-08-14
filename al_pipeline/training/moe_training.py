@@ -440,6 +440,24 @@ def train_moe_from_config(cfg: ALConfig, log=None) -> dict[str, Any]:
         log.info(f"[moe train] saved nonPS={p.moe_nonps_chkpt(temp=False)}")
         log.info(f"[moe train] saved RF={p.moe_rf_bundle(temp=False)}")
 
+    # Diagnostic fit plots (policy-aggregate parity, z-space). In-sample mirrors
+    # the multitask GPR plot; the held-out one re-fits on an 80% similarity split
+    # for an honest estimate. Never let a plotting failure break training, and
+    # never touch the deployed checkpoints saved above.
+    try:
+        from al_pipeline.diagnostic.moe_fit_plots import (
+            plot_moe_holdout_fit, plot_moe_insample_fit,
+        )
+        plot_moe_insample_fit(
+            cfg, features_df, labels_df, is_ps,
+            ps_expert, nonps_expert, rf, conv_cols, scaler1, scaler2, log=log,
+        )
+        if getattr(cfg, "moe_holdout_plot", True):
+            plot_moe_holdout_fit(cfg, features_df, labels_df, is_ps, log=log)
+    except Exception as e:   # noqa: BLE001 — diagnostics must not break training
+        if log:
+            log.warning(f"[moe train] fit plots skipped ({type(e).__name__}: {e})")
+
     return {
         "n_total":       len(labels_df),
         "n_ps":          len(ps_indices),

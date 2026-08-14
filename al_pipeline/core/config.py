@@ -109,6 +109,10 @@ class ALConfig:
     # PS class is scarce (early AL iters); 'isotonic' is safe once N_ps grows.
     # 'none' returns the raw RF for one-line rollback.
     moe_calibration_method: str = "sigmoid"
+    # Emit the held-out (80-20 similarity cluster) MoE fit plot at train time.
+    # The in-sample FIT plot always runs; this toggles only the extra re-fit on
+    # the 80% split (roughly doubles MoE train time). Disable to save time.
+    moe_holdout_plot: bool = True
 
     def validate(self) -> None:
         """Validate the configuration parameters."""
