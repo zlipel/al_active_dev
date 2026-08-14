@@ -66,56 +66,90 @@ def _policy_zstats(
 
 def _parity_panels(
     cfg: ALConfig,
-    true_z: np.ndarray,
-    pred_zm: np.ndarray,
-    pred_zv: np.ndarray,
+    series: list[dict[str, Any]],
     label_columns: list[str],
     kind: str,
     log=None,
 ) -> dict[str, dict[str, float]]:
-    """One z-space parity panel per objective; annotate R² + z-NLPD.
+    """One z-space parity panel per objective, overlaying every series.
 
-    Styled like the multitask parity plot ([kfold_training.py]). Saves
-    ``MoE_{policy}_iter{N}_{tag}_{kind}_{label}.png`` to ``models_dir`` and
-    returns ``{label: {"r2", "nll_z", "n"}}``.
+    Each ``series`` entry is a dict::
+
+        {"name": str, "true_z": (N,2), "pred_zm": (N,2), "pred_zv": (N,2),
+         "color": str, "alpha": float, "size": float}
+
+    Every series is scattered and annotated (in the legend) with its own R² +
+    z-NLPD; the **last** series is the headline (test for HELDOUT, all-data for
+    FIT) and its metrics are returned per objective. Styled like the multitask
+    parity plot ([kfold_training.py]). Saves
+    ``MoE_{policy}_iter{N}_{tag}_{kind}_{label}.png`` to ``models_dir``.
     """
     from al_pipeline.diagnostic.al_regime_oof import _finite_and_metrics  # deferred: import cycle
 
     p = cfg.paths
     out: dict[str, dict[str, float]] = {}
     for i, label in enumerate(label_columns):
-        y = np.asarray(true_z[:, i], dtype=np.float64)
-        yhat = np.asarray(pred_zm[:, i], dtype=np.float64)
-        v = np.asarray(pred_zv[:, i], dtype=np.float64)
+        fig, ax = plt.subplots(figsize=(2.3, 2.3), dpi=300)
+        pooled: list[np.ndarray] = []
+        headline = {"r2": float("nan"), "nll_z": float("nan"), "n": 0.0}
+        for s in series:
+            y = np.asarray(s["true_z"][:, i], dtype=np.float64)
+            yhat = np.asarray(s["pred_zm"][:, i], dtype=np.float64)
+            v = np.asarray(s["pred_zv"][:, i], dtype=np.float64)
 
-        n, met = _finite_and_metrics(y, yhat, v)
-        r2 = met.get("r2", float("nan"))
-        nll = met.get("nll_z", float("nan"))
+            n, met = _finite_and_metrics(y, yhat, v)
+            r2 = met.get("r2", float("nan"))
+            nll = met.get("nll_z", float("nan"))
 
-        fig, ax = plt.subplots(figsize=(2, 2), dpi=300)
-        finite = np.isfinite(y) & np.isfinite(yhat)
-        yf, yhf = y[finite], yhat[finite]
-        ax.scatter(yf, yhf, color="orange", alpha=0.3,
-                   label=f"$R^2$={r2:.3f}\nNLPD$_z$={nll:.3f}")
-        if yf.size:
-            lo = float(min(yf.min(), yhf.min()))
-            hi = float(max(yf.max(), yhf.max()))
-            ax.plot([lo, hi], [lo, hi], "r--")
+            finite = np.isfinite(y) & np.isfinite(yhat)
+            ax.scatter(
+                y[finite], yhat[finite], color=s["color"], edgecolors="none",
+                alpha=s.get("alpha", 0.35), s=s.get("size", 10),
+                label=f"{s['name']} (n={n}): $R^2$={r2:.2f}, NLPD={nll:.2f}",
+            )
+            pooled.append(y[finite]); pooled.append(yhat[finite])
+            headline = {"r2": float(r2), "nll_z": float(nll), "n": float(n)}
+            if log:
+                log.info(f"[moe {kind.lower()} plot] {label} [{s['name']}]: "
+                         f"R2={r2:.4f} NLPD_z={nll:.4f} (n={n})")
+
+        cat = (np.concatenate([a for a in pooled if a.size])
+               if any(a.size for a in pooled) else np.array([0.0, 1.0]))
+        lo, hi = float(cat.min()), float(cat.max())
+        ax.plot([lo, hi], [lo, hi], "r--", lw=0.8)
         ax.set_xlabel(f"True {label} (z)", fontsize=6)
         ax.set_ylabel(f"Predicted {label} (z)", fontsize=6)
         ax.set_title(f"MoE {cfg.moe_policy} {kind} — {label}", fontsize=6)
         ax.tick_params(axis="both", which="both", labelsize=4, direction="in")
-        ax.legend(fontsize=5)
+        ax.legend(fontsize=4.5, loc="best")
         fig.tight_layout()
         fig_path = p.models_dir / f"MoE_{cfg.moe_policy}_iter{cfg.iteration}_{p.tag}_{kind}_{label}.png"
         fig.savefig(str(fig_path), dpi=300, bbox_inches="tight")
         plt.close(fig)
 
         if log:
-            log.info(f"[moe {kind.lower()} plot] {label}: R2={r2:.4f} NLPD_z={nll:.4f} "
-                     f"(n={n}) -> {fig_path.name}")
-        out[label] = {"r2": float(r2), "nll_z": float(nll), "n": float(n)}
+            log.info(f"[moe {kind.lower()} plot] {label}: wrote {fig_path.name}")
+        out[label] = headline
     return out
+
+
+def _policy_from_frame(
+    cfg: ALConfig, frame: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract ``(true_z, pred_zm, pred_zv)`` for the active policy from a fold frame."""
+    obj1, obj2 = cfg.obj1, cfg.obj2
+    true_z = frame[[f"true_{obj1}_z", f"true_{obj2}_z"]].to_numpy()
+    if cfg.moe_policy == "soft":
+        zm = frame[[f"moe_soft_{obj1}_z_mean", f"moe_soft_{obj2}_z_mean"]].to_numpy()
+        zv = frame[[f"moe_soft_{obj1}_z_var", f"moe_soft_{obj2}_z_var"]].to_numpy()
+    else:  # hard: reconstruct z mean/var from per-expert columns at the threshold
+        p_ps = frame["p_ps"].to_numpy()
+        ps_zm = frame[[f"ps_expert_{obj1}_z_mean", f"ps_expert_{obj2}_z_mean"]].to_numpy()
+        ps_zv = frame[[f"ps_expert_{obj1}_z_var", f"ps_expert_{obj2}_z_var"]].to_numpy()
+        nps_zm = frame[[f"nonps_expert_{obj1}_z_mean", f"nonps_expert_{obj2}_z_mean"]].to_numpy()
+        nps_zv = frame[[f"nonps_expert_{obj1}_z_var", f"nonps_expert_{obj2}_z_var"]].to_numpy()
+        zm, zv = _policy_zstats(cfg, p_ps, ps_zm, ps_zv, nps_zm, nps_zv)
+    return true_z, zm, zv
 
 
 def plot_moe_insample_fit(
@@ -154,7 +188,11 @@ def plot_moe_insample_fit(
 
     zm, zv = _policy_zstats(cfg, np.asarray(p_ps), ps_zm, ps_zv, nps_zm, nps_zv)
     true_z = _true_labels_to_z(labels_df, obj1, obj2, cfg.transform, scaler1, scaler2)
-    return _parity_panels(cfg, true_z, zm, zv, [obj1, obj2], "FIT", log=log)
+    series = [{
+        "name": "all data", "true_z": true_z, "pred_zm": zm, "pred_zv": zv,
+        "color": "orange", "alpha": 0.3, "size": 10,
+    }]
+    return _parity_panels(cfg, series, [obj1, obj2], "FIT", log=log)
 
 
 def _agglomerative_labels(D: np.ndarray, n_clusters: int) -> np.ndarray:
@@ -279,25 +317,24 @@ def plot_moe_holdout_fit(
             log.warning("[moe heldout plot] a regime too small in the train split; skipping.")
         return {}
 
-    frame = _build_fold_frame(
-        bundle, features_df, labels_df,
-        original_indices=list(range(len(features_df))),
-        te_idx=np.asarray(te_idx), is_ps=is_ps_arr, fold_idx=0,
-        label_columns=[obj1, obj2], aux_col=cfg.aux1_obj1,
-        ps_threshold=cfg.moe_threshold, scaler1=scaler1, scaler2=scaler2,
-        transform=cfg.transform,
-    )
+    # Predict BOTH the 80% train and the 20% test with the same (train-fit)
+    # bundle, so the panel shows the in-split fit and the generalization gap.
+    def _frame(idx: np.ndarray) -> pd.DataFrame:
+        return _build_fold_frame(
+            bundle, features_df, labels_df,
+            original_indices=list(range(len(features_df))),
+            te_idx=np.asarray(idx), is_ps=is_ps_arr, fold_idx=0,
+            label_columns=[obj1, obj2], aux_col=cfg.aux1_obj1,
+            ps_threshold=cfg.moe_threshold, scaler1=scaler1, scaler2=scaler2,
+            transform=cfg.transform,
+        )
 
-    true_z = frame[[f"true_{obj1}_z", f"true_{obj2}_z"]].to_numpy()
-    if cfg.moe_policy == "soft":
-        zm = frame[[f"moe_soft_{obj1}_z_mean", f"moe_soft_{obj2}_z_mean"]].to_numpy()
-        zv = frame[[f"moe_soft_{obj1}_z_var", f"moe_soft_{obj2}_z_var"]].to_numpy()
-    else:  # hard: reconstruct z mean/var from per-expert columns at the threshold
-        p_ps = frame["p_ps"].to_numpy()
-        ps_zm = frame[[f"ps_expert_{obj1}_z_mean", f"ps_expert_{obj2}_z_mean"]].to_numpy()
-        ps_zv = frame[[f"ps_expert_{obj1}_z_var", f"ps_expert_{obj2}_z_var"]].to_numpy()
-        nps_zm = frame[[f"nonps_expert_{obj1}_z_mean", f"nonps_expert_{obj2}_z_mean"]].to_numpy()
-        nps_zv = frame[[f"nonps_expert_{obj1}_z_var", f"nonps_expert_{obj2}_z_var"]].to_numpy()
-        zm, zv = _policy_zstats(cfg, p_ps, ps_zm, ps_zv, nps_zm, nps_zv)
-
-    return _parity_panels(cfg, true_z, zm, zv, [obj1, obj2], "HELDOUT", log=log)
+    tr_true, tr_zm, tr_zv = _policy_from_frame(cfg, _frame(tr_idx))
+    te_true, te_zm, te_zv = _policy_from_frame(cfg, _frame(te_idx))
+    series = [
+        {"name": "train (80%)", "true_z": tr_true, "pred_zm": tr_zm, "pred_zv": tr_zv,
+         "color": "steelblue", "alpha": 0.25, "size": 8},
+        {"name": "test (20%)", "true_z": te_true, "pred_zm": te_zm, "pred_zv": te_zv,
+         "color": "orange", "alpha": 0.6, "size": 16},
+    ]
+    return _parity_panels(cfg, series, [obj1, obj2], "HELDOUT", log=log)
