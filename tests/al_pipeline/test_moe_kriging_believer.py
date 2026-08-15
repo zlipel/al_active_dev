@@ -536,6 +536,43 @@ def test_augment_kb_moe_reconditions_both_experts_on_shared_label(_moe_iter_dir,
     np.testing.assert_allclose(ps_y, nps_y, rtol=1e-6, atol=1e-8)
 
 
+@pytest.mark.parametrize("seq_id,expect_temp", [(1, False), (2, True), (5, True)])
+@pytest.mark.parametrize("model_type", ["moe", "gpr_multitask"])
+def test_run_ga_loads_reconditioned_temp_bundle(tmp_path, monkeypatch, model_type, seq_id, expect_temp):
+    """Guard: the GA scores each candidate with the kriging-believer TEMP bundle
+    for seq_id>1 (both MoE and global). Loading the base bundle would leave the
+    EHVI landscape unchanged across the batch -> the acquisition re-finds the same
+    optimum and the batch collapses onto duplicates."""
+    from al_pipeline.ga import run_ga
+
+    base = tmp_path / "home"; scratch = tmp_path / "scratch"; db = tmp_path / "db"
+    for d in (base, scratch, db):
+        d.mkdir(parents=True, exist_ok=True)
+    cfg = ALConfig(
+        model="TEST", iteration=0, front="upper",
+        base_path=base, scratch_path=scratch, db_path=db,
+        train_model_type=model_type,
+    )
+
+    seen: dict[str, bool] = {}
+
+    def _spy_moe(cfg, temp=False):
+        seen["temp"] = temp
+        return object()
+
+    def _spy_models(cfg, temp=False, device="cpu"):
+        seen["temp"] = temp
+        return object()
+
+    monkeypatch.setattr(run_ga.ga_utils, "load_moe_bundle", _spy_moe)
+    monkeypatch.setattr(run_ga.ga_utils, "load_models", _spy_models)
+    monkeypatch.setattr(run_ga.ga_utils, "load_normalization_stats", lambda p: {})
+    monkeypatch.setattr(run_ga, "make_surrogate", lambda cfg, **kw: object())
+
+    run_ga._load_ga_surrogate(cfg, seq_id)
+    assert seen["temp"] is expect_temp
+
+
 def test_augment_kb_moe_loop_consumes_and_grows_temp_norm_files(_moe_iter_dir):
     """(req 3) The AL loop lives in the temp/norm files: each seq_id appends the
     child to features_norm_csv / labels_norm_csv / seq_gen_temp_txt and, for

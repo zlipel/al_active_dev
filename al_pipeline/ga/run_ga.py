@@ -185,6 +185,31 @@ def _fitness_batch_mc(
 
 
 
+def _load_ga_surrogate(cfg: ALConfig, seq_id: int) -> Surrogate:
+    """Build the acquisition surrogate for one GA candidate.
+
+    For seq_id > 1 this MUST load the kriging-believer-reconditioned TEMP bundle
+    — for BOTH the MoE and the global GPR — so the EHVI is scored against the
+    surrogate updated with the fantasized picks 1..seq_id-1. Loading the base
+    bundle instead leaves the acquisition landscape unchanged across the batch,
+    so every seq_id re-finds the same optimum and the batch collapses onto
+    duplicates. (The global path always passed `temp`; the MoE path did not,
+    which silently disabled MoE kriging-believer diversity.)
+    """
+    temp = seq_id > 1
+    if cfg.train_model_type == "moe":
+        moe_bundle = ga_utils.load_moe_bundle(cfg=cfg, temp=temp)
+        return make_surrogate(
+            cfg, moe_bundle=moe_bundle,
+            moe_policy=cfg.moe_policy, moe_threshold=cfg.moe_threshold,
+        )
+    model_bundle = ga_utils.load_models(cfg=cfg, temp=temp, device="cpu")
+    normalization_stats = ga_utils.load_normalization_stats(cfg.paths.norm_stats)
+    return make_surrogate(
+        cfg, model_bundle=model_bundle, normalization_stats=normalization_stats,
+    )
+
+
 def run_one_candidate(
     cfg: ALConfig,
     cand_id: int,
@@ -195,33 +220,14 @@ def run_one_candidate(
     No augmentation, no selection of global best.
     """
 
-    temp = seq_id > 1
-
     # seeding (per-cand reproducibility)
     ga_utils.seed_everything(seed_base=cfg.seed_base, iteration=cfg.iteration, seq_id=seq_id, cand_id=cand_id)
 
     featurizer = sf.SequenceFeaturizer(model_name=cfg.model.lower(), db_path=cfg.db_path)
-    # normalization_stats is only needed for the global-GPR surrogate (MoE
-    # experts carry their own normalizers). Load it for global paths and skip
-    # for MoE — calling it under MoE would fail since the global-fit
-    # normalization stats file isn't written by the MoE training pipeline.
-    if cfg.train_model_type == "moe":
-        moe_bundle = ga_utils.load_moe_bundle(cfg=cfg)
-        surrogate = make_surrogate(
-            cfg,
-            moe_bundle=moe_bundle,
-            moe_policy=cfg.moe_policy,
-            moe_threshold=cfg.moe_threshold,
-        )
-        normalization_stats = ga_utils.load_normalization_stats(cfg.paths.norm_stats)
-    else:
-        model_bundle = ga_utils.load_models(cfg=cfg, temp=temp, device='cpu')
-        normalization_stats = ga_utils.load_normalization_stats(cfg.paths.norm_stats)
-        surrogate = make_surrogate(
-            cfg,
-            model_bundle=model_bundle,
-            normalization_stats=normalization_stats,
-        )
+    # Acquisition surrogate: for seq_id>1 this is the kriging-believer temp
+    # bundle (both MoE and global) so the EHVI reflects the fantasized picks.
+    surrogate = _load_ga_surrogate(cfg, seq_id)
+    normalization_stats = ga_utils.load_normalization_stats(cfg.paths.norm_stats)
 
     pareto_front, parent_seqs = ga_utils.load_front(cfg=cfg, seq_id=seq_id)
 
