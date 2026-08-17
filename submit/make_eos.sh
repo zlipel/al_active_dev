@@ -34,6 +34,7 @@ conda activate "${CONDA_ENV}"
 
 MODEL=""
 ITER=""
+RUN_TAG=""
 DENSITY_START=""
 DENSITY_END=""
 DENSITY_STEP=""
@@ -58,6 +59,10 @@ Scope (exactly one of):
                                      — populate first with gen_validation_sequences.py)
 
 Optional:
+  --run_tag TAG                     Parallel-policy run tag (--iter only). The AL loop
+                                    appends _TAG to candidate/seq filenames so parallel
+                                    policies (e.g. global/soft/hard) don't collide; pass
+                                    the same TAG here to read the right files. Default: none.
   --check_densities                 Sanity-check requested density range
   --check_finished                  Skip already-completed sims
   --cpus_per_sim N                  CPUs per sim partition (default: make_eos.py = 12)
@@ -70,6 +75,7 @@ while [[ "$#" -gt 0 ]]; do
     case $1 in
         --init) INIT=true ;;
         --iter) ITER="$2"; shift ;;
+        --run_tag) RUN_TAG="$2"; shift ;;
         --validation) VALIDATION="$2"; shift ;;
         --model) MODEL="$2"; shift ;;
         --density_start) DENSITY_START="$2"; shift ;;
@@ -112,10 +118,17 @@ else
     fi
     PAR_DIR="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS"
 
+    # al_pipeline (ALPaths.next_iter_candidates_file) appends _<run_tag> to the
+    # candidate filename when a run_tag is set, so parallel policies sharing one
+    # iteration dir don't collide. Match that suffix on the combined + copied
+    # seq files too. Empty run_tag ⇒ production naming (backward compatible).
+    TAG_SUFFIX=""
+    [[ -n "$RUN_TAG" ]] && TAG_SUFFIX="_${RUN_TAG}"
+
     # al_pipeline mirrors candidates into EOS/ at these paths (primary location):
-    SEQ_UPPER="$PAR_DIR/simulation_candidates_gen${ITER}_upper.txt"
-    SEQ_LOWER="$PAR_DIR/simulation_candidates_gen${ITER}_lower.txt"
-    SEQS="$PAR_DIR/seq_gen${ITER}.txt"
+    SEQ_UPPER="$PAR_DIR/simulation_candidates_gen${ITER}_upper${TAG_SUFFIX}.txt"
+    SEQ_LOWER="$PAR_DIR/simulation_candidates_gen${ITER}_lower${TAG_SUFFIX}.txt"
+    SEQS="$PAR_DIR/seq_gen${ITER}${TAG_SUFFIX}.txt"
 
     # Combine whichever fronts exist; error if neither found.
     if [[ -f "$SEQ_UPPER" && -f "$SEQ_LOWER" ]]; then
@@ -131,8 +144,8 @@ else
         exit 1
     fi
 
-    cp "$SEQS" "${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/seq_gen${ITER}.txt"
-    LOG_TAG="gen$ITER"
+    cp "$SEQS" "${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/seq_gen${ITER}${TAG_SUFFIX}.txt"
+    LOG_TAG="gen${ITER}${TAG_SUFFIX}"
 fi
 
 LOGS="$PAR_DIR/logs/"

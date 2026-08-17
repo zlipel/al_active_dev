@@ -34,6 +34,7 @@ conda activate "${CONDA_ENV}"
 
 MODEL=""
 ITER=""
+RUN_TAG=""
 NSIM="6"
 INIT=false
 VALIDATION=""
@@ -56,6 +57,11 @@ Scope (exactly one of):
                                      — populate first with gen_validation_sequences.py)
 
 Optional:
+  --run_tag TAG                     Parallel-policy run tag (--iter only). The AL loop
+                                    appends _TAG to candidate/seq filenames so parallel
+                                    policies (e.g. global/soft/hard) don't collide; pass
+                                    the same TAG here (and to make_eos.sh) to read the
+                                    right files. Default: none.
   --nsim NSIM                       Independent production runs (default: 5)
   --check_finished                  Skip already-completed sims
   --quick N                         Fixed init density without EOS lookup
@@ -69,6 +75,7 @@ while [[ "$#" -gt 0 ]]; do
     case $1 in
         --init) INIT=true ;;
         --iter) ITER="$2"; shift ;;
+        --run_tag) RUN_TAG="$2"; shift ;;
         --validation) VALIDATION="$2"; shift ;;
         --model) MODEL="$2"; shift ;;
         --nsim) NSIM="$2"; shift ;;
@@ -120,12 +127,17 @@ else
         echo "Error: exactly one of --init / --iter / --validation is required"
         usage
     fi
-    cp "${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS/seq_gen$ITER.txt" \
-       "${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF/seq_gen$ITER.txt"
+    # Match the run_tag suffix make_eos.sh wrote on the combined seq file
+    # (ALPaths appends _<run_tag> for parallel policies). Empty ⇒ production.
+    TAG_SUFFIX=""
+    [[ -n "$RUN_TAG" ]] && TAG_SUFFIX="_${RUN_TAG}"
 
-    SEQS="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF/seq_gen$ITER.txt"
+    cp "${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS/seq_gen${ITER}${TAG_SUFFIX}.txt" \
+       "${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF/seq_gen${ITER}${TAG_SUFFIX}.txt"
+
+    SEQS="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF/seq_gen${ITER}${TAG_SUFFIX}.txt"
     PAR_DIR="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF/"
-    LOG_TAG="gen$ITER"
+    LOG_TAG="gen${ITER}${TAG_SUFFIX}"
 fi
 
 LOGS="$PAR_DIR/logs/"
