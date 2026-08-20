@@ -36,6 +36,10 @@ NBOOT=$2
 # validation case must be tested first — [[ ... -eq 0 ]] is arithmetic and
 # would (mis)evaluate a "validation:*" string to 0.
 SCOPE_SPEC=$3
+RUN_TAG="${RUN_TAG:-""}"
+
+echo ${RUN_TAG}
+exit 0
 
 if [[ "$SCOPE_SPEC" == validation:* ]]; then
     SCOPE="${SCOPE_SPEC#validation:}"
@@ -49,7 +53,7 @@ elif [[ $SCOPE_SPEC -eq 0 ]]; then
     OUTPUT_DIR="${SCRATCH_AL}/$MODEL/SIMULATIONS/DIFF"
 else
     ITER="$SCOPE_SPEC"
-    SEQS="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS/seq_gen$ITER.txt"
+    SEQS="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS/seq_gen$ITER_${RUN_TAG}.txt"
     PAR_DIR="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS"
     OUTPUT_DIR="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF"
 fi

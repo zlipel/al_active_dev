@@ -38,6 +38,7 @@ SCOPE_SPEC=$2
 INNER_JOBS=${3:-4}
 OMP_THREADS=${4:-4}
 NSEQ_JOBS=${5:-6}
+RUN_TAG="${RUN_TAG:-""}"
 
 if [[ "$SCOPE_SPEC" == validation:* ]]; then
     SCOPE="${SCOPE_SPEC#validation:}"
@@ -49,7 +50,7 @@ elif [[ $SCOPE_SPEC -eq 0 ]]; then
     PAR_DIR="${SCRATCH_AL}/$MODEL/SIMULATIONS/DIFF"
 else
     ITER="$SCOPE_SPEC"
-    SEQS="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF/seq_gen$ITER.txt"
+    SEQS="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF/seq_gen$ITER_${RUN_TAG}.txt"
     PAR_DIR="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF"
 fi
 
