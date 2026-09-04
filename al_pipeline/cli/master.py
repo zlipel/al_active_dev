@@ -132,6 +132,15 @@ def main() -> None:
             log.exception(f"Child features generation failed: {e}")
             raise
 
+        from al_pipeline.diagnostic.batch_diversity import score_selected_batch
+        log.info("Scoring feature-space diversity of the selected batch...")
+        try:
+            score_selected_batch(cfg, log=log)
+            log.info("Batch diversity scoring completed.")
+        except Exception as e:
+            # Diagnostic only — never fail the sweep over a diversity metric.
+            log.exception(f"Batch diversity scoring failed (non-fatal): {e}")
+
 
     #### Generate next sim files and so on ####
 
