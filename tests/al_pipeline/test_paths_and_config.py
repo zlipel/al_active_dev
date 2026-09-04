@@ -110,6 +110,73 @@ def test_config_threads_run_tag_into_paths():
     assert cfg.paths.tag.endswith("_soft")
 
 
+# ---------- run_tag on cumulative generation artifacts + read fallback ----------
+
+def _tagged_paths(tmp_path: Path, run_tag: str, iteration: int = 11) -> ALPaths:
+    return ALPaths(base_path=tmp_path / "home", scratch_path=tmp_path / "scratch",
+                   iteration=iteration, front="upper", model="hps_urry", run_tag=run_tag)
+
+
+def test_cumulative_artifacts_untagged_when_run_tag_empty(tmp_path):
+    p = _tagged_paths(tmp_path, "", iteration=11)
+    assert p.features_csv.name == "features_gen11.csv"
+    assert p.labels_csv.name == "labels_gen11.csv"
+    assert p.seq_gen_txt.name == "seq_gen11.txt"
+    assert p.eos_csv.name == "eos_results.csv"
+    assert p.diff_csv.name == "diffusivities.csv"
+
+
+def test_cumulative_outputs_tagged_when_run_tag_set(tmp_path):
+    p = _tagged_paths(tmp_path, "moe_soft", iteration=11)
+    assert p.features_csv.name == "features_gen11_moe_soft.csv"
+    assert p.labels_csv.name == "labels_gen11_moe_soft.csv"
+    assert p.seq_gen_txt.name == "seq_gen11_moe_soft.txt"
+
+
+def test_tagged_reads_fall_back_to_untagged(tmp_path):
+    """With run_tag set but only un-tagged files on disk, reads resolve un-tagged."""
+    p = _tagged_paths(tmp_path, "moe_soft", iteration=11)
+    p.eos_dir.mkdir(parents=True, exist_ok=True)
+    p.diff_dir.mkdir(parents=True, exist_ok=True)
+    p.prev_iter_scratch_dir.mkdir(parents=True, exist_ok=True)
+    for f in (p.eos_dir / "eos_results.csv", p.diff_dir / "diffusivities.csv",
+              p.eos_dir / "seq_gen11.txt",
+              p.prev_iter_scratch_dir / "features_gen10.csv",
+              p.prev_iter_scratch_dir / "labels_gen10.csv",
+              p.prev_iter_scratch_dir / "seq_gen10.txt"):
+        f.write_text("x")
+    assert p.eos_csv.name == "eos_results.csv"
+    assert p.diff_csv.name == "diffusivities.csv"
+    assert p.eos_seq_gen_txt.name == "seq_gen11.txt"
+    assert p.prev_features_csv.name == "features_gen10.csv"
+    assert p.prev_labels_csv.name == "labels_gen10.csv"
+    assert p.prev_seq_gen_txt.name == "seq_gen10.txt"
+
+
+def test_tagged_reads_prefer_tagged_when_present(tmp_path):
+    """When the tagged file exists it wins over the un-tagged default."""
+    p = _tagged_paths(tmp_path, "moe_soft", iteration=11)
+    p.eos_dir.mkdir(parents=True, exist_ok=True)
+    p.diff_dir.mkdir(parents=True, exist_ok=True)
+    p.prev_iter_scratch_dir.mkdir(parents=True, exist_ok=True)
+    for name, d in [("eos_results.csv", p.eos_dir), ("eos_results_moe_soft.csv", p.eos_dir),
+                    ("diffusivities.csv", p.diff_dir), ("diffusivities_moe_soft.csv", p.diff_dir),
+                    ("seq_gen11.txt", p.eos_dir), ("seq_gen11_moe_soft.txt", p.eos_dir),
+                    ("features_gen10.csv", p.prev_iter_scratch_dir),
+                    ("features_gen10_moe_soft.csv", p.prev_iter_scratch_dir),
+                    ("labels_gen10.csv", p.prev_iter_scratch_dir),
+                    ("labels_gen10_moe_soft.csv", p.prev_iter_scratch_dir),
+                    ("seq_gen10.txt", p.prev_iter_scratch_dir),
+                    ("seq_gen10_moe_soft.txt", p.prev_iter_scratch_dir)]:
+        (d / name).write_text("x")
+    assert p.eos_csv.name == "eos_results_moe_soft.csv"
+    assert p.diff_csv.name == "diffusivities_moe_soft.csv"
+    assert p.eos_seq_gen_txt.name == "seq_gen11_moe_soft.txt"
+    assert p.prev_features_csv.name == "features_gen10_moe_soft.csv"
+    assert p.prev_labels_csv.name == "labels_gen10_moe_soft.csv"
+    assert p.prev_seq_gen_txt.name == "seq_gen10_moe_soft.txt"
+
+
 def test_skip_data_prep_relaxes_prev_file_check():
     """With skip_data_prep the iteration>0 prev-CSV existence check is bypassed,
     so a seeded run doesn't require iteration_{N-1} data on disk."""

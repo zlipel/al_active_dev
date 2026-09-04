@@ -154,6 +154,7 @@ CMD="python \"${REPO_ROOT}/simulation/make_diff.py\" --model \"$MODEL\" \
 [[ "$CHECK_FIN" == true ]] && CMD+=" --check_finished"
 [[ -n "$CPUS_PER_SIM" ]] && CMD+=" --cpus_per_sim $CPUS_PER_SIM"
 [[ -n "$MAX_CORES" ]] && CMD+=" --max_cores $MAX_CORES"
+[[ -n "$RUN_TAG" ]] && CMD+=" --run_tag $RUN_TAG"
 eval "$CMD"
 
 # SLURM keeps --output / --error open in SLURM_SUBMIT_DIR, even after we cd.

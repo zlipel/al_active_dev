@@ -55,7 +55,19 @@ class ALPaths:
     def tag(self) -> str:
         base = _tag(self.ehvi_variant, self.exploration_strategy, self.transform, self.front, self.mc_ehvi)
         return f"{base}_{self.run_tag}" if self.run_tag else base
-    
+
+    def _tagged_name(self, stem: str, ext: str) -> str:
+        """Return `{stem}_{run_tag}{ext}`, or `{stem}{ext}` when run_tag is unset."""
+        return f"{stem}_{self.run_tag}{ext}" if self.run_tag else f"{stem}{ext}"
+
+    def _resolve_tagged(self, directory: Path, stem: str, ext: str) -> Path:
+        """Return the run-tagged file if it exists, else the un-tagged default."""
+        if self.run_tag:
+            tagged = directory / f"{stem}_{self.run_tag}{ext}"
+            if tagged.exists():
+                return tagged
+        return directory / f"{stem}{ext}"
+
     #### model directories ####
     @property
     def model_home_dir(self) -> Path:
@@ -85,7 +97,11 @@ class ALPaths:
     
     @property
     def eos_csv(self) -> Path:
-        return self.eos_dir / f"eos_results.csv"
+        return self._resolve_tagged(self.eos_dir, "eos_results", ".csv")
+
+    @property
+    def eos_seq_gen_txt(self) -> Path:
+        return self._resolve_tagged(self.eos_dir, f"seq_gen{self.iteration}", ".txt")
 
     @property
     def diff_dir(self) -> Path:
@@ -93,7 +109,7 @@ class ALPaths:
     
     @property
     def diff_csv(self) -> Path:
-        return self.diff_dir / f"diffusivities.csv"
+        return self._resolve_tagged(self.diff_dir, "diffusivities", ".csv")
     
     #### home outputs ####
     @property
@@ -110,15 +126,15 @@ class ALPaths:
     #### data files####
     @property
     def features_csv(self) -> Path:
-        return self.iter_scratch_dir / f"features_gen{self.iteration}.csv"
-    
+        return self.iter_scratch_dir / self._tagged_name(f"features_gen{self.iteration}", ".csv")
+
     @property
     def labels_csv(self) -> Path:
-        return self.iter_scratch_dir / f"labels_gen{self.iteration}.csv"
-    
+        return self.iter_scratch_dir / self._tagged_name(f"labels_gen{self.iteration}", ".csv")
+
     @property
     def seq_gen_txt(self) -> Path:
-        return self.iter_scratch_dir / f"seq_gen{self.iteration}.txt"
+        return self.iter_scratch_dir / self._tagged_name(f"seq_gen{self.iteration}", ".txt")
     
     #### normalized and tagged instances ####
     @property
@@ -152,11 +168,15 @@ class ALPaths:
 
     @property
     def prev_features_csv(self) -> Path:
-        return self.prev_iter_scratch_dir / f"features_gen{self.iteration - 1}.csv"
+        return self._resolve_tagged(self.prev_iter_scratch_dir, f"features_gen{self.iteration - 1}", ".csv")
 
     @property
     def prev_labels_csv(self) -> Path:
-        return self.prev_iter_scratch_dir / f"labels_gen{self.iteration - 1}.csv"
+        return self._resolve_tagged(self.prev_iter_scratch_dir, f"labels_gen{self.iteration - 1}", ".csv")
+
+    @property
+    def prev_seq_gen_txt(self) -> Path:
+        return self._resolve_tagged(self.prev_iter_scratch_dir, f"seq_gen{self.iteration - 1}", ".txt")
     
     #### special files### 
     @property

@@ -18,7 +18,7 @@ def generate_features(cfg: ALConfig, log=None) -> None:
     featurizer = SequenceFeaturizer(model_name, str(db_path))
 
     seq_file = p.seq_gen_txt
-    new_seqs = p.eos_dir / f"seq_gen{iter_num}.txt"
+    new_seqs = p.eos_seq_gen_txt
 
     with open(new_seqs, 'r') as f:
         sequences = [line.strip() for line in f]
@@ -30,7 +30,7 @@ def generate_features(cfg: ALConfig, log=None) -> None:
             log.info(f"Generated features for iteration {iter_num} and saved to {p.features_csv}")
     else:
         try:
-            old_seq_file = p.prev_iter_scratch_dir / f"seq_gen{iter_num - 1}.txt"
+            old_seq_file = p.prev_seq_gen_txt
             with open(old_seq_file, 'r') as f:
                 old_sequences = [line.strip() for line in f]
             

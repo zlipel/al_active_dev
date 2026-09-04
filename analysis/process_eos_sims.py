@@ -20,12 +20,14 @@ def main():
     parser.add_argument("-output_dir", type=str, help="Output directory for storing results")
     parser.add_argument("-sequence_file", type=str, help="File containing sequences to be analyzed")
     parser.add_argument("-num_bootstrap", type=int, default=1000, help="Number of bootstrap resamples")
+    parser.add_argument("-run_tag", type=str, default="", help="Optional parallel-policy suffix on output files")
 
     args = parser.parse_args()
 
     parent_dir = args.parent_dir
     output_dir = args.output_dir
     num_bootstrap = args.num_bootstrap
+    tag_suffix = f"_{args.run_tag}" if args.run_tag else ""
 
     all_eos = []
 
@@ -65,7 +67,7 @@ def main():
         P, err, rho = result[7:]
         all_eos.append([P, err, rho])
 
-    with open(os.path.join(output_dir, f"eos_vals.pkl"), 'wb') as f:
+    with open(os.path.join(output_dir, f"eos_vals{tag_suffix}.pkl"), 'wb') as f:
         pkl.dump(all_eos, f)
 
     # Sort dataframe by seq_id
@@ -74,7 +76,7 @@ def main():
     # save the results
     os.makedirs(output_dir, exist_ok=True)
     #f'{output_dir}/eos_results.csv'
-    df.to_csv(os.path.join(output_dir, "eos_results.csv"), index=False)
+    df.to_csv(os.path.join(output_dir, f"eos_results{tag_suffix}.csv"), index=False)
 
 
 def wrapper(cmd, num_bootstrap):

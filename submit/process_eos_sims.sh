@@ -64,11 +64,12 @@ python "${REPO_ROOT}/analysis/process_eos_sims.py" \
     -parent_dir "$PAR_DIR" \
     -output_dir "$PAR_DIR" \
     -sequence_file "$SEQS" \
-    -num_bootstrap "$NBOOT"
+    -num_bootstrap "$NBOOT" \
+    -run_tag "$RUN_TAG"
 
 # make_diff.py reads eos_results.csv from its parent_dir (the DIFF dir), so
 # hand the EOS results across to the sibling DIFF tree.
-cp "$PAR_DIR/eos_results.csv" "$OUTPUT_DIR/eos_results.csv"
+cp "$PAR_DIR/eos_results${TAG_SUFFIX}.csv" "$OUTPUT_DIR/eos_results${TAG_SUFFIX}.csv"
 if [[ "$SCOPE_SPEC" == validation:* ]]; then
     cp "$SEQS" "$OUTPUT_DIR/seq_${SCOPE_LOWER}.txt"
 else

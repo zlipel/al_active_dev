@@ -85,4 +85,5 @@ python "${REPO_ROOT}/analysis/process_diff_sims.py" \
     --omp_threads $OMP_THREADS \
     --nseq_jobs $NSEQ_JOBS \
     --cutoff $CUT \
-    --stride $STRIDE
+    --stride $STRIDE \
+    --run_tag "$RUN_TAG"
