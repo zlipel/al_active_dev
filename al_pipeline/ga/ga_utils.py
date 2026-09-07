@@ -321,9 +321,7 @@ def compute_and_store_shift(cfg: ALConfig, log=None) -> None:
         feats_raw = pd.read_csv(p.parent_features_csv)   # base parents, aligned
         std = surrogate.predict_pool(feats_raw).stds     # (N, 2), normalized space
         sigma_bar = np.mean(std, axis=0)                 # (2,)
-        # Preserve make_epsilon_shifted_front's scaling exactly (sign carries one
-        # epsilon_scale, the product a second).
-        sign = cfg.epsilon_scale if cfg.front == "upper" else -1 * cfg.epsilon_scale
+        sign = 1 if cfg.front == "upper" else -1
         eps = (sign * sigma_bar * cfg.epsilon_scale).tolist()
 
         lbl = pd.read_csv(p.parent_labels_norm_csv)      # base real front (all real)
@@ -364,7 +362,7 @@ def make_epsilon_shifted_front(
     std = pool.stds  # (N, 2) in normalized objective space
 
     sigma_bar = np.mean(std, axis=0)  # (2,)
-    sign = cfg.epsilon_scale if cfg.front == "upper" else -1 * cfg.epsilon_scale
+    sign = 1 if cfg.front == "upper" else -1
     eps = sign * sigma_bar * epsilon_scale  # (2,)
 
     pareto_input = pareto_front.copy()
