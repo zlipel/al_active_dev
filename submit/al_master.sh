@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-task=96
 #SBATCH --mem-per-cpu=1G
 #SBATCH --time=05:59:00
-#SBATCH --output=al_master.out
-#SBATCH --error=al_master.err
+#SBATCH --output=%x-%j.out
+#SBATCH --error=%x-%j.err
 #
 # One sbatch per AL iteration. The master loops over child seq_ids internally
 # (via cli/child.run_child), which itself fans out via multiprocessing across
@@ -141,9 +141,10 @@ echo "Running: ${CMD[*]}"
 # if anything in the run cd'd elsewhere.
 LOG_DEST="${HOME_AL}/${MODEL}/logs/iteration_${FRONT}_${ITER}"
 mkdir -p "$LOG_DEST"
-SLURM_OUT="${SLURM_SUBMIT_DIR:-.}/al_master.out"
-SLURM_ERR="${SLURM_SUBMIT_DIR:-.}/al_master.err"
+SLURM_OUT="${SLURM_SUBMIT_DIR:-.}/${SLURM_JOB_NAME}-${SLURM_JOB_ID}.out"
+SLURM_ERR="${SLURM_SUBMIT_DIR:-.}/${SLURM_JOB_NAME}-${SLURM_JOB_ID}.err"
 [[ -f "$SLURM_OUT" ]] && mv "$SLURM_OUT" "$LOG_DEST/al_master_iter${ITER}.out"
 [[ -f "$SLURM_ERR" ]] && mv "$SLURM_ERR" "$LOG_DEST/al_master_iter${ITER}.err"
 
 conda deactivate
+ 

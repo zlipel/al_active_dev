@@ -185,8 +185,10 @@ def main():
     parser.add_argument("--cutoff", type=float)
     parser.add_argument("--stride", type=int, default=1, help="Stride over which to thin COM position data.")
     parser.add_argument("--bootstrap", action=argparse.BooleanOptionalAction, default=False, help='Flag for bootstrapping.')
+    parser.add_argument("--run_tag", type=str, default="", help="Optional parallel-policy suffix on output file")
 
     args = parser.parse_args()
+    tag_suffix = f"_{args.run_tag}" if args.run_tag else ""
 
     os.environ["OMP_NUM_THREADS"] = str(args.omp_threads)
 
@@ -224,7 +226,7 @@ def main():
     })
 
     os.makedirs(args.output_dir, exist_ok=True)
-    df.to_csv(os.path.join(args.output_dir, "diffusivities.csv"), index=False)
+    df.to_csv(os.path.join(args.output_dir, f"diffusivities{tag_suffix}.csv"), index=False)
 
     print("Finished computing and saving diffusivities.", flush=True)
 

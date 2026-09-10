@@ -181,6 +181,28 @@ def test_moe_hard_covariance_is_the_assigned_expert_cov(_bench_moe_bundle):
     np.testing.assert_allclose(pool_nps.covariance, cov_nps_only, rtol=1e-6, atol=1e-6)
 
 
+def test_moe_soft_stds_consistent_with_covariance(_bench_moe_bundle):
+    """
+    The acquisition uses two views of the same mixture uncertainty: the epsilon
+    shift + pessimism *scaling* read `pool.stds`, while the pessimism *overlap*
+    reads `pool.covariance` (full law of total covariance). They must stay the
+    same statistic: `stds**2 == diag(covariance)`. Locks `soft_mixture_variance`
+    (the per-objective law of total variance) to the diagonal of the (2, 2)
+    law-of-total-covariance so a refactor can't silently desync shift/scaling
+    from the overlap. Checked under soft AND the hard-gate switch.
+    """
+    bundle = _bench_moe_bundle
+    feats = _make_raw_features_df(5, seed=7)
+
+    for sur in (
+        MoESurrogate(bundle, policy="soft"),
+        MoESurrogate(bundle, policy="hard", threshold=0.5),
+    ):
+        pool = sur.predict_pool(feats)
+        diag = np.diagonal(pool.covariance, axis1=1, axis2=2)   # (B, 2)
+        np.testing.assert_allclose(pool.stds ** 2, diag, rtol=1e-6, atol=1e-8)
+
+
 # ---------- (2) _MultitaskPoolPosterior.covariance behavior-preserving ----------
 
 def test_multitask_covariance_matches_get_cand_stats():
@@ -260,6 +282,7 @@ def test_reindex_expert_appends_one_row():
     expert = _train_toy_expert(feats, labels, scaler1, scaler2)
 
     n_before = expert.model.train_inputs[0].shape[0]
+    x0 = expert.model.train_inputs[0].detach().numpy().copy()   # existing dataset
     new_child = _make_raw_features_df(1, seed=200)
     new_child_z = np.array([0.5, -0.2])
     train_x, train_y = augmentation._reindex_expert(expert, new_child, new_child_z, lr=0.1)
@@ -267,6 +290,17 @@ def test_reindex_expert_appends_one_row():
     assert train_y.shape[0] == n_before + 1
     # The expert's internal tensors were mutated to the expanded set.
     assert expert.model.train_inputs[0].shape[0] == n_before + 1
+
+    # (req 5) Reconditioning is on dataset + fantasy: the existing rows are the
+    # untouched training set, the one appended row IS the fantasy child.
+    np.testing.assert_allclose(train_x[:n_before].detach().numpy(), x0, rtol=1e-6, atol=1e-6)
+    # The appended label is exactly the passed (believed) z-space fantasy label.
+    np.testing.assert_allclose(train_y[-1].detach().numpy(), new_child_z, rtol=1e-6, atol=1e-6)
+    # (req 6) The appended feature row is the child normalized through THIS
+    # expert's FROZEN normalizer — same convert+apply the loop reuses.
+    feat_conv = convert_features(new_child[expert.feature_columns])
+    expected_x = apply_feature_normalizer(feat_conv, expert.feature_normalizer_stats).to_numpy().ravel()
+    np.testing.assert_allclose(train_x[-1].detach().numpy(), expected_x, rtol=1e-5, atol=1e-6)
 
 
 # ---------- (5) end-to-end augment() under kriging_believer + MoE ----------
@@ -388,14 +422,13 @@ def test_augment_kriging_believer_moe_writes_temp_artifacts(_moe_iter_dir):
     # seq_gen_temp updated too.
     assert p.seq_gen_temp_txt.exists()
 
-    # Reloaded temp bundle: assigned expert grew by 1, other unchanged.
+    # Reloaded temp bundle: BOTH experts grew by 1 (kriging-believer conditions
+    # the whole mixture, not just the gated expert).
     bundle_temp = load_moe_bundle(cfg, temp=True)
     ps_n_after = bundle_temp.ps_expert.model.train_inputs[0].shape[0]
     nps_n_after = bundle_temp.nonps_expert.model.train_inputs[0].shape[0]
-    grew_ps = (ps_n_after == ps_n_before + 1) and (nps_n_after == nps_n_before)
-    grew_nps = (nps_n_after == nps_n_before + 1) and (ps_n_after == ps_n_before)
-    assert grew_ps or grew_nps, (
-        f"Expected exactly one expert to grow by 1: ps {ps_n_before}->{ps_n_after}, "
+    assert ps_n_after == ps_n_before + 1 and nps_n_after == nps_n_before + 1, (
+        f"Expected BOTH experts to grow by 1: ps {ps_n_before}->{ps_n_after}, "
         f"nonps {nps_n_before}->{nps_n_after}"
     )
 
@@ -438,3 +471,276 @@ def test_augment_kriging_believer_moe_pessimism_no_crash(_moe_iter_dir):
     # Second-pass temp files exist and load.
     bundle = load_moe_bundle(cfg, temp=True)
     assert bundle.label_scaler_scope == "all"
+
+
+# ---------- (6) routing / loop-file / pessimism / frozen-normalization ----------
+
+class _DetFeaturizer:
+    """Cross-process-deterministic stand-in for SequenceFeaturizer.
+
+    `_FakeFeaturizer` keys on builtin `hash()`, which is per-process randomized
+    (PYTHONHASHSEED) — fine for structural assertions but not for value-sensitive
+    ones (pessimism magnitude). This one seeds off `hashlib.md5`, so a given
+    sequence maps to the same feature row in every process.
+    """
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def featurize(self, seq: str) -> list[float]:
+        import hashlib
+        seed = int(hashlib.md5(seq.encode()).hexdigest()[:8], 16)
+        rng = np.random.default_rng(seed)
+        L = len(seq)
+        probs = rng.dirichlet(np.ones(20))
+        counts = rng.multinomial(L, probs).astype(float)
+        engineered = [
+            float(L), float(rng.normal(0.0, 0.5)), float(rng.uniform(0.0, 2.5)),
+            float(rng.integers(0, 10)), float(rng.uniform(0.0, 3.5)),
+            float(rng.integers(0, max(1, L // 5))), float(rng.integers(0, max(1, L // 5))),
+            float(rng.uniform(2.0, 4.5)), float(L * 110.0 + rng.normal(0.0, 50.0)),
+        ]
+        return list(counts) + engineered
+
+
+def _expert_sizes(bundle) -> tuple[int, int]:
+    return (
+        bundle.ps_expert.model.train_inputs[0].shape[0],
+        bundle.nonps_expert.model.train_inputs[0].shape[0],
+    )
+
+
+@pytest.mark.parametrize("threshold", [0.0, 0.5, 1.0 + 1e-9])
+def test_augment_kb_moe_reconditions_both_experts_on_shared_label(_moe_iter_dir, threshold):
+    """Kriging-believer conditions the whole mixture: BOTH experts are
+    reconditioned on the SAME believed label so they agree at x* (this is what
+    collapses the between-expert disagreement term of the mixture variance).
+    Independent of the gate threshold, both experts grow by exactly one row and
+    that appended row is the same z-space believed label in each."""
+    cfg = replace(_moe_iter_dir, moe_threshold=threshold)
+    ps_before, nps_before = _expert_sizes(load_moe_bundle(cfg, temp=False))
+
+    augmentation.augment(cfg, seq_id=1, pessimism=False)
+
+    bundle = load_moe_bundle(cfg, temp=True)
+    ps_after, nps_after = _expert_sizes(bundle)
+    # Regardless of routing, BOTH experts grew by exactly one.
+    assert ps_after == ps_before + 1 and nps_after == nps_before + 1
+
+    # The believed label written to disk this step (== labels_norm_csv tail).
+    believed = pd.read_csv(cfg.paths.labels_norm_csv).iloc[-1][[cfg.obj1, cfg.obj2]].to_numpy()
+    ps_y = bundle.ps_expert.model.train_targets[-1].detach().numpy()
+    nps_y = bundle.nonps_expert.model.train_targets[-1].detach().numpy()
+    # Both experts were conditioned on the identical believed label.
+    np.testing.assert_allclose(ps_y, believed, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(nps_y, believed, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(ps_y, nps_y, rtol=1e-6, atol=1e-8)
+
+
+@pytest.mark.parametrize("seq_id,expect_temp", [(1, False), (2, True), (5, True)])
+@pytest.mark.parametrize("model_type", ["moe", "gpr_multitask"])
+def test_run_ga_loads_reconditioned_temp_bundle(tmp_path, monkeypatch, model_type, seq_id, expect_temp):
+    """Guard: the GA scores each candidate with the kriging-believer TEMP bundle
+    for seq_id>1 (both MoE and global). Loading the base bundle would leave the
+    EHVI landscape unchanged across the batch -> the acquisition re-finds the same
+    optimum and the batch collapses onto duplicates."""
+    from al_pipeline.ga import run_ga
+
+    base = tmp_path / "home"; scratch = tmp_path / "scratch"; db = tmp_path / "db"
+    for d in (base, scratch, db):
+        d.mkdir(parents=True, exist_ok=True)
+    cfg = ALConfig(
+        model="TEST", iteration=0, front="upper",
+        base_path=base, scratch_path=scratch, db_path=db,
+        train_model_type=model_type,
+    )
+
+    seen: dict[str, bool] = {}
+
+    def _spy_moe(cfg, temp=False):
+        seen["temp"] = temp
+        return object()
+
+    def _spy_models(cfg, temp=False, device="cpu"):
+        seen["temp"] = temp
+        return object()
+
+    monkeypatch.setattr(run_ga.ga_utils, "load_moe_bundle", _spy_moe)
+    monkeypatch.setattr(run_ga.ga_utils, "load_models", _spy_models)
+    monkeypatch.setattr(run_ga.ga_utils, "load_normalization_stats", lambda p: {})
+    monkeypatch.setattr(run_ga, "make_surrogate", lambda cfg, **kw: object())
+
+    run_ga._load_ga_surrogate(cfg, seq_id)
+    assert seen["temp"] is expect_temp
+
+
+def test_augment_kb_moe_loop_consumes_and_grows_temp_norm_files(_moe_iter_dir):
+    """(req 3) The AL loop lives in the temp/norm files: each seq_id appends the
+    child to features_norm_csv / labels_norm_csv / seq_gen_temp_txt and, for
+    seq_id>1, reloads the *temp* bundle (not base). Two augments must therefore
+    grow the norm files by 2 and the experts' combined train set by 2 (chained
+    through temp), not by 1 (which would mean seq_id=2 re-read the base bundle)."""
+    cfg = _moe_iter_dir
+    p = cfg.paths
+
+    n_lbl0 = len(pd.read_csv(p.labels_norm_csv))
+    n_feat0 = len(pd.read_csv(p.features_norm_csv))
+    n_seq0 = len(p.seq_gen_txt.read_text().split())
+    ps0, nps0 = _expert_sizes(load_moe_bundle(cfg, temp=False))
+
+    augmentation.augment(cfg, seq_id=1, pessimism=False)
+    assert len(pd.read_csv(p.labels_norm_csv)) == n_lbl0 + 1
+    assert len(pd.read_csv(p.features_norm_csv)) == n_feat0 + 1
+    assert len(p.seq_gen_temp_txt.read_text().split()) == n_seq0 + 1
+
+    child2 = "GGGWLYNTKKKKKKKPPRDDEELLSKAAA"
+    (p.ga_children_dir / "seq_child_2.txt").write_text(child2 + "\n")
+    augmentation.augment(cfg, seq_id=2, pessimism=False)
+
+    # Norm/seq files grew again -> seq_id=2 read the *grown* files, not the base.
+    assert len(pd.read_csv(p.labels_norm_csv)) == n_lbl0 + 2
+    assert len(pd.read_csv(p.features_norm_csv)) == n_feat0 + 2
+    assert len(p.seq_gen_temp_txt.read_text().split()) == n_seq0 + 2
+
+    # Both experts grow by 1 each per augment, so two augments add 4 combined ->
+    # seq_id=2 loaded the temp bundle from seq_id=1 (base+1 each) and chained
+    # (+1 each). A base reload at seq_id=2 would give only +2 combined.
+    ps2, nps2 = _expert_sizes(load_moe_bundle(cfg, temp=True))
+    assert (ps2 + nps2) == (ps0 + nps0) + 4
+
+
+def test_augment_kb_moe_pessimism_conservative_and_reconditions_on_believed_label(
+    _moe_iter_dir, monkeypatch,
+):
+    """(req 1, guards Fix 2) With --pessimism the believed label is pushed to the
+    conservative side of the plain posterior mean, the pessimistic value (not the
+    optimistic mean) is what's written to labels_norm_csv, and the assigned expert
+    is reconditioned on that same pessimistic label — matching the global path."""
+    # Deterministic featurizer so the pessimism penalty is reproducible.
+    monkeypatch.setattr(augmentation.sf, "SequenceFeaturizer", _DetFeaturizer)
+    cfg = replace(_moe_iter_dir, pessimism=True)   # front="upper" (maximize)
+    p = cfg.paths
+
+    augmentation.augment(cfg, seq_id=1, pessimism=True)   # seeds; no penalty at seq_id=1
+
+    child2 = "MKKLVAGGGWLYNTRQPPRDDEELLSKGG"
+    (p.ga_children_dir / "seq_child_2.txt").write_text(child2 + "\n")
+    augmentation.augment(cfg, seq_id=2, pessimism=True)
+
+    believed = pd.read_csv(p.labels_norm_csv).iloc[-1][[cfg.obj1, cfg.obj2]].to_numpy()
+    optimistic = pd.read_csv(p.labels_no_pessimism).iloc[-1][[cfg.obj1, cfg.obj2]].to_numpy()
+
+    # Pessimism actually moved the label to the conservative (lower, for the
+    # upper/maximize front) side of the plain mean.
+    assert not np.allclose(believed, optimistic)
+    assert np.all(believed <= optimistic + 1e-8)
+
+    # BOTH reconditioned experts' newly appended target is the PESSIMISTIC label
+    # (== labels_norm_csv tail), NOT the optimistic mean (labels_no_pessimism).
+    bundle2 = load_moe_bundle(cfg, temp=True)
+    for expert in (bundle2.ps_expert, bundle2.nonps_expert):
+        recond_y = expert.model.train_targets[-1].detach().numpy()
+        np.testing.assert_allclose(recond_y, believed, rtol=1e-5, atol=1e-6)
+        assert not np.allclose(recond_y, optimistic)
+
+
+def test_augment_kb_moe_freezes_and_reuses_normalization_on_fantasy(_moe_iter_dir):
+    """(req 6) The per-expert feature normalizer + label scalers and the global
+    norm_stats.json are frozen during the batch and simply *reused* to encode the
+    fantasy child: the reconditioned feature row equals the child normalized with
+    the base (pre-augment) frozen normalizer, and no normalization state changes."""
+    cfg = _moe_iter_dir
+    p = cfg.paths
+
+    base_bundle = load_moe_bundle(cfg, temp=False)
+    ps0, nps0 = _expert_sizes(base_bundle)
+    # Snapshot frozen normalization state before the batch touches anything.
+    norm_stats_before = p.norm_stats.read_bytes()
+    ps_feat_stats_before = base_bundle.ps_expert.feature_normalizer_stats
+    nps_feat_stats_before = base_bundle.nonps_expert.feature_normalizer_stats
+
+    augmentation.augment(cfg, seq_id=1, pessimism=False)
+
+    # Global normalization stats untouched by the loop.
+    assert p.norm_stats.read_bytes() == norm_stats_before
+
+    temp_bundle = load_moe_bundle(cfg, temp=True)
+    ps1, nps1 = _expert_sizes(temp_bundle)
+    grew_is_ps = ps1 == ps0 + 1
+    grew_before = base_bundle.ps_expert if grew_is_ps else base_bundle.nonps_expert
+    grew_after = temp_bundle.ps_expert if grew_is_ps else temp_bundle.nonps_expert
+
+    # Per-expert feature normalizer is frozen through the batch. Stats are nested
+    # {feature: {'type', 'mean'/'std'/'min'/...}} — walk and compare numerically.
+    frozen_stats = ps_feat_stats_before if grew_is_ps else nps_feat_stats_before
+    after_stats = grew_after.feature_normalizer_stats
+    assert set(after_stats) == set(frozen_stats)
+    for feat, sub in frozen_stats.items():
+        assert after_stats[feat]["type"] == sub["type"]
+        for stat_key, val in sub.items():
+            if stat_key == "type":
+                continue
+            np.testing.assert_allclose(
+                float(after_stats[feat][stat_key]), float(val), rtol=1e-6, atol=1e-8,
+            )
+    # Label scalers frozen too (Yeo-Johnson lambdas unchanged).
+    np.testing.assert_allclose(
+        grew_after.label_scaler1.lambdas_, grew_before.label_scaler1.lambdas_, rtol=1e-6,
+    )
+    np.testing.assert_allclose(
+        grew_after.label_scaler2.lambdas_, grew_before.label_scaler2.lambdas_, rtol=1e-6,
+    )
+
+    # The fantasy child's reconditioned feature row is the child encoded with the
+    # FROZEN (base) normalizer — normalization was reused, not refit.
+    child = (cfg.paths.ga_children_dir / "seq_child_1.txt").read_text().strip()
+    featurizer = augmentation.sf.SequenceFeaturizer(cfg.model.lower(), cfg.db_path)
+    raw = pd.DataFrame(
+        np.asarray(featurizer.featurize(child)).reshape(1, -1), columns=FEATURE_COLUMNS,
+    )
+    feat_conv = convert_features(raw[grew_before.feature_columns])
+    expected_x = apply_feature_normalizer(
+        feat_conv, grew_before.feature_normalizer_stats,
+    ).to_numpy().ravel()
+    np.testing.assert_allclose(
+        grew_after.model.train_inputs[0][-1].detach().numpy(), expected_x, rtol=1e-5, atol=1e-6,
+    )
+
+
+def test_augment_kb_moe_pessimism_feeds_raw_prev_children(_moe_iter_dir, monkeypatch):
+    """Regression: the pessimism overlap must RE-FEATURIZE prior children (RAW),
+    not reuse the globally-normalized rows from features_norm_csv. Feeding
+    normalized rows as "raw" sends the MoE RF gate's convert_features to inf
+    ('Input X contains infinity ...'). Spy the surrogate calls and assert the
+    prior-children frame carries RAW features, not the normalized ones."""
+    monkeypatch.setattr(augmentation.sf, "SequenceFeaturizer", _DetFeaturizer)
+    cfg = replace(_moe_iter_dir, pessimism=True)
+    p = cfg.paths
+
+    calls: list[pd.DataFrame] = []
+    orig = augmentation.predict_for_augmentation
+
+    def _spy(surrogate, features_raw_df, return_std=False):
+        calls.append(features_raw_df.copy())
+        return orig(surrogate, features_raw_df, return_std=return_std)
+
+    monkeypatch.setattr(augmentation, "predict_for_augmentation", _spy)
+
+    augmentation.augment(cfg, seq_id=1, pessimism=True)   # seeds child_1
+    child2 = "MKKLVAGGGWLYNTRQPPRDDEELLSKGG"
+    (p.ga_children_dir / "seq_child_2.txt").write_text(child2 + "\n")
+    calls.clear()
+    augmentation.augment(cfg, seq_id=2, pessimism=True)   # would crash under the bug
+
+    # Two predict calls at seq_id=2: [current child, prior children].
+    assert len(calls) == 2
+    prev_df = calls[1]
+    assert len(prev_df) == 1                              # one prior child (child_1)
+    assert np.isfinite(prev_df.to_numpy()).all()          # not inf/over-range
+
+    # The prior-children row is the RAW featurization of child_1, NOT its
+    # normalized row in features_norm_csv (which is what the bug fed).
+    child1 = (p.ga_children_dir / "seq_child_1.txt").read_text().strip()
+    expected_raw = np.asarray(_DetFeaturizer().featurize(child1), dtype=float)
+    np.testing.assert_allclose(prev_df.iloc[0].to_numpy(), expected_raw, rtol=1e-6, atol=1e-6)
+    norm_row = pd.read_csv(p.features_norm_csv).iloc[-2].to_numpy()   # child_1's normalized row
+    assert not np.allclose(prev_df.iloc[0].to_numpy(), norm_row)

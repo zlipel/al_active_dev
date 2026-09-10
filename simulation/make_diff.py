@@ -285,11 +285,17 @@ if __name__ == "__main__":
     parser.add_argument('--max_cores', type=int, default=480,
                         help='Total core ceiling for this submission. Match to your SLURM partition '
                              '(Stellar medium: 3000, long: 2500; default: 480).')
+    parser.add_argument('--run_tag', type=str, default='',
+                        help='Optional parallel-policy suffix on the eos_results file read for rho_init.')
     args = parser.parse_args(args)
 
     if args.quick == 0:
         if not args.test:
-            eos_results = pd.read_csv(os.path.join(args.parent_dir, 'eos_results.csv'))
+            eos_name = f"eos_results_{args.run_tag}.csv" if args.run_tag else "eos_results.csv"
+            eos_path = os.path.join(args.parent_dir, eos_name)
+            if args.run_tag and not os.path.exists(eos_path):
+                eos_path = os.path.join(args.parent_dir, "eos_results.csv")
+            eos_results = pd.read_csv(eos_path)
 
             psp     = eos_results['psp'].values
             density = eos_results['density'].values

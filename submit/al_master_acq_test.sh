@@ -10,8 +10,9 @@
 #SBATCH --error=acq_logs/al_acq_test.err
 #
 # Acquisition-function diagnostic: runs the AL pipeline at iter=0 with
-# --acq_test on, against a SEPARATE scratch path so it doesn't clobber a
-# production run. Designed to be invoked once per (model, ehvi, explore)
+# --acq_test on, against SEPARATE scratch AND home paths so it doesn't clobber
+# a production run. Scratch -> SCRATCH_AL_ACQ, home -> HOME_AL_ACQ
+# (runs/ACQ_SWEEP). Designed to be invoked once per (model, ehvi, explore)
 # combo, typically via submit/run_acq_sweep.sh.
 #
 # Usage:
@@ -123,7 +124,7 @@ CMD=(al-master
     --ref_point_mode "$REF_POINT_MODE"
     --obj1 "$OBJ1"
     --obj2 "$OBJ2"
-    --base_path "$HOME_AL"
+    --base_path "$HOME_AL_ACQ"
     --scratch_path "$SCRATCH_AL_ACQ"
     --db_path "$DB_PATH"
     --pessimism

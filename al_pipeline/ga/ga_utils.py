@@ -196,27 +196,23 @@ def load_gpr_singletask(cfg: ALConfig, *, temp: bool, device: str | torch.device
 
 def load_front(cfg: ALConfig, seq_id: int, log=None):
     """
-    Loads the current Pareto front: sequences, raw features, and labels.
+    Load the current epsilon-shifted reference front for the GA.
 
     Returns
     -------
     pareto_front : np.ndarray
-        Shape (N, 2). Labels in normalized objective space (same z-space the
-        EHVI computation operates in).
-    pareto_feats_raw_df : pd.DataFrame
-        Shape (N, 29). RAW parent features — the surrogate normalizes them
-        internally. Lets the epsilon-shift route through the surrogate ABC so
-        global GPR and MoE share one code path.
+        Shape (N, 2). Reference objectives in normalized space — the eps-shifted
+        real front unioned with the (unshifted) kriging-believer fantasy rows.
+        The shift is baked in upstream (`compute_and_store_shift` + `get_parents`),
+        so run_ga feeds this straight into `front_augmentation`.
     parent_seqs : list[str]
-        The actual amino-acid sequences for each Pareto point.
+        The amino-acid sequences for each reference point.
     """
     p = cfg.paths
 
     seq_path = p.parent_seqs_temp_txt if seq_id > 1 else p.parent_seqs_txt
 
     labels_df = pd.read_csv(p.parent_labels_norm_csv)
-    feats_raw_df = pd.read_csv(p.parent_features_csv)
-
     pareto_front = labels_df[[cfg.obj1, cfg.obj2]].to_numpy()
 
     with open(seq_path, "r") as f:
@@ -224,10 +220,8 @@ def load_front(cfg: ALConfig, seq_id: int, log=None):
 
     if len(parent_seqs) != pareto_front.shape[0]:
         raise ValueError("Parents mismatch: sequences and labels have different lengths.")
-    if len(feats_raw_df) != pareto_front.shape[0]:
-        raise ValueError("Parents mismatch: feats and labels have different lengths.")
 
-    return pareto_front, feats_raw_df, parent_seqs
+    return pareto_front, parent_seqs
 
 def alpha(sequences: np.ndarray, propseqs: np.ndarray, seq_id: int) -> np.ndarray:
     """
@@ -289,6 +283,62 @@ def load_previous_children_as_feats(
     Xn = convert_and_normalize_features(X, train=False, stats=normalization_stats)  # shape [K,29]
     return np.asarray(Xn, dtype=np.float32)
 
+def _build_base_surrogate(cfg: ALConfig):
+    """Build the pre-loop (base, temp=False) surrogate — mirrors run_ga's setup."""
+    from al_pipeline.surrogates import make_surrogate  # deferred: avoid import cycle
+    if cfg.train_model_type == "moe":
+        moe_bundle = load_moe_bundle(cfg=cfg)
+        return make_surrogate(
+            cfg, moe_bundle=moe_bundle,
+            moe_policy=cfg.moe_policy, moe_threshold=cfg.moe_threshold,
+        )
+    model_bundle = load_models(cfg=cfg, temp=False, device="cpu")
+    normalization_stats = load_normalization_stats(cfg.paths.norm_stats)
+    return make_surrogate(cfg, model_bundle=model_bundle, normalization_stats=normalization_stats)
+
+
+def compute_and_store_shift(cfg: ALConfig, log=None) -> None:
+    """
+    Compute the epsilon shift ONCE, before the sequential batch, and freeze it.
+
+    KB approximates q-EHVI as joint improvement over a FIXED reference (the
+    epsilon-front); the shift is a property of the real-data posterior and must
+    not drift with — or be re-applied to — the believed (fantasy) points. So we
+    compute `eps` here from the base real Pareto front + base surrogate, persist
+    it (plus `n_base`, the real-row count) to `epsilon_shift_json`, and bake it
+    into the base `parent_labels_norm_csv` — seq_id=1's reference is the shifted
+    real front. The temp-stage `get_parents` reuses the frozen `eps` to shift the
+    real rows (< n_base) before its Pareto; fantasy rows join unshifted.
+
+    No-op (eps = [0, 0]) when `ehvi_variant != 'epsilon'`.
+    """
+    p = cfg.paths
+    n_base = int(len(pd.read_csv(p.labels_norm_csv)))
+    eps = [0.0, 0.0]
+
+    if cfg.ehvi_variant == "epsilon":
+        surrogate = _build_base_surrogate(cfg)
+        feats_raw = pd.read_csv(p.parent_features_csv)   # base parents, aligned
+        std = surrogate.predict_pool(feats_raw).stds     # (N, 2), normalized space
+        sigma_bar = np.mean(std, axis=0)                 # (2,)
+        sign = 1 if cfg.front == "upper" else -1
+        eps = (sign * sigma_bar * cfg.epsilon_scale).tolist()
+
+        lbl = pd.read_csv(p.parent_labels_norm_csv)      # base real front (all real)
+        lbl[cfg.obj1] = lbl[cfg.obj1] + eps[0]
+        lbl[cfg.obj2] = lbl[cfg.obj2] + eps[1]
+        lbl.to_csv(p.parent_labels_norm_csv, index=False)
+
+    with open(p.epsilon_shift_json, "w") as f:
+        json.dump({"eps": eps, "n_base": n_base}, f)
+
+    msg = f"Epsilon shift frozen: eps={eps}, n_base={n_base}"
+    if log:
+        log.info(msg)
+    else:
+        print(msg, flush=True)
+
+
 def make_epsilon_shifted_front(
     cfg,
     pareto_front: np.ndarray,           # shape [N,2] in normalized objective space
@@ -296,14 +346,13 @@ def make_epsilon_shifted_front(
     surrogate,
 ) -> tuple[np.ndarray, tuple[float, float] | None]:
     """
-    Returns (pareto_input, eps_tuple_or_None). pareto_input is what we feed
-    into front augmentation.
+    Per-pick epsilon shift: returns (pareto_input, eps_tuple_or_None).
 
-    Routes through the `Surrogate` ABC so global GPR and MoE share one
-    implementation: each surrogate normalizes raw features its own way and
-    returns marginal stds via `predict_pool(...).stds`. The shift direction
-    flips with `cfg.front` (upper / lower) to push the front "outward" in the
-    less explored direction.
+    Routes through the `Surrogate` ABC so global GPR and MoE share one path; the
+    shift direction flips with `cfg.front`. Retained for the retrospective
+    diagnostic (`al_retrospective`), which replicates the completed campaigns'
+    per-pick shift on in-memory (aligned) fronts. The production AL loop no longer
+    calls this — it freezes the shift once via `compute_and_store_shift`.
     """
     if cfg.ehvi_variant != "epsilon":
         return pareto_front.copy(), None
@@ -313,7 +362,7 @@ def make_epsilon_shifted_front(
     std = pool.stds  # (N, 2) in normalized objective space
 
     sigma_bar = np.mean(std, axis=0)  # (2,)
-    sign = cfg.epsilon_scale if cfg.front == "upper" else -1 * cfg.epsilon_scale
+    sign = 1 if cfg.front == "upper" else -1
     eps = sign * sigma_bar * epsilon_scale  # (2,)
 
     pareto_input = pareto_front.copy()

@@ -241,10 +241,14 @@ After LAMMPS simulations complete:
 
 ```bash
 # EOS analysis (phase coexistence densities, Beff/exp_density)
-submit/eos_calc.sh CALVADOS 500 10        # MODEL NBOOT ITER
+submit/eos_calc.sh CALVADOS 500 10        # MODEL NBOOT ITER [RUN_TAG]
 
 # Diffusivity analysis
-submit/diff_calc.sh CALVADOS 10           # MODEL ITER [INNER_JOBS] [OMP_THREADS] [NSEQ_JOBS]
+submit/diff_calc.sh CALVADOS 10           # MODEL ITER [RUN_TAG] [INNER_JOBS] [OMP_THREADS] [NSEQ_JOBS]
+
+# Parallel-policy (run-tagged) example — pass the same tag used at make_*.sh --run_tag:
+#   submit/eos_calc.sh  CALVADOS 500 11 soft
+#   submit/diff_calc.sh CALVADOS 11 soft
 ```
 
 (The `*_calc.sh` scripts are thin wrappers — they `sbatch` the actual SLURM job

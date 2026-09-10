@@ -38,6 +38,12 @@ SCOPE_SPEC=$2
 INNER_JOBS=${3:-4}
 OMP_THREADS=${4:-4}
 NSEQ_JOBS=${5:-6}
+# Sixth arg is the optional parallel-policy run tag (iteration scope only); the
+# AL loop appends _<run_tag> to the seq filename so parallel policies sharing one
+# iteration dir don't collide. Empty ⇒ production naming (backward compatible).
+RUN_TAG="${6:-}"
+TAG_SUFFIX=""
+[[ -n "$RUN_TAG" ]] && TAG_SUFFIX="_${RUN_TAG}"
 
 if [[ "$SCOPE_SPEC" == validation:* ]]; then
     SCOPE="${SCOPE_SPEC#validation:}"
@@ -49,7 +55,7 @@ elif [[ $SCOPE_SPEC -eq 0 ]]; then
     PAR_DIR="${SCRATCH_AL}/$MODEL/SIMULATIONS/DIFF"
 else
     ITER="$SCOPE_SPEC"
-    SEQS="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF/seq_gen$ITER.txt"
+    SEQS="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF/seq_gen${ITER}${TAG_SUFFIX}.txt"
     PAR_DIR="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF"
 fi
 
@@ -79,4 +85,5 @@ python "${REPO_ROOT}/analysis/process_diff_sims.py" \
     --omp_threads $OMP_THREADS \
     --nseq_jobs $NSEQ_JOBS \
     --cutoff $CUT \
-    --stride $STRIDE
+    --stride $STRIDE \
+    --run_tag "$RUN_TAG"

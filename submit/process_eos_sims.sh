@@ -36,6 +36,12 @@ NBOOT=$2
 # validation case must be tested first — [[ ... -eq 0 ]] is arithmetic and
 # would (mis)evaluate a "validation:*" string to 0.
 SCOPE_SPEC=$3
+# Fourth arg is the optional parallel-policy run tag (iteration scope only); the
+# AL loop appends _<run_tag> to the seq filename so parallel policies sharing one
+# iteration dir don't collide. Empty ⇒ production naming (backward compatible).
+RUN_TAG="${4:-}"
+TAG_SUFFIX=""
+[[ -n "$RUN_TAG" ]] && TAG_SUFFIX="_${RUN_TAG}"
 
 if [[ "$SCOPE_SPEC" == validation:* ]]; then
     SCOPE="${SCOPE_SPEC#validation:}"
@@ -49,7 +55,7 @@ elif [[ $SCOPE_SPEC -eq 0 ]]; then
     OUTPUT_DIR="${SCRATCH_AL}/$MODEL/SIMULATIONS/DIFF"
 else
     ITER="$SCOPE_SPEC"
-    SEQS="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS/seq_gen$ITER.txt"
+    SEQS="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS/seq_gen${ITER}${TAG_SUFFIX}.txt"
     PAR_DIR="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/EOS"
     OUTPUT_DIR="${SCRATCH_AL}/$MODEL/GENERATIONS/iteration_$ITER/SIMULATIONS/DIFF"
 fi
@@ -58,13 +64,14 @@ python "${REPO_ROOT}/analysis/process_eos_sims.py" \
     -parent_dir "$PAR_DIR" \
     -output_dir "$PAR_DIR" \
     -sequence_file "$SEQS" \
-    -num_bootstrap "$NBOOT"
+    -num_bootstrap "$NBOOT" \
+    -run_tag "$RUN_TAG"
 
 # make_diff.py reads eos_results.csv from its parent_dir (the DIFF dir), so
 # hand the EOS results across to the sibling DIFF tree.
-cp "$PAR_DIR/eos_results.csv" "$OUTPUT_DIR/eos_results.csv"
+cp "$PAR_DIR/eos_results${TAG_SUFFIX}.csv" "$OUTPUT_DIR/eos_results${TAG_SUFFIX}.csv"
 if [[ "$SCOPE_SPEC" == validation:* ]]; then
     cp "$SEQS" "$OUTPUT_DIR/seq_${SCOPE_LOWER}.txt"
 else
-    cp "$SEQS" "$OUTPUT_DIR/seq_gen$SCOPE_SPEC.txt"
+    cp "$SEQS" "$OUTPUT_DIR/seq_gen${SCOPE_SPEC}${TAG_SUFFIX}.txt"
 fi
