@@ -20,8 +20,9 @@ Mode differences:
   distinct non-empty bins chosen to maximize bin-index spread (farthest-point
   in bin space). Targets: 4 diagonals at ``±benchmark_delta``.
 - **production** — picks ``⌈frac × |bin|⌉`` sequences per non-empty bin.
-  Targets: full symmetric grid over ``{±grid_spacing, ±2·grid_spacing, ...}``
-  up to ``±largest_delta`` on each axis, excluding zero on both axes.
+  Targets: full symmetric grid over ``{0, ±grid_spacing, ±2·grid_spacing,
+  ...}`` up to ``±largest_delta`` on each axis, excluding only the ``(0, 0)``
+  centre (single-axis moves are kept).
 
 Outputs land under ``<scratch>/PATHS[_FIXED_LENGTH]/<MODEL>/<MODE>/`` — the
 runner consumes ``endpoints_<MODEL>.csv`` from the same folder and writes
@@ -254,11 +255,12 @@ def make_target_deltas(
 
     Benchmark: 4 diagonals at ``(±benchmark_delta, ±benchmark_delta)``.
 
-    Production: symmetric grid ``{-largest_delta, ..., -grid_spacing,
-    +grid_spacing, ..., +largest_delta}`` per axis, excluding zero on both
-    axes. All cells are true 2D moves. Grid size = ``(2·k)² = 4·k²`` where
-    ``k = round(largest_delta / grid_spacing)``. Defaults give ``(2·4)² =
-    64`` cells.
+    Production: symmetric grid ``{-largest_delta, ..., -grid_spacing, 0,
+    +grid_spacing, ..., +largest_delta}`` per axis, excluding only the
+    ``(0, 0)`` centre. Single-axis moves (``(du, 0)`` / ``(0, dv)``) are kept
+    so the heatmap covers pure single-objective directions too. Grid size =
+    ``(2·k + 1)² - 1`` where ``k = round(largest_delta / grid_spacing)``.
+    Defaults give ``(2·4 + 1)² - 1 = 80`` cells.
     """
     if mode == "benchmark":
         d = float(benchmark_delta)
@@ -276,9 +278,8 @@ def make_target_deltas(
                 f"largest_delta ({largest_delta}) < grid_spacing "
                 f"({grid_spacing}) — no cells to search"
             )
-        pos = [round(grid_spacing * (i + 1), 6) for i in range(k)]
-        vals = [-v for v in pos[::-1]] + pos
-        return [(du, dv) for du in vals for dv in vals]
+        vals = [round(grid_spacing * i, 6) for i in range(-k, k + 1)]
+        return [(du, dv) for du in vals for dv in vals if not (du == 0.0 and dv == 0.0)]
 
     raise ValueError(f"unknown mode={mode!r}")
 

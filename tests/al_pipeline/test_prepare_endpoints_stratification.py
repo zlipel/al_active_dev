@@ -210,33 +210,35 @@ def test_benchmark_deltas_are_four_diagonals():
                         (-0.0375, 0.0375), (-0.0375, -0.0375)}
 
 
-def test_production_deltas_are_8x8_no_zero():
+def test_production_deltas_include_axes_exclude_center():
     dels = make_target_deltas(
         "production",
         grid_spacing=0.0125,
         largest_delta=0.05,
         benchmark_delta=0.0375,
     )
-    assert len(dels) == 64
-    # No cell has du=0 or dv=0.
-    assert all(abs(du) > 1e-9 and abs(dv) > 1e-9 for du, dv in dels)
-    # Symmetric on both axes.
+    # 9x9 grid minus the (0, 0) centre.
+    assert len(dels) == 80
+    # (0, 0) is the ONLY excluded cell.
+    assert (0.0, 0.0) not in dels
+    # Single-axis moves ARE kept (unlike the old 2D-only grid).
+    assert (0.0125, 0.0) in dels and (0.0, -0.05) in dels
+    # Symmetric on both axes and includes 0.
     dus = sorted({du for du, _ in dels})
     dvs = sorted({dv for _, dv in dels})
     assert dus == dvs
-    assert dus == sorted({-round(0.0125 * (i + 1), 6) for i in range(4)}
-                         | {round(0.0125 * (i + 1), 6) for i in range(4)})
+    assert dus == sorted({round(0.0125 * i, 6) for i in range(-4, 5)})
 
 
 def test_production_default_smaller_grid():
-    # spacing=0.02, largest=0.06 → 3 pos + 3 neg per axis → 6×6 = 36
+    # spacing=0.02, largest=0.06 → k=3 → 7×7 grid minus (0,0) centre = 48
     dels = make_target_deltas(
         "production",
         grid_spacing=0.02,
         largest_delta=0.06,
         benchmark_delta=0.0375,
     )
-    assert len(dels) == 36
+    assert len(dels) == 48
 
 
 def test_make_target_deltas_bad_mode_raises():
