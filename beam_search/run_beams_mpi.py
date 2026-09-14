@@ -58,8 +58,42 @@ def build_existing_reason_map(existing_df):
         return {}
     out = {}
     for row in existing_df.itertuples(index=False):
+        # Blank/NaN reasons resume as a missing key, not as done.
+        if pd.isna(row.reason):
+            continue
         out[endpoint_key(row)] = row.reason
     return out
+
+
+def _atomic_write_csv(df, out_csv):
+    """Write ``df`` to ``out_csv`` via a temp file + ``os.replace``.
+
+    ``os.replace`` is atomic within a filesystem, so a reader or a kill mid-write
+    never sees a partial ``paths.csv`` — only the previous or the new complete
+    file. The pid in the temp name keeps concurrent writers from colliding.
+    """
+    tmp = f"{out_csv}.tmp.{os.getpid()}"
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, out_csv)
+
+
+def assemble_results_df(rows_out, existing_df, order_df):
+    """Combine computed endpoint rows with prior results, ordered by the grid.
+
+    rows_out overrides existing_df on duplicate keys; existing keys not in
+    order_df are dropped. Uncomputed endpoints are omitted rather than written
+    as NaN rows, so a missing key on resume is retried.
+    """
+    new_df = pd.DataFrame(rows_out)
+    if existing_df is not None and not existing_df.empty:
+        existing_trim = existing_df.merge(order_df[KEY_COLS], on=KEY_COLS, how="inner")
+        out_df = pd.concat([existing_trim, new_df], ignore_index=True)
+        out_df = out_df.drop_duplicates(subset=KEY_COLS, keep="last")
+    else:
+        out_df = new_df.drop_duplicates(subset=KEY_COLS, keep="last")
+    # Order by the grid without padding absent endpoints.
+    out_df = out_df.merge(order_df, on=KEY_COLS, how="left")
+    return out_df.sort_values("_order").drop(columns="_order")
 
 
 def get_pending_start_indices(all_start_indices, groups_by_start, paths_dir, resume, extend_no_finished):
@@ -401,6 +435,10 @@ def doWork(start_idx, groups_by_start, paths_dir, bundle, model, q_rho, q_diff,
     start_uv = np.array([u_start, v_start], dtype=float)
     start_z = np.array([z_rho_start, z_diff_start], dtype=float)
 
+    # Canonical endpoint grid; every incremental flush reindexes against it.
+    order_df = groups_by_start[int(start_idx)][KEY_COLS].drop_duplicates().copy()
+    order_df["_order"] = np.arange(len(order_df))
+
     rows_out = []
     n_ep = len(sub)
     _rank = MPI.COMM_WORLD.Get_rank()
@@ -437,145 +475,127 @@ def doWork(start_idx, groups_by_start, paths_dir, bundle, model, q_rho, q_diff,
                 ddiff=np.nan,
                 end_seq=None,
             ))
-            rows_out.append(d)
-            continue
-
-        u_t = float(row.u_target)
-        v_t = float(row.v_target)
-        rho_t = float(q_rho.inverse_transform([[u_t]])[0, 0])
-        diff_t = float(q_diff.inverse_transform([[v_t]])[0, 0])
-
-        if timings is not None:
-            _reset_timers(timings)
-        # Collect per-step convergence trace only when --profile is on
-        # (we key off `timings` since the two share the same output file).
-        progress_out: list[dict] | None = [] if timings is not None else None
-        _t_walk = time()
-        finished, beam_tail = beam_search_paths(
-            policy=policy,
-            start_seq=row.start_seq,
-            uv_target=np.array([u_t, v_t], dtype=float),
-            start_phys=start_phys,
-            start_uv=start_uv,
-            start_z=start_z,
-            beam_width=beam_width,
-            max_steps=row_max_steps,
-            tol=quantile_tol,
-            diversity="none",
-            diversity_radius=0.0,
-            budget_cost=None,
-            length_changes=length_changes,
-            axis_weights=(1.0, 1.0),
-            min_positive=1e-12,
-            patience=patience,
-            min_delta=min_delta,
-            progress_out=progress_out,
-        )
-        _walk_ms = (time() - _t_walk) * 1000.0
-
-        if timings is not None:
-            rows_out_t = _timing_rows(
-                timings,
-                start_idx=int(start_idx),
-                du_req=float(row.du_req),
-                dv_req=float(row.dv_req),
-                walk_ms=_walk_ms,
-                progress=progress_out,
-            )
-            timings_path = os.path.join(
-                paths_dir, "step_timings", f"start_{start_idx:04d}.csv"
-            )
-            pd.DataFrame(rows_out_t).to_csv(
-                timings_path,
-                mode="a",
-                header=not os.path.exists(timings_path),
-                index=False,
-            )
-
-        if finished:
-            best = finished[0]
-            hit = True
-            reason = "finished_quantile"
-        elif beam_tail:
-            best = beam_tail[0]
-            hit = False
-            reason = "no_finished"
         else:
-            d.update(dict(
-                attempted=True,
-                hit=False,
-                reason="no_valid_candidates",
-                n_edits=np.nan,
-                path_len=np.nan,
-                rho_target=rho_t,
-                diff_target=diff_t,
-                z_rho_target=np.nan,
-                z_diff_target=np.nan,
-                rho_end=np.nan,
-                diff_end=np.nan,
-                z_rho_end=np.nan,
-                z_diff_end=np.nan,
-                u_end=np.nan,
-                v_end=np.nan,
-                du_ach=np.nan,
-                dv_ach=np.nan,
-                drho=np.nan,
-                ddiff=np.nan,
-                end_seq=None,
-            ))
-            rows_out.append(d)
-            continue
+            u_t = float(row.u_target)
+            v_t = float(row.v_target)
+            rho_t = float(q_rho.inverse_transform([[u_t]])[0, 0])
+            diff_t = float(q_diff.inverse_transform([[v_t]])[0, 0])
 
-        z_rho_end, z_diff_end = best["preds_z"][-1]
-        rho_end, diff_end = best["preds_phys"][-1]
-        u_end, v_end = best["preds_uv"][-1]
+            if timings is not None:
+                _reset_timers(timings)
+            # Per-step convergence trace only when --profile is on.
+            progress_out: list[dict] | None = [] if timings is not None else None
+            _t_walk = time()
+            finished, beam_tail = beam_search_paths(
+                policy=policy,
+                start_seq=row.start_seq,
+                uv_target=np.array([u_t, v_t], dtype=float),
+                start_phys=start_phys,
+                start_uv=start_uv,
+                start_z=start_z,
+                beam_width=beam_width,
+                max_steps=row_max_steps,
+                tol=quantile_tol,
+                diversity="none",
+                diversity_radius=0.0,
+                budget_cost=None,
+                length_changes=length_changes,
+                axis_weights=(1.0, 1.0),
+                min_positive=1e-12,
+                patience=patience,
+                min_delta=min_delta,
+                progress_out=progress_out,
+            )
+            _walk_ms = (time() - _t_walk) * 1000.0
 
-        z_rho_t = float(s_rho.transform([[rho_t]])[0, 0])
-        z_diff_t = float(s_diff.transform([[diff_t]])[0, 0])
+            if timings is not None:
+                rows_out_t = _timing_rows(
+                    timings,
+                    start_idx=int(start_idx),
+                    du_req=float(row.du_req),
+                    dv_req=float(row.dv_req),
+                    walk_ms=_walk_ms,
+                    progress=progress_out,
+                )
+                timings_path = os.path.join(
+                    paths_dir, "step_timings", f"start_{start_idx:04d}.csv"
+                )
+                pd.DataFrame(rows_out_t).to_csv(
+                    timings_path,
+                    mode="a",
+                    header=not os.path.exists(timings_path),
+                    index=False,
+                )
 
-        d.update(dict(
-            attempted=True,
-            hit=hit,
-            reason=reason,
-            n_edits=len(best["edits"]),
-            path_len=len(best["path"]),
-            rho_target=rho_t,
-            diff_target=diff_t,
-            z_rho_target=z_rho_t,
-            z_diff_target=z_diff_t,
-            rho_end=float(rho_end),
-            diff_end=float(diff_end),
-            z_rho_end=float(z_rho_end),
-            z_diff_end=float(z_diff_end),
-            u_end=float(u_end),
-            v_end=float(v_end),
-            du_ach=float(u_end - u_start),
-            dv_ach=float(v_end - v_start),
-            drho=float(rho_end - rho_start),
-            ddiff=float(diff_end - diff_start),
-            end_seq=best["path"][-1],
-            endpoint_p_ps=float(best.get("endpoint_p_ps", float("nan"))),
-        ))
+            if finished:
+                best = finished[0]
+                hit = True
+                reason = "finished_quantile"
+            elif beam_tail:
+                best = beam_tail[0]
+                hit = False
+                reason = "no_finished"
+            else:
+                best = None
+                d.update(dict(
+                    attempted=True,
+                    hit=False,
+                    reason="no_valid_candidates",
+                    n_edits=np.nan,
+                    path_len=np.nan,
+                    rho_target=rho_t,
+                    diff_target=diff_t,
+                    z_rho_target=np.nan,
+                    z_diff_target=np.nan,
+                    rho_end=np.nan,
+                    diff_end=np.nan,
+                    z_rho_end=np.nan,
+                    z_diff_end=np.nan,
+                    u_end=np.nan,
+                    v_end=np.nan,
+                    du_ach=np.nan,
+                    dv_ach=np.nan,
+                    drho=np.nan,
+                    ddiff=np.nan,
+                    end_seq=None,
+                ))
+
+            if best is not None:
+                z_rho_end, z_diff_end = best["preds_z"][-1]
+                rho_end, diff_end = best["preds_phys"][-1]
+                u_end, v_end = best["preds_uv"][-1]
+
+                z_rho_t = float(s_rho.transform([[rho_t]])[0, 0])
+                z_diff_t = float(s_diff.transform([[diff_t]])[0, 0])
+
+                d.update(dict(
+                    attempted=True,
+                    hit=hit,
+                    reason=reason,
+                    n_edits=len(best["edits"]),
+                    path_len=len(best["path"]),
+                    rho_target=rho_t,
+                    diff_target=diff_t,
+                    z_rho_target=z_rho_t,
+                    z_diff_target=z_diff_t,
+                    rho_end=float(rho_end),
+                    diff_end=float(diff_end),
+                    z_rho_end=float(z_rho_end),
+                    z_diff_end=float(z_diff_end),
+                    u_end=float(u_end),
+                    v_end=float(v_end),
+                    du_ach=float(u_end - u_start),
+                    dv_ach=float(v_end - v_start),
+                    drho=float(rho_end - rho_start),
+                    ddiff=float(diff_end - diff_start),
+                    end_seq=best["path"][-1],
+                    endpoint_p_ps=float(best.get("endpoint_p_ps", float("nan"))),
+                ))
+
         rows_out.append(d)
+        # Atomic per-endpoint checkpoint so a kill loses at most one walk.
+        _atomic_write_csv(assemble_results_df(rows_out, existing_df, order_df), out_csv)
 
-    new_df = pd.DataFrame(rows_out)
-
-    order_df = groups_by_start[int(start_idx)][KEY_COLS].drop_duplicates().copy()
-    order_df["_order"] = np.arange(len(order_df))
-
-    if existing_df is not None and not existing_df.empty:
-        # Strip stale rows whose keys are no longer in the current endpoint grid.
-        existing_df = existing_df.merge(order_df[KEY_COLS], on=KEY_COLS, how="inner")
-        out_df = pd.concat([existing_df, new_df], ignore_index=True)
-        out_df = out_df.drop_duplicates(subset=KEY_COLS, keep="last")
-    else:
-        out_df = new_df.drop_duplicates(subset=KEY_COLS, keep="last")
-
-    # Current endpoint grid is the source of truth: exactly one row per expected endpoint.
-    out_df = order_df.merge(out_df, on=KEY_COLS, how="left")
-    out_df = out_df.sort_values("_order").drop(columns="_order")
-
-    out_df.to_csv(out_csv, index=False)
     print(f"[rank {MPI.COMM_WORLD.Get_rank()}] start_idx={start_idx} done; results written to {out_csv}", flush=True)
 
 
