@@ -51,35 +51,22 @@ source "${REPO_ROOT}/config/cluster.env"
 module purge
 module load "${OPENMPI_MODULE}"
 module load "${CONDA_MODULE}"
-# GPU runs: cluster.env may define CUDA_MODULE (e.g. "cudatoolkit/12.9").
-# Load it before conda so torch's CUDA detection picks it up. Harmless on
-# CPU-only runs — just sets env vars.
 if [[ -n "${CUDA_MODULE:-}" ]]; then
     module load "${CUDA_MODULE}"
 fi
 conda activate "${CONDA_ENV}"
 
-# Conda ships a newer libstdc++ than Stellar's /lib64/libstdc++.so.6 —
-# numpy 2.x needs GLIBCXX_3.4.29 which the system lib lacks. Prepend
-# conda's libdir so numpy's C extensions and torch's bundled CUDA libs
-# resolve cleanly. Must happen AFTER `conda activate` so $CONDA_PREFIX is set.
-export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 
-# beam_search/ on PYTHONPATH so the runner's `from cross_paths.model_io ...`
-# imports resolve; REPO_ROOT so `from al_pipeline.core.paths ...` resolves.
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="${REPO_ROOT}/beam_search:${REPO_ROOT}:${PYTHONPATH:-}"
 
 # Numba: OMP threading layer inside each MPI rank; NUMBA_NUM_THREADS =
 # SLURM_CPUS_PER_TASK so the featurizer uses every core allocated to this
-# rank. The runner also calls nb.set_num_threads() at the top of each
-# worker to align with SLURM_CPUS_PER_TASK — this env var is the fallback
-# for the module-import path.
+# rank. 
 export NUMBA_THREADING_LAYER=omp
 export NUMBA_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
-# Cap the numeric-library thread pools that torch / numpy would otherwise
-# fan out into — MPI oversubscription otherwise. Torch's own thread count
-# is set inside the runner (--torch_threads).
+# Cap the numeric-library thread pools that torch / numpy use
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
@@ -95,6 +82,7 @@ FRONT="upper"
 EHVI_VARIANT="epsilon"
 EXPLORATION_STRATEGY="kriging_believer"
 TRANSFORM="yeoj"
+RUN_TAG=""
 
 BEAM_WIDTH=64
 MAX_STEPS=8
@@ -145,6 +133,8 @@ Common options (defaults shown):
                                     (default: SLURM_CPUS_PER_TASK)
   --torch_threads N                 torch threads per rank
                                     (default: SLURM_CPUS_PER_TASK)
+  --run_tag TAG                     Optional suffix that matches production
+                                    AL pipeline (default: none)
   --hard_threshold F                gate threshold for --policy hard
                                     (default: 0.5)
   --reject_threshold F              gate threshold for --policy anchored_reject
@@ -178,6 +168,7 @@ while [[ "$#" -gt 0 ]]; do
         --ehvi_variant)      EHVI_VARIANT="$2"; shift ;;
         --exploration_strategy) EXPLORATION_STRATEGY="$2"; shift ;;
         --transform)         TRANSFORM="$2"; shift ;;
+        --run_tag)           RUN_TAG="$2"; shift ;;
         --beam_width)        BEAM_WIDTH="$2"; shift ;;
         --max_steps)         MAX_STEPS="$2"; shift ;;
         --tol_u)             TOL_U="$2"; shift ;;
@@ -232,6 +223,7 @@ CMD=(python -u "${REPO_ROOT}/beam_search/run_beams_mpi.py"
     --extra_steps "$EXTRA_STEPS"
 )
 
+[[ -n "$RUN_TAG" ]]                 && CMD+=(--run_tag "$RUN_TAG")
 [[ "$LENGTH_CHANGES"     == true ]] && CMD+=(--length_changes)
 [[ "$MC_EHVI"            == true ]] && CMD+=(--mc_ehvi)
 [[ "$RESUME"             == true ]] && CMD+=(--resume)
