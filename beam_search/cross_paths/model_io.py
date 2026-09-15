@@ -122,6 +122,7 @@ def _cfg_from_paths(paths: ALPaths, *, db_path: Path) -> ALConfig:
         obj1="exp_density",
         obj2="diff",
         aux1_obj1="density",
+        run_tag=paths.run_tag,
     )
 
 

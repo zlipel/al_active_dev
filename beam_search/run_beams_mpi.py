@@ -138,6 +138,51 @@ def get_pending_start_indices(all_start_indices, groups_by_start, paths_dir, res
     return pending, n_with_results, n_skipped
 
 
+def log_completion_summary(all_start_indices, groups_by_start, paths_dir):
+    """Scan RESULTS after a run; print per-start completeness + endpoint
+    outcomes and return the list of incomplete starts (empty = no resume
+    needed). A start is complete when every expected endpoint has a final
+    reason (converged or not)."""
+    from collections import Counter
+
+    reasons = Counter()
+    n_complete = 0
+    incomplete = []
+    n_expected = 0
+    n_final = 0
+
+    for start_idx in all_start_indices:
+        sub = groups_by_start[int(start_idx)]
+        expected = {endpoint_key(r) for r in sub[KEY_COLS].itertuples(index=False)}
+        n_expected += len(expected)
+
+        reason_map = build_existing_reason_map(load_existing_results(paths_dir, start_idx))
+        final = {k for k in expected if reason_map.get(k) in FINAL_REASONS}
+        n_final += len(final)
+        for k in final:
+            reasons[reason_map[k]] += 1
+
+        if final >= expected:
+            n_complete += 1
+        else:
+            incomplete.append(int(start_idx))
+
+    print(f"[rank 0] starts: {len(all_start_indices)} total, "
+          f"{n_complete} complete, {len(incomplete)} incomplete", flush=True)
+    print(f"[rank 0] endpoints: {n_final}/{n_expected} with a final reason", flush=True)
+    print("[rank 0] outcomes: "
+          + ", ".join(f"{r}={reasons.get(r, 0)}" for r in sorted(FINAL_REASONS)), flush=True)
+    if incomplete:
+        shown = incomplete[:20]
+        print(f"[rank 0] RESUME NEEDED: {len(incomplete)} starts incomplete "
+              f"(first {len(shown)}: {shown}); resubmit the same command with --resume",
+              flush=True)
+    else:
+        print("[rank 0] ALL COMPLETE — no resume needed; safe to run collect_results.py",
+              flush=True)
+    return incomplete
+
+
 def handoutWork(start_indices, comm, numProcesses):
     totalWork = len(start_indices)
     workcount = 0
@@ -643,6 +688,8 @@ def main():
                         help="Label transform (default: yeoj)")
     parser.add_argument("--mc_ehvi", action="store_true",
                         help="Use MC-EHVI checkpoint naming")
+    parser.add_argument("--run_tag", default="",
+                        help="Optional suffix that matches production AL pipeline.")
     # --- Row 9: beam policy ---
     parser.add_argument(
         "--policy",
@@ -740,6 +787,7 @@ def main():
         exploration_strategy=args.exploration_strategy,
         transform=args.transform,
         mc_ehvi=args.mc_ehvi,
+        run_tag=args.run_tag,
     )
     bundles = load_all_models(
         al_paths,
@@ -780,6 +828,9 @@ def main():
     comm.Barrier()
     if rank == 0:
         print("[rank 0] All ranks finished", flush=True)
+        print(f"[rank 0] ===== Beam completion summary: "
+              f"{model} / {args.mode} / {args.policy} =====", flush=True)
+        log_completion_summary(all_start_indices, groups_by_start, paths_dir)
 
 
 if __name__ == "__main__":

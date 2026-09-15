@@ -366,6 +366,8 @@ def main():
     parser.add_argument("--exploration_strategy", default="kriging_believer")
     parser.add_argument("--transform",            default="yeoj")
     parser.add_argument("--mc_ehvi", action="store_true")
+    parser.add_argument("--run_tag", default="",
+                        help="Optional suffix that matches production AL pipeline.")
 
     args = parser.parse_args()
 
@@ -389,6 +391,7 @@ def main():
         exploration_strategy=args.exploration_strategy,
         transform=args.transform,
         mc_ehvi=args.mc_ehvi,
+        run_tag=args.run_tag,
     )
 
     bundles = load_all_models(al_paths, db_dir=os.path.join(args.db_root, "databases"))

@@ -29,6 +29,7 @@ from run_beams_mpi import (  # noqa: E402
     assemble_results_df,
     build_existing_reason_map,
     get_pending_start_indices,
+    log_completion_summary,
     _atomic_write_csv,
 )
 
@@ -189,3 +190,37 @@ def test_partial_start_stays_pending_then_skipped(tmp_path):
         [5], groups_by_start, paths_dir, resume=True, extend_no_finished=False,
     )
     assert pending == [] and n_skipped == 1
+
+
+def _write_paths(paths_dir, start_idx, rows):
+    d = paths_dir / "RESULTS" / f"start_{start_idx:04d}"
+    d.mkdir(parents=True)
+    pd.DataFrame(rows).to_csv(d / "paths.csv", index=False)
+
+
+def test_completion_summary_flags_incomplete(tmp_path):
+    o1 = _order_df(1, [(0.01, 0.0), (0.0, -0.02)])
+    o2 = _order_df(2, [(0.01, 0.0), (0.0, -0.02)])
+    groups = {1: o1[KEY_COLS].copy(), 2: o2[KEY_COLS].copy()}
+    # start 1 complete (both endpoints final); start 2 missing its 2nd endpoint.
+    _write_paths(tmp_path, 1, [_row(1, 0.01, 0.0, "finished_quantile"),
+                               _row(1, 0.0, -0.02, "no_finished")])
+    _write_paths(tmp_path, 2, [_row(2, 0.01, 0.0, "finished_quantile")])
+
+    incomplete = log_completion_summary([1, 2], groups, str(tmp_path))
+    assert incomplete == [2]
+
+
+def test_completion_summary_all_complete(tmp_path):
+    o1 = _order_df(1, [(0.01, 0.0)])
+    groups = {1: o1[KEY_COLS].copy()}
+    _write_paths(tmp_path, 1, [_row(1, 0.01, 0.0, "finished_quantile")])
+
+    assert log_completion_summary([1], groups, str(tmp_path)) == []
+
+
+def test_completion_summary_missing_file_is_incomplete(tmp_path):
+    # A start whose worker never wrote paths.csv (e.g. killed) is incomplete.
+    o1 = _order_df(9, [(0.01, 0.0)])
+    groups = {9: o1[KEY_COLS].copy()}
+    assert log_completion_summary([9], groups, str(tmp_path)) == [9]

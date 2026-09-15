@@ -70,6 +70,7 @@ FRONT="upper"
 EHVI_VARIANT="epsilon"
 EXPLORATION_STRATEGY="kriging_believer"
 TRANSFORM="yeoj"
+RUN_TAG=""
 
 THRESH_LOWER="0.25"
 THRESH_HIGHER="0.75"
@@ -105,6 +106,8 @@ Common options (defaults shown):
   --mode {benchmark,production}    (default: benchmark)
   --final_iter N                    (default: 10)
   --front {upper,lower}             (default: upper)
+  --run_tag TAG                     Optional suffix that matches production
+                                    AL pipeline (default: none)
   --thresh_lower F                  nonPS pool cap (default: 0.25)
   --thresh_higher F                 PS pool floor (default: 0.75)
   --ps_bins N                       (default: 3)
@@ -140,6 +143,7 @@ while [[ "$#" -gt 0 ]]; do
         --ehvi_variant)      EHVI_VARIANT="$2"; shift ;;
         --exploration_strategy) EXPLORATION_STRATEGY="$2"; shift ;;
         --transform)         TRANSFORM="$2"; shift ;;
+        --run_tag)           RUN_TAG="$2"; shift ;;
         --thresh_lower)      THRESH_LOWER="$2"; shift ;;
         --thresh_higher)     THRESH_HIGHER="$2"; shift ;;
         --ps_bins)           PS_BINS="$2"; shift ;;
@@ -196,6 +200,7 @@ else
     CMD+=(--frac_ps "$FRAC_PS" --frac_nonps "$FRAC_NONPS")
 fi
 
+[[ -n "$RUN_TAG" ]]             && CMD+=(--run_tag "$RUN_TAG")
 [[ "$LENGTH_CHANGES" == true ]] && CMD+=(--length_changes)
 [[ "$MC_EHVI"        == true ]] && CMD+=(--mc_ehvi)
 [[ "$CLEAR"          == true ]] && CMD+=(--clear)
