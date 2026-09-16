@@ -117,6 +117,32 @@ def test_loader_uses_raw_features_not_norm(tmp_path):
         load_beam_bundle(p, db_dir=tmp_path / "db")
 
 
+def test_load_moe_bundle_reads_resolved_data_paths(tmp_path, monkeypatch):
+    # from_checkpoints reads the training features/labels to rebuild the GP
+    # tensors; load_moe_bundle must hand it the tag-resolved (fallback) paths so
+    # a tagged run with untagged data still loads. Capture what it passes.
+    import al_pipeline.surrogates as surrogates_mod
+    from al_pipeline.ga.ga_utils import load_moe_bundle
+    from cross_paths.model_io import _cfg_from_paths
+
+    p = _paths("moe_soft", tmp_path)
+    _write(p.iter_scratch_dir / "features_gen10.csv")   # untagged only
+    _write(p.iter_scratch_dir / "labels_gen10.csv")
+    cfg = _cfg_from_paths(p, db_path=tmp_path / "db")
+
+    captured = {}
+
+    def _fake(rf, ps, nps, feats, labels, **kw):
+        captured["feats"], captured["labels"] = feats, labels
+        return "BUNDLE"
+
+    monkeypatch.setattr(surrogates_mod.MoEBundle, "from_checkpoints", staticmethod(_fake))
+
+    assert load_moe_bundle(cfg, temp=False) == "BUNDLE"
+    assert captured["feats"].endswith("features_gen10.csv")   # fell back to untagged
+    assert captured["labels"].endswith("labels_gen10.csv")
+
+
 def test_surrogate_cfg_carries_run_tag(tmp_path):
     # The ALConfig used to load the surrogate must resolve the same tagged MoE
     # checkpoints as the pre-check, or a tagged run loads untagged models.
