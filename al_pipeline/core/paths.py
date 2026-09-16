@@ -135,7 +135,24 @@ class ALPaths:
     @property
     def seq_gen_txt(self) -> Path:
         return self.iter_scratch_dir / self._tagged_name(f"seq_gen{self.iteration}", ".txt")
-    
+
+    #### read paths with tag fallback ####
+    # Writers use the always-tagged features_csv/labels_csv/seq_gen_txt above so
+    # a tagged run never writes to the untagged file. Read-only consumers that
+    # tolerate untagged upstream data (the beam) use these: tagged file if it
+    # exists, else the untagged default — resolved per file.
+    @property
+    def features_csv_resolved(self) -> Path:
+        return self._resolve_tagged(self.iter_scratch_dir, f"features_gen{self.iteration}", ".csv")
+
+    @property
+    def labels_csv_resolved(self) -> Path:
+        return self._resolve_tagged(self.iter_scratch_dir, f"labels_gen{self.iteration}", ".csv")
+
+    @property
+    def seq_gen_txt_resolved(self) -> Path:
+        return self._resolve_tagged(self.iter_scratch_dir, f"seq_gen{self.iteration}", ".txt")
+
     #### normalized and tagged instances ####
     @property
     def features_norm_csv(self) -> Path:

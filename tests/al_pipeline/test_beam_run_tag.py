@@ -53,13 +53,67 @@ def test_beam_artifacts_carry_run_tag(run_tag, tmp_path):
     assert p.moe_rf_bundle(temp=False).name == f"MOE_RF_iter10_{BASE_TAG}{suffix}.pkl"
 
 
-def test_loader_resolves_tagged_path(tmp_path):
-    # The real beam loader consults the tagged path: with empty dirs it fails
-    # the first existence check, naming the tagged features file.
+def _write(path, text="x\n"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def test_beam_reads_tagged_data_when_present(tmp_path):
+    # With the tagged data files on disk, the resolved read paths pick them up.
+    p = _paths("diag1", tmp_path)
+    d = p.iter_scratch_dir
+    _write(d / "features_gen10_diag1.csv")
+    _write(d / "labels_gen10_diag1.csv")
+    _write(d / "seq_gen10_diag1.txt")
+    assert p.features_csv_resolved.name == "features_gen10_diag1.csv"
+    assert p.labels_csv_resolved.name == "labels_gen10_diag1.csv"
+    assert p.seq_gen_txt_resolved.name == "seq_gen10_diag1.txt"
+
+
+def test_beam_falls_back_to_untagged_data_with_tagged_models(tmp_path):
+    # A tagged run with only UNtagged data files: the read paths fall back to
+    # the untagged data (writer paths stay tagged), and the loader gets past the
+    # data pre-check to fail on the missing TAGGED model — so untagged data is
+    # accepted while the tagged model variant is still required.
+    from cross_paths.model_io import load_beam_bundle
+
+    p = _paths("moe_soft", tmp_path)
+    d = p.iter_scratch_dir
+    _write(d / "features_gen10.csv")
+    _write(d / "labels_gen10.csv")
+    _write(d / "seq_gen10.txt")
+
+    assert p.features_csv_resolved.name == "features_gen10.csv"     # read: fallback
+    assert p.features_csv.name == "features_gen10_moe_soft.csv"     # write: tagged
+
+    with pytest.raises(FileNotFoundError, match=r"MOE_PS_iter10_.*moe_soft\.pt"):
+        load_beam_bundle(p, db_dir=tmp_path / "db")
+
+
+def test_beam_missing_data_reports_untagged_name(tmp_path):
+    # Neither tagged nor untagged present -> resolved returns the untagged base.
     from cross_paths.model_io import load_beam_bundle
 
     p = _paths("diag1", tmp_path)
-    with pytest.raises(FileNotFoundError, match=r"features_gen10_diag1\.csv"):
+    with pytest.raises(FileNotFoundError, match=r"features_gen10\.csv"):
+        load_beam_bundle(p, db_dir=tmp_path / "db")
+
+
+def test_loader_uses_raw_features_not_norm(tmp_path):
+    # The beam loads the raw features/labels, never the _NORM_ training variants.
+    from cross_paths.model_io import load_beam_bundle
+
+    p = _paths("", tmp_path)
+    assert p.features_csv != p.features_norm_csv
+    assert p.labels_csv != p.labels_norm_csv
+    assert "_NORM_" not in p.features_csv.name
+    assert "_NORM_" not in p.labels_csv.name
+
+    # With only the NORM file present the loader still requires the raw file
+    # (no NORM fallback): it fails naming the raw features CSV.
+    p.features_norm_csv.parent.mkdir(parents=True, exist_ok=True)
+    p.features_norm_csv.write_text("stub\n")
+    with pytest.raises(FileNotFoundError, match=r"features_gen10\.csv"):
         load_beam_bundle(p, db_dir=tmp_path / "db")
 
 

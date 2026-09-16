@@ -173,11 +173,18 @@ def load_beam_bundle(
     db_dir = Path(db_dir)
     cfg = _cfg_from_paths(paths, db_path=db_dir)
 
+    # Data files resolve with tag fallback (tagged if present, else untagged) so
+    # a tagged run can read shared untagged training data; the MoE checkpoints
+    # stay always-tagged (the tagged model variant must exist).
+    features_csv = paths.features_csv_resolved
+    labels_csv = paths.labels_csv_resolved
+    seq_gen_txt = paths.seq_gen_txt_resolved
+
     # Existence check per §IV.pre-diagnostic-verification.
     for name, p in {
-        "features_csv": paths.features_csv,
-        "labels_csv":   paths.labels_csv,
-        "seq_gen_txt":  paths.seq_gen_txt,
+        "features_csv": features_csv,
+        "labels_csv":   labels_csv,
+        "seq_gen_txt":  seq_gen_txt,
         "moe_ps":       paths.moe_ps_chkpt(temp=False),
         "moe_nonps":    paths.moe_nonps_chkpt(temp=False),
         "moe_rf":       paths.moe_rf_bundle(temp=False),
@@ -191,8 +198,8 @@ def load_beam_bundle(
     # `density` alongside `exp_density` and `diff` per III.8 — the regime
     # label is `density > 0`, the quantile axis is `exp_density`, and both
     # need to be recorded in the endpoints CSV.
-    labels_df = pd.read_csv(paths.labels_csv)
-    features_df = pd.read_csv(paths.features_csv)
+    labels_df = pd.read_csv(labels_csv)
+    features_df = pd.read_csv(features_csv)
 
     for col in ("exp_density", "diff"):
         if col not in labels_df.columns:
@@ -219,7 +226,7 @@ def load_beam_bundle(
     # Sequences — one per feature row. seq_gen_txt is the AL training
     # sequences file; slice to the clean-index subset in case any labels were
     # dropped above.
-    with open(paths.seq_gen_txt, "r") as f:
+    with open(seq_gen_txt, "r") as f:
         all_seqs = [ln.strip() for ln in f if ln.strip()]
     if len(all_seqs) != len(labels_df):
         raise ValueError(
