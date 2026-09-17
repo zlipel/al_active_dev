@@ -51,7 +51,9 @@ source "${REPO_ROOT}/config/cluster.env"
 module purge
 module load "${OPENMPI_MODULE}"
 module load "${CONDA_MODULE}"
-if [[ -n "${CUDA_MODULE:-}" ]]; then
+# CUDA only for a GPU run (export WANT_CUDA=true). CPU nodes don't expose the
+# cudatoolkit module and torch bundles its own CUDA libs.
+if [[ "${WANT_CUDA:-false}" == true ]]; then
     module load "${CUDA_MODULE}"
 fi
 conda activate "${CONDA_ENV}"
