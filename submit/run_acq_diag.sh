@@ -25,7 +25,7 @@
 #   # tiny plumbing check first
 #   ./submit/run_acq_diag.sh --model MPIPI --exp_name pilot_20260923 --pilot --dry_run
 
-set -euo pipefail
+set -eo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/config/cluster.env"
