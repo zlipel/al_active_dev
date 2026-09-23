@@ -113,7 +113,7 @@ if [[ "$MISSING" == true ]]; then
 fi
 
 # Per-cell wall time and pilot flag.
-if [[ "$PILOT" == true ]]; then TIME="00:30:00"; PILOT_FLAG=(--pilot); else TIME="03:59:00"; PILOT_FLAG=(); fi
+if [[ "$PILOT" == true ]]; then TIME="00:30:00"; PILOT_FLAG=(--pilot); else TIME="02:00:00"; PILOT_FLAG=(); fi
 
 mkdir -p "${REPO_ROOT}/acq_logs"
 

@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=96
 #SBATCH --mem-per-cpu=1G
-#SBATCH --time=03:59:00
+#SBATCH --time=02:00:00
 #SBATCH --output=acq_logs/acq_diag_%j.out
 #SBATCH --error=acq_logs/acq_diag_%j.err
 #
