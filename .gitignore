@@ -58,6 +58,9 @@ simlogs/
 archive/
 file_inventory.txt
 
+# ── Zipped copies of local folders (e.g. runs/) ───────────────────────────
+*.zip
+
 # ── Markdown policy: only READMEs are tracked ─────────────────────────────
 # Ignore every .md file...
 *.md
@@ -71,6 +74,9 @@ follow_ups/
 
 # ── Local Claude state ────────────────────────────────────────────────────
 .claude/
+
+# ── Agentic workflow ────────────────────────────────────────────────────
+agentic_workflows/
 
 # ── Anomaly / label-curation exploration (kept local for provenance) ──────
 # One-off diagnostics + relabeling that produced the curated gen-10 labels.
